@@ -35,6 +35,18 @@ logger = logging.getLogger("qwen-realtime-client")
 _SESSION_MAX_LIFETIME_S = 110 * 60
 
 
+def default_voice_for_model(model: str) -> str:
+    """Return the safest default voice for a realtime model family."""
+    model_lower = model.lower()
+    if "qwen3.5-omni" in model_lower:
+        return "Tina"
+    if "qwen3-omni-flash-realtime" in model_lower:
+        return "Cherry"
+    if "qwen-omni-turbo-realtime" in model_lower:
+        return "Chelsie"
+    return "Tina"
+
+
 @dataclass
 class QwenRealtimeConfig:
     """Configuration for QwenRealtimeClient."""
@@ -70,6 +82,7 @@ class QwenRealtimeConfig:
             api_key=get_api_key(),
             model=QWEN_REALTIME_MODEL,
             endpoint=DASHSCOPE_REALTIME_URL,
+            voice=default_voice_for_model(QWEN_REALTIME_MODEL),
             transcription_model=QWEN_TRANSCRIPTION_MODEL,
         )
 
@@ -126,7 +139,17 @@ class QwenRealtimeClient:
             created_event = self._wait_for_event("session.created", timeout=15.0)
             self._session_id = self._extract_session_id(created_event)
             self._send_session_update()
-            updated_event = self._wait_for_event("session.updated", timeout=15.0)
+            try:
+                updated_event = self._wait_for_event("session.updated", timeout=15.0)
+            except Exception as exc:
+                session_context = (
+                    f" session_id={self._session_id}" if self._session_id else ""
+                )
+                raise RuntimeError(
+                    "DashScope session.update failed for "
+                    f"model={self._config.model} voice={self._config.voice} "
+                    f"endpoint={self._config.endpoint}{session_context}: {exc}"
+                ) from exc
             self._session_id = (
                 self._extract_session_id(updated_event) or self._session_id
             )

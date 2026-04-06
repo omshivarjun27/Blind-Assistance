@@ -33,6 +33,21 @@ def test_config_defaults():
     assert cfg.voice == "Cherry"
 
 
+def test_default_voice_for_model_prefers_tina_for_qwen35_omni():
+    """Qwen 3.5 omni realtime models should default to Tina."""
+    from apps.backend.services.dashscope.realtime_client import default_voice_for_model
+
+    assert default_voice_for_model("qwen3.5-omni-flash-realtime") == "Tina"
+    assert default_voice_for_model("qwen3.5-omni-plus-realtime") == "Tina"
+
+
+def test_default_voice_for_model_keeps_cherry_for_qwen3_flash():
+    """Legacy qwen3 flash realtime model should keep Cherry."""
+    from apps.backend.services.dashscope.realtime_client import default_voice_for_model
+
+    assert default_voice_for_model("qwen3-omni-flash-realtime") == "Cherry"
+
+
 def test_config_from_settings_reads_env():
     """from_settings() reads model and endpoint from settings."""
     from apps.backend.services.dashscope.realtime_client import QwenRealtimeConfig
@@ -41,6 +56,7 @@ def test_config_from_settings_reads_env():
     assert cfg.api_key == "test-key-for-unit-tests"
     assert "realtime" in cfg.model
     assert cfg.endpoint.startswith("wss://")
+    assert cfg.voice == "Tina"
 
 
 def test_config_from_settings_reads_transcription_model_env():
@@ -214,13 +230,46 @@ def test_connect_closes_socket_if_handshake_fails():
         )
         mp.setattr(client, "_wait_for_event", fake_wait)
 
-        with pytest.raises(TimeoutError, match="session.updated timeout"):
+        with pytest.raises(RuntimeError, match="session.updated timeout"):
             client.connect()
 
     fake_ws.close.assert_called_once()
     assert client._ws is None
     assert client._connected is False
     assert client._session_id is None
+
+
+def test_connect_surfaces_session_update_failure_context():
+    """connect() should expose model and voice on session.update failure."""
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+    )
+
+    cfg = QwenRealtimeConfig(
+        api_key="test-key", model="qwen3.5-omni-plus-realtime", voice="Tina"
+    )
+    client = QwenRealtimeClient(cfg)
+    fake_ws = MagicMock()
+
+    def fake_wait(expected_type: str, timeout: float = 15.0) -> dict[str, object]:
+        if expected_type == "session.created":
+            return {"type": "session.created", "session": {"id": "sess-created"}}
+        raise RuntimeError("DashScope closed before session.updated")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            websocket,
+            "create_connection",
+            lambda url, header, timeout: fake_ws,
+        )
+        mp.setattr(client, "_wait_for_event", fake_wait)
+
+        with pytest.raises(
+            RuntimeError,
+            match="qwen3.5-omni-plus-realtime.*Tina.*api-ws/v1/realtime.*sess-created",
+        ):
+            client.connect()
 
 
 # ── streaming order tests ─────────────────────────────────────────
