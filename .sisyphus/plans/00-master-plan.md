@@ -138,7 +138,7 @@ Online learning judges corrected turns during a live session, adapts prompts/rou
 
 | Use case | PROFILE=dev | PROFILE=exam |
 |---|---|---|
-| Realtime voice+image | qwen3-omni-flash-realtime | qwen3.5-omni-plus-realtime |
+| Realtime voice+image | qwen3.5-omni-flash-realtime | qwen3.5-omni-plus-realtime |
 | Heavy vision/document | qwen3.5-flash | qwen3.6-plus |
 | Transcription | gummy-realtime-v1 (fixed) | gummy-realtime-v1 (fixed) |
 | Memory embeddings | text-embedding-v3 1024 dense | text-embedding-v3 1024 dense |
@@ -148,7 +148,7 @@ Note: `gummy-realtime-v1` is fixed by DashScope, transcript is reference-only, a
 Note: `text-embedding-v3` uses the DashScope native endpoint:  
 `https://dashscope-intl.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding`
 
-Note: DashScope 2026 realtime docs confirm `qwen3.5-omni-plus-realtime`, PCM audio, `gummy-realtime-v1`, and a 120-minute WebSocket cap. The repo currently names the dev realtime model as `qwen3.5-omni-flash-realtime`, but the doc-backed correction for the flash realtime path is `qwen3-omni-flash-realtime`, so the plan uses the corrected name.
+Note: DashScope 2026 realtime docs confirm `qwen3.5-omni-plus-realtime`, PCM audio, `gummy-realtime-v1`, and a 120-minute WebSocket cap. The repo currently names the dev realtime model as `qwen3.5-omni-flash-realtime`, and the plan uses `qwen3.5-omni-flash-realtime` consistently.
 
 Note: `qwen3.5-flash` is the doc-confirmed heavy-vision baseline. `qwen3.6-plus` is a valid configured exam-path model with official Alibaba launch-material multimodal evidence, but execution should make the full document path work on `qwen3.5-flash` first and treat `qwen3.6-plus` as the exam/high-accuracy override.
 
