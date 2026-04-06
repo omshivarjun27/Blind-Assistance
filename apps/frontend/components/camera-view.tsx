@@ -9,8 +9,7 @@ interface CameraViewProps {
 
 export function CameraView({ videoRef, isEnabled }: CameraViewProps) {
   return (
-    <div className="relative w-[640px] h-[480px] bg-gray-900 rounded-lg overflow-hidden border border-gray-700">
-      {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
+    <div className="relative w-full aspect-video max-w-4xl mx-auto rounded-2xl overflow-hidden bg-zinc-900">
       <video
         ref={videoRef}
         autoPlay
@@ -19,8 +18,8 @@ export function CameraView({ videoRef, isEnabled }: CameraViewProps) {
         className="w-full h-full object-cover"
       />
       {!isEnabled && (
-        <div className="absolute inset-0 flex items-center justify-center text-gray-400 text-sm">
-          Camera not enabled
+        <div className="absolute inset-0 flex items-center justify-center">
+          <p className="text-zinc-500 text-sm">Camera not enabled</p>
         </div>
       )}
     </div>

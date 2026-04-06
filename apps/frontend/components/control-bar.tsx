@@ -1,6 +1,6 @@
 'use client';
 
-import { Camera, Mic, Square } from 'lucide-react';
+import { Camera, Mic, X } from 'lucide-react';
 
 interface ControlBarProps {
   onStart: () => void;
@@ -10,42 +10,39 @@ interface ControlBarProps {
 }
 
 export function ControlBar({ onStart, onStop, onCapture, status }: ControlBarProps) {
-  const isActive = status === 'listening' || status === 'thinking' || status === 'speaking';
-  const isDisabled = status === 'connecting' || status === 'thinking';
+  const isActive = ['listening', 'thinking', 'speaking'].includes(status);
+  const isDisabled = ['connecting', 'thinking'].includes(status);
 
   return (
-    <div className="flex items-center gap-4">
-      {!isActive ? (
-        <button
-          onClick={onStart}
-          disabled={status === 'connecting'}
-          className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700
-                     disabled:opacity-50 disabled:cursor-not-allowed
-                     text-white rounded-lg font-medium transition-colors"
-        >
-          <Mic size={18} />
-          Start
-        </button>
-      ) : (
+    <div className="flex items-center justify-center gap-6 py-4">
+      {isActive ? (
         <button
           onClick={onStop}
-          className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700
-                     text-white rounded-lg font-medium transition-colors"
+          className="w-12 h-12 rounded-full bg-zinc-800 hover:bg-zinc-700 flex items-center justify-center transition-colors"
+          aria-label="Stop"
         >
-          <Square size={18} />
-          Stop
+          <X size={20} className="text-zinc-300" />
         </button>
+      ) : (
+        <div className="w-12 h-12" />
       )}
+
+      <button
+        onClick={isActive ? onStop : onStart}
+        disabled={isDisabled}
+        className="w-16 h-16 rounded-full bg-white hover:bg-zinc-200 disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center transition-colors shadow-lg"
+        aria-label={isActive ? 'Stop' : 'Start'}
+      >
+        <Mic size={24} className="text-black" />
+      </button>
 
       <button
         onClick={onCapture}
         disabled={isDisabled}
-        className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600
-                   disabled:opacity-50 disabled:cursor-not-allowed
-                   text-white rounded-lg font-medium transition-colors"
+        className="w-12 h-12 rounded-full bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center transition-colors"
+        aria-label="Capture frame"
       >
-        <Camera size={18} />
-        Capture
+        <Camera size={18} className="text-zinc-300" />
       </button>
     </div>
   );

@@ -1,26 +1,22 @@
 'use client';
 
-interface StatusPillProps {
-  status: string;
-}
-
-const STATUS_CONFIG: Record<string, { label: string; color: string }> = {
-  idle:       { label: 'Ready',      color: 'bg-gray-500' },
-  connecting: { label: 'Connecting', color: 'bg-yellow-500' },
-  listening:  { label: 'Listening',  color: 'bg-green-500' },
-  thinking:   { label: 'Thinking',   color: 'bg-blue-500' },
-  speaking:   { label: 'Speaking',   color: 'bg-purple-500' },
-  error:      { label: 'Error',      color: 'bg-red-500' },
+const STATUS_CONFIG: Record<string, { label: string; dot: string }> = {
+  idle:       { label: 'Ready',      dot: 'bg-zinc-400' },
+  connecting: { label: 'Connecting', dot: 'bg-yellow-400 animate-pulse' },
+  listening:  { label: 'Listening',  dot: 'bg-green-400 animate-pulse' },
+  thinking:   { label: 'Thinking',   dot: 'bg-blue-400 animate-pulse' },
+  speaking:   { label: 'Speaking',   dot: 'bg-purple-400 animate-pulse' },
+  error:      { label: 'Error',      dot: 'bg-red-400' },
 };
 
-export function StatusPill({ status }: StatusPillProps) {
+export function StatusPill({ status }: { status: string }) {
   const cfg = STATUS_CONFIG[status] ?? STATUS_CONFIG.idle;
   return (
-    <span
-      className={`inline-flex items-center px-3 py-1 rounded-full text-white text-sm font-medium ${cfg.color}`}
-    >
-      <span className="w-2 h-2 rounded-full bg-white mr-2 opacity-75" />
-      {cfg.label}
-    </span>
+    <div className="flex items-center justify-center gap-2 py-2">
+      <span className={`w-2 h-2 rounded-full ${cfg.dot}`} />
+      <span className="text-sm text-zinc-300 tracking-wide">
+        {cfg.label}
+      </span>
+    </div>
   );
 }

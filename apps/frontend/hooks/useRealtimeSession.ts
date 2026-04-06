@@ -42,6 +42,8 @@ export function useRealtimeSession(captureFrame: () => string | null) {
   const chunksRef = useRef<ArrayBuffer[]>([]);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isSpeakingRef = useRef(false);
+  const isSendingRef = useRef(false);
+  const hasSpeechRef = useRef(false);
   const mic = useMicStream();
 
   const appendTranscript = useCallback((entry: TranscriptEntry) => {
@@ -49,7 +51,10 @@ export function useRealtimeSession(captureFrame: () => string | null) {
   }, []);
 
   const flushTurn = useCallback(() => {
+    if (isSendingRef.current) return;
     if (chunksRef.current.length === 0) return;
+    isSendingRef.current = true;
+    hasSpeechRef.current = false;
     const pcm = concatArrayBuffers(chunksRef.current);
     chunksRef.current = [];
     setStatus('thinking');
@@ -59,12 +64,13 @@ export function useRealtimeSession(captureFrame: () => string | null) {
   const onPcmChunk = useCallback(
     (chunk: ArrayBuffer) => {
       if (isSpeakingRef.current) return; // don't capture while assistant speaks
-
-      chunksRef.current.push(chunk);
+      if (isSendingRef.current) return;
 
       // Silence detection
       const rms = calcRms(chunk);
       if (rms < SILENCE_THRESHOLD) {
+        if (!hasSpeechRef.current) return;
+        chunksRef.current.push(chunk);
         // Start or reset silence timer
         if (!silenceTimerRef.current) {
           silenceTimerRef.current = setTimeout(() => {
@@ -75,6 +81,8 @@ export function useRealtimeSession(captureFrame: () => string | null) {
           }, SILENCE_TIMEOUT_MS);
         }
       } else {
+        hasSpeechRef.current = true;
+        chunksRef.current.push(chunk);
         // Voice detected — cancel silence timer
         if (silenceTimerRef.current) {
           clearTimeout(silenceTimerRef.current);
@@ -100,6 +108,7 @@ export function useRealtimeSession(captureFrame: () => string | null) {
         setStatus('speaking');
         await playPcmAudio(pcm);
         isSpeakingRef.current = false;
+        isSendingRef.current = false;
         setStatus('listening');
       };
 
@@ -141,11 +150,13 @@ export function useRealtimeSession(captureFrame: () => string | null) {
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
     }
-    chunksRef.current = [];
-    mic.stopListening();
-    wsRef.current?.disconnect();
-    wsRef.current = null;
-    setStatus('idle');
+      chunksRef.current = [];
+      hasSpeechRef.current = false;
+      isSendingRef.current = false;
+      mic.stopListening();
+      wsRef.current?.disconnect();
+      wsRef.current = null;
+      setStatus('idle');
   }
 
   return {
