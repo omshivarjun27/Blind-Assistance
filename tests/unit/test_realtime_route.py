@@ -5,7 +5,9 @@ All tests use mocked QwenRealtimeClient — no real network.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -284,6 +286,97 @@ def test_websocket_upstream_exception_returns_structured_error():
                 assert msg["details"]["model"] == mock_config.model
                 assert msg["details"]["voice"] == mock_config.voice
                 assert msg["details"]["endpoint"] == mock_config.endpoint
+
+
+def test_websocket_pending_classifier_does_not_block_next_turn():
+    """A slow classifier must not stall the next audio turn."""
+    first_turn = _make_mock_turn(assistant_text="first", user_text="describe this")
+    second_turn = _make_mock_turn(assistant_text="second", user_text="follow up")
+    mock_client = _mock_client(first_turn)
+    mock_client.async_send_audio_turn = AsyncMock(side_effect=[first_turn, second_turn])
+    mock_classifier = MagicMock()
+
+    async def slow_classify(_: str):
+        await asyncio.sleep(5)
+
+    mock_classifier.classify = slow_classify
+    mock_config = MagicMock()
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=mock_config,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+                start = time.monotonic()
+                ws.send_bytes(b"\x01" * 3200)
+                _ = ws.receive_bytes()
+                elapsed = time.monotonic() - start
+
+    assert elapsed < 1.0, f"Second turn was blocked for {elapsed:.2f}s"
+    assert mock_client.async_send_audio_turn.await_count == 2
+
+
+def test_websocket_empty_user_transcript_clears_stale_classification():
+    """An empty transcript must clear previous-turn classification state."""
+    first_turn = _make_mock_turn(assistant_text="first", user_text="read this")
+    second_turn = _make_mock_turn(assistant_text="second", user_text="")
+    third_turn = _make_mock_turn(assistant_text="third", user_text="")
+    mock_client = _mock_client(first_turn)
+    mock_client.async_send_audio_turn = AsyncMock(
+        side_effect=[first_turn, second_turn, third_turn]
+    )
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock(
+        return_value=MagicMock(intent=MagicMock(value="READ_TEXT"))
+    )
+    mock_config = MagicMock()
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=mock_config,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+                ws.send_bytes(b"\x01" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+
+                ws.send_bytes(b"\x02" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+
+    assert mock_classifier.classify.await_count == 1
 
 
 # ── disconnect ────────────────────────────────────────────────────

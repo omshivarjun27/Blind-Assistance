@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import asyncio as _asyncio
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -24,6 +25,11 @@ from apps.backend.services.dashscope.realtime_client import (
     QwenRealtimeClient,
     QwenRealtimeConfig,
 )
+from core.orchestrator.intent_classifier import (
+    IntentCategory,
+    IntentClassifier,
+)
+from core.orchestrator.policy_router import RouteTarget, route
 
 logger = logging.getLogger("ally-vision-realtime-route")
 router = APIRouter()
@@ -68,6 +74,9 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     config = QwenRealtimeConfig.from_settings()
     client = QwenRealtimeClient(config)
 
+    last_user_transcript: str = ""
+    classifier = IntentClassifier.from_settings()
+    pending_classification_task: _asyncio.Task[object] | None = None
     pending_image_b64: str | None = None
     pending_instructions: str | None = None
 
@@ -87,15 +96,68 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     continue
                 logger.debug("Audio turn received: %d bytes", len(audio_pcm))
 
+                # Classify intent from PREVIOUS turn's transcript
+                # (current transcript arrives WITH the response)
+                effective_instructions = pending_instructions
+                predicted_target = RouteTarget.REALTIME_CHAT
+                applied_target = RouteTarget.REALTIME_CHAT
+
+                if (
+                    pending_classification_task
+                    and pending_classification_task.done()
+                    and not pending_instructions
+                ):
+                    try:
+                        clf_result = pending_classification_task.result()
+                        decision = route(clf_result.intent)
+                        predicted_target = decision.target
+                        if decision.requires_frame and not pending_image_b64:
+                            logger.debug(
+                                "Frame required but not available — will ask user to capture"
+                            )
+                            effective_instructions = "Tell the user briefly to point the camera and press the capture button."
+                        elif decision.system_instructions:
+                            effective_instructions = decision.system_instructions
+                    except Exception as exc:
+                        logger.warning(
+                            "Orchestrator failed, using default: %s",
+                            exc,
+                        )
+                    finally:
+                        pending_classification_task = None
+                elif (
+                    pending_classification_task
+                    and not pending_classification_task.done()
+                ):
+                    logger.debug(
+                        "Intent classification still pending for previous turn — using default realtime behavior"
+                    )
+
+                if predicted_target != applied_target:
+                    logger.debug(
+                        "Predicted route %s but applying handler %s in Plan 05",
+                        predicted_target.value,
+                        applied_target.value,
+                    )
+
                 try:
                     result = await client.async_send_audio_turn(
                         audio_pcm=audio_pcm,
                         image_jpeg_b64=pending_image_b64,
-                        instructions=pending_instructions,
+                        instructions=effective_instructions,
                     )
                 except Exception as exc:
                     await _send_upstream_error(ws, str(exc), config)
                     break
+
+                # Store for next turn classification
+                last_user_transcript = result.user_transcript or ""
+                if last_user_transcript:
+                    pending_classification_task = _asyncio.create_task(
+                        classifier.classify(last_user_transcript)
+                    )
+                else:
+                    pending_classification_task = None
 
                 # Reset per-turn context
                 pending_image_b64 = None
