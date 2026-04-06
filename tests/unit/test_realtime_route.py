@@ -379,6 +379,94 @@ def test_websocket_empty_user_transcript_clears_stale_classification():
     assert mock_classifier.classify.await_count == 1
 
 
+def test_websocket_pending_classifier_with_next_transcript_preserves_first_heavy_vision():
+    """A later transcript must not overwrite an unfinished earlier heavy-vision intent."""
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+    from core.orchestrator.policy_router import RouteTarget
+
+    first_turn = _make_mock_turn(assistant_text="first", user_text="read this")
+    second_turn = _make_mock_turn(assistant_text="second", user_text="hello")
+    third_turn = _make_mock_turn(assistant_text="third", user_text="")
+    mock_client = _mock_client(first_turn)
+    mock_client.async_send_audio_turn = AsyncMock(
+        side_effect=[first_turn, second_turn, third_turn]
+    )
+
+    call_index = 0
+
+    async def classify_side_effect(_: str):
+        nonlocal call_index
+        call_index += 1
+        if call_index == 1:
+            await asyncio.sleep(0.2)
+            return ClassificationResult(
+                intent=IntentCategory.READ_TEXT,
+                confidence="high",
+                raw_label="READ_TEXT",
+            )
+        return ClassificationResult(
+            intent=IntentCategory.GENERAL_CHAT,
+            confidence="high",
+            raw_label="GENERAL_CHAT",
+        )
+
+    mock_classifier = MagicMock()
+    mock_classifier.classify = classify_side_effect
+    mock_mm_client = MagicMock()
+    mock_mm_client._model = "qwen3.5-flash"
+    mock_mm_client.analyze = AsyncMock(
+        return_value=MagicMock(success=True, text="READ RESULT")
+    )
+    mock_config = MagicMock()
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=mock_config,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MultimodalClient.from_settings",
+            return_value=mock_mm_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.assess_frame_quality",
+            return_value=(True, ""),
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_text(json.dumps({"type": "image", "data": "image-one"}))
+                ws.send_bytes(b"\x00" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+                ws.send_text(json.dumps({"type": "image", "data": "image-two"}))
+                ws.send_bytes(b"\x01" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+                time.sleep(0.3)
+
+                ws.send_bytes(b"\x02" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+
+    mock_mm_client.analyze.assert_awaited_once()
+    vision_request = mock_mm_client.analyze.await_args.args[0]
+    assert vision_request.image_jpeg_b64 == "image-one"
+    assert call_index >= 1
+
+
 # ── disconnect ────────────────────────────────────────────────────
 
 

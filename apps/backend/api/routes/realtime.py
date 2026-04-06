@@ -21,10 +21,15 @@ from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from apps.backend.services.dashscope.multimodal_client import (
+    MultimodalClient,
+    VisionRequest,
+)
 from apps.backend.services.dashscope.realtime_client import (
     QwenRealtimeClient,
     QwenRealtimeConfig,
 )
+from core.orchestrator.capture_coach import assess_frame_quality
 from core.orchestrator.intent_classifier import (
     IntentCategory,
     IntentClassifier,
@@ -76,7 +81,10 @@ async def realtime_endpoint(ws: WebSocket) -> None:
 
     last_user_transcript: str = ""
     classifier = IntentClassifier.from_settings()
+    mm_client = MultimodalClient.from_settings()
     pending_classification_task: _asyncio.Task[object] | None = None
+    pending_classification_image_b64: str | None = None
+    queued_classification_input: tuple[str, str | None] | None = None
     pending_image_b64: str | None = None
     pending_instructions: str | None = None
 
@@ -111,7 +119,54 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         clf_result = pending_classification_task.result()
                         decision = route(clf_result.intent)
                         predicted_target = decision.target
-                        if decision.requires_frame and not pending_image_b64:
+                        if decision.target == RouteTarget.HEAVY_VISION:
+                            applied_target = RouteTarget.HEAVY_VISION
+                            vision_image_b64 = pending_classification_image_b64
+                            is_usable, guidance = assess_frame_quality(vision_image_b64)
+                            if not is_usable:
+                                effective_instructions = (
+                                    f"Tell the user this guidance: {guidance}"
+                                )
+                                logger.debug(
+                                    "HEAVY_VISION blocked by capture_coach: %s",
+                                    guidance,
+                                )
+                            elif vision_image_b64:
+                                logger.debug(
+                                    "HEAVY_VISION: calling multimodal model=%s",
+                                    mm_client._model,
+                                )
+                                vision_result = await mm_client.analyze(
+                                    VisionRequest(
+                                        image_jpeg_b64=vision_image_b64,
+                                        prompt=decision.system_instructions
+                                        or "Describe what you see.",
+                                    )
+                                )
+                                if vision_result.success:
+                                    effective_instructions = (
+                                        "Say exactly this to the user: "
+                                        f"{vision_result.text}"
+                                    )
+                                    logger.info(
+                                        "HEAVY_VISION result: %d chars",
+                                        len(vision_result.text),
+                                    )
+                                else:
+                                    effective_instructions = (
+                                        "Tell the user the image could not be "
+                                        "analyzed. Ask them to try again."
+                                    )
+                                    logger.warning(
+                                        "HEAVY_VISION error: %s",
+                                        vision_result.error,
+                                    )
+                            else:
+                                effective_instructions = (
+                                    "Tell the user to press the capture button "
+                                    "to take a photo first, then ask again."
+                                )
+                        elif decision.requires_frame and not pending_image_b64:
                             logger.debug(
                                 "Frame required but not available — will ask user to capture"
                             )
@@ -125,6 +180,16 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         )
                     finally:
                         pending_classification_task = None
+                        pending_classification_image_b64 = None
+                        if queued_classification_input:
+                            queued_transcript, queued_image_b64 = (
+                                queued_classification_input
+                            )
+                            pending_classification_task = _asyncio.create_task(
+                                classifier.classify(queued_transcript)
+                            )
+                            pending_classification_image_b64 = queued_image_b64
+                            queued_classification_input = None
                 elif (
                     pending_classification_task
                     and not pending_classification_task.done()
@@ -150,14 +215,21 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     await _send_upstream_error(ws, str(exc), config)
                     break
 
+                turn_image_b64 = pending_image_b64
+
                 # Store for next turn classification
                 last_user_transcript = result.user_transcript or ""
                 if last_user_transcript:
-                    pending_classification_task = _asyncio.create_task(
-                        classifier.classify(last_user_transcript)
-                    )
-                else:
-                    pending_classification_task = None
+                    if pending_classification_task is None:
+                        pending_classification_task = _asyncio.create_task(
+                            classifier.classify(last_user_transcript)
+                        )
+                        pending_classification_image_b64 = turn_image_b64
+                    else:
+                        queued_classification_input = (
+                            last_user_transcript,
+                            turn_image_b64,
+                        )
 
                 # Reset per-turn context
                 pending_image_b64 = None
