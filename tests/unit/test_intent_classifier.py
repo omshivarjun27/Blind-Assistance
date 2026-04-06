@@ -53,6 +53,42 @@ async def test_classify_returns_read_text():
 
 
 @pytest.mark.asyncio
+async def test_classify_returns_translate():
+    from core.orchestrator.intent_classifier import (
+        IntentCategory,
+        IntentClassifier,
+    )
+
+    clf = IntentClassifier(api_key="test-key")
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock(return_value=_mock_response("TRANSLATE"))
+        result = await clf.classify("translate this to Hindi")
+    assert result.intent == IntentCategory.TRANSLATE
+    assert result.confidence == "high"
+
+
+@pytest.mark.asyncio
+async def test_classify_returns_translate():
+    from core.orchestrator.intent_classifier import (
+        IntentCategory,
+        IntentClassifier,
+    )
+
+    clf = IntentClassifier(api_key="test-key")
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock(return_value=_mock_response("TRANSLATE"))
+        result = await clf.classify("translate this to Hindi")
+    assert result.intent == IntentCategory.TRANSLATE
+    assert result.confidence == "high"
+
+
+@pytest.mark.asyncio
 async def test_classify_returns_general_chat_on_empty():
     from core.orchestrator.intent_classifier import (
         IntentCategory,

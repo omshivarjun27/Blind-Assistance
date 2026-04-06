@@ -71,6 +71,7 @@ export class RealtimeWSClient {
   }
 
   sendImage(base64Jpeg: string): void {
+    console.log('[WS] Sending image:', base64Jpeg.length, 'chars');
     this.ws?.send(JSON.stringify({ type: 'image', data: base64Jpeg }));
   }
 

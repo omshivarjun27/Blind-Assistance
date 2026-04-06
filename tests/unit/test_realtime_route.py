@@ -187,6 +187,43 @@ def test_websocket_image_message_queued_for_next_turn():
     assert image_used == "base64imgdata"
 
 
+def test_websocket_image_first_turn_defaults_to_scene_describe():
+    """If no prior transcript exists but image is present, default to visual intent."""
+    turn = _make_mock_turn(assistant_text="I see a desk", user_text="")
+    mock_client = _mock_client(turn)
+    mock_config = MagicMock()
+    mock_classifier = MagicMock()
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=mock_config,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_text(json.dumps({"type": "image", "data": "frame123"}))
+                ws.send_bytes(b"\x00" * 3200)
+                _ = ws.receive_bytes()
+
+    call_kwargs = mock_client.async_send_audio_turn.call_args
+    kwargs = call_kwargs[1] if call_kwargs[1] else {}
+    args = call_kwargs[0] if call_kwargs[0] else ()
+    instructions_used = kwargs.get("instructions") or (args[2] if len(args) > 2 else "")
+    image_used = kwargs.get("image_jpeg_b64") or (args[1] if len(args) > 1 else None)
+    assert image_used == "frame123"
+    assert instructions_used is not None
+    assert "Describe what you see" in instructions_used
+
+
 # ── ping/pong ─────────────────────────────────────────────────────
 
 
@@ -334,6 +371,8 @@ def test_websocket_pending_classifier_does_not_block_next_turn():
 
 def test_websocket_empty_user_transcript_clears_stale_classification():
     """An empty transcript must clear previous-turn classification state."""
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+
     first_turn = _make_mock_turn(assistant_text="first", user_text="read this")
     second_turn = _make_mock_turn(assistant_text="second", user_text="")
     third_turn = _make_mock_turn(assistant_text="third", user_text="")
@@ -343,7 +382,11 @@ def test_websocket_empty_user_transcript_clears_stale_classification():
     )
     mock_classifier = MagicMock()
     mock_classifier.classify = AsyncMock(
-        return_value=MagicMock(intent=MagicMock(value="READ_TEXT"))
+        return_value=ClassificationResult(
+            intent=IntentCategory.READ_TEXT,
+            confidence="high",
+            raw_label="READ_TEXT",
+        )
     )
     mock_config = MagicMock()
 

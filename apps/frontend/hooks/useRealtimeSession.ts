@@ -39,6 +39,7 @@ export function useRealtimeSession(captureFrame: () => string | null) {
   const [error, setError] = useState<string | null>(null);
 
   const wsRef = useRef<RealtimeWSClient | null>(null);
+  const captureFrameRef = useRef<(() => string | null) | null>(null);
   const chunksRef = useRef<ArrayBuffer[]>([]);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isSpeakingRef = useRef(false);
@@ -55,6 +56,13 @@ export function useRealtimeSession(captureFrame: () => string | null) {
     if (chunksRef.current.length === 0) return;
     isSendingRef.current = true;
     hasSpeechRef.current = false;
+
+    const frame = captureFrameRef.current?.();
+    console.log('[Session] Frame captured:', frame ? frame.length : 'none');
+    if (frame) {
+      wsRef.current?.sendImage(frame);
+    }
+
     const pcm = concatArrayBuffers(chunksRef.current);
     chunksRef.current = [];
     setStatus('thinking');
@@ -99,6 +107,7 @@ export function useRealtimeSession(captureFrame: () => string | null) {
 
     try {
       const wsUrl = process.env.NEXT_PUBLIC_WS_URL ?? 'ws://127.0.0.1:8000/ws/realtime';
+      captureFrameRef.current = captureFrame;
 
       const ws = new RealtimeWSClient(wsUrl);
       wsRef.current = ws;
@@ -107,6 +116,13 @@ export function useRealtimeSession(captureFrame: () => string | null) {
         isSpeakingRef.current = true;
         setStatus('speaking');
         await playPcmAudio(pcm);
+
+        // Auto-capture new frame for next potential vision turn.
+        const newFrame = captureFrameRef.current?.();
+        if (newFrame) {
+          wsRef.current?.sendImage(newFrame);
+        }
+
         isSpeakingRef.current = false;
         isSendingRef.current = false;
         setStatus('listening');
@@ -153,6 +169,7 @@ export function useRealtimeSession(captureFrame: () => string | null) {
       chunksRef.current = [];
       hasSpeechRef.current = false;
       isSendingRef.current = false;
+      captureFrameRef.current = null;
       mic.stopListening();
       wsRef.current?.disconnect();
       wsRef.current = null;

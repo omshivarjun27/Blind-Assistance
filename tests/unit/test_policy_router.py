@@ -32,6 +32,26 @@ def test_general_chat_no_frame_needed():
     assert decision.system_instructions == ""
 
 
+def test_translate_routes_to_realtime_chat_with_instructions():
+    from core.orchestrator.intent_classifier import IntentCategory
+    from core.orchestrator.policy_router import RouteTarget, route
+
+    decision = route(IntentCategory.TRANSLATE)
+    assert decision.target == RouteTarget.REALTIME_CHAT
+    assert decision.requires_frame is False
+    assert "Translate" in decision.system_instructions
+
+
+def test_translate_routes_to_realtime_chat_with_instructions():
+    from core.orchestrator.intent_classifier import IntentCategory
+    from core.orchestrator.policy_router import RouteTarget, route
+
+    decision = route(IntentCategory.TRANSLATE)
+    assert decision.target == RouteTarget.REALTIME_CHAT
+    assert decision.requires_frame is False
+    assert "Translate" in decision.system_instructions
+
+
 def test_web_search_falls_back_to_realtime_in_plan05():
     """WEB_SEARCH not yet implemented — falls back to REALTIME_CHAT."""
     from core.orchestrator.intent_classifier import IntentCategory

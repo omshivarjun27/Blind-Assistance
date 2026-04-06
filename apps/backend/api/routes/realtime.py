@@ -77,6 +77,17 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     logger.info("WebSocket client connected")
 
     config = QwenRealtimeConfig.from_settings()
+    config.instructions = (
+        "You are Ally, a voice and vision assistant "
+        "for blind and visually impaired users. "
+        "When an image is provided, ALWAYS describe "
+        "or analyze it as part of your response. "
+        "Be specific about what you see — objects, "
+        "text, positions, distances, colors. "
+        "Speak clearly and concisely. "
+        "Support all languages — respond in the same "
+        "language the user speaks."
+    )
     client = QwenRealtimeClient(config)
 
     last_user_transcript: str = ""
@@ -109,6 +120,8 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 effective_instructions = pending_instructions
                 predicted_target = RouteTarget.REALTIME_CHAT
                 applied_target = RouteTarget.REALTIME_CHAT
+                predicted_intent: IntentCategory | None = None
+                classified_image_b64: str | None = None
 
                 if (
                     pending_classification_task
@@ -117,62 +130,8 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 ):
                     try:
                         clf_result = pending_classification_task.result()
-                        decision = route(clf_result.intent)
-                        predicted_target = decision.target
-                        if decision.target == RouteTarget.HEAVY_VISION:
-                            applied_target = RouteTarget.HEAVY_VISION
-                            vision_image_b64 = pending_classification_image_b64
-                            is_usable, guidance = assess_frame_quality(vision_image_b64)
-                            if not is_usable:
-                                effective_instructions = (
-                                    f"Tell the user this guidance: {guidance}"
-                                )
-                                logger.debug(
-                                    "HEAVY_VISION blocked by capture_coach: %s",
-                                    guidance,
-                                )
-                            elif vision_image_b64:
-                                logger.debug(
-                                    "HEAVY_VISION: calling multimodal model=%s",
-                                    mm_client._model,
-                                )
-                                vision_result = await mm_client.analyze(
-                                    VisionRequest(
-                                        image_jpeg_b64=vision_image_b64,
-                                        prompt=decision.system_instructions
-                                        or "Describe what you see.",
-                                    )
-                                )
-                                if vision_result.success:
-                                    effective_instructions = (
-                                        "Say exactly this to the user: "
-                                        f"{vision_result.text}"
-                                    )
-                                    logger.info(
-                                        "HEAVY_VISION result: %d chars",
-                                        len(vision_result.text),
-                                    )
-                                else:
-                                    effective_instructions = (
-                                        "Tell the user the image could not be "
-                                        "analyzed. Ask them to try again."
-                                    )
-                                    logger.warning(
-                                        "HEAVY_VISION error: %s",
-                                        vision_result.error,
-                                    )
-                            else:
-                                effective_instructions = (
-                                    "Tell the user to press the capture button "
-                                    "to take a photo first, then ask again."
-                                )
-                        elif decision.requires_frame and not pending_image_b64:
-                            logger.debug(
-                                "Frame required but not available — will ask user to capture"
-                            )
-                            effective_instructions = "Tell the user briefly to point the camera and press the capture button."
-                        elif decision.system_instructions:
-                            effective_instructions = decision.system_instructions
+                        predicted_intent = clf_result.intent
+                        classified_image_b64 = pending_classification_image_b64
                     except Exception as exc:
                         logger.warning(
                             "Orchestrator failed, using default: %s",
@@ -197,6 +156,78 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     logger.debug(
                         "Intent classification still pending for previous turn — using default realtime behavior"
                     )
+
+                # If no transcript yet but image is present, assume a visual request.
+                if predicted_intent is None and pending_image_b64:
+                    predicted_intent = IntentCategory.SCENE_DESCRIBE
+                    logger.debug("No transcript yet, image present → SCENE_DESCRIBE")
+
+                if predicted_intent is not None:
+                    decision = route(predicted_intent)
+                    predicted_target = decision.target
+                    logger.debug(
+                        "Intent: %s → Route: %s (frame=%s)",
+                        predicted_intent.value,
+                        decision.target.value,
+                        decision.requires_frame,
+                    )
+                    if decision.target == RouteTarget.HEAVY_VISION:
+                        applied_target = RouteTarget.HEAVY_VISION
+                        vision_image_b64 = classified_image_b64 or pending_image_b64
+                        is_usable, guidance = assess_frame_quality(vision_image_b64)
+                        if not is_usable:
+                            effective_instructions = (
+                                f"Tell the user this guidance: {guidance}"
+                            )
+                            logger.debug(
+                                "HEAVY_VISION blocked by capture_coach: %s",
+                                guidance,
+                            )
+                        elif vision_image_b64:
+                            logger.debug(
+                                "HEAVY_VISION: calling multimodal model=%s",
+                                mm_client._model,
+                            )
+                            vision_result = await mm_client.analyze(
+                                VisionRequest(
+                                    image_jpeg_b64=vision_image_b64,
+                                    prompt=decision.system_instructions
+                                    or "Describe what you see.",
+                                )
+                            )
+                            if vision_result.success:
+                                effective_instructions = (
+                                    "Say exactly this to the user: "
+                                    f"{vision_result.text}"
+                                )
+                                logger.info(
+                                    "HEAVY_VISION result: %d chars",
+                                    len(vision_result.text),
+                                )
+                            else:
+                                effective_instructions = (
+                                    "Tell the user the image could not be "
+                                    "analyzed. Ask them to try again."
+                                )
+                                logger.warning(
+                                    "HEAVY_VISION error: %s",
+                                    vision_result.error,
+                                )
+                        else:
+                            effective_instructions = (
+                                "Tell the user to press the capture button "
+                                "to take a photo first, then ask again."
+                            )
+                    elif decision.requires_frame and not pending_image_b64:
+                        logger.debug(
+                            "Frame required but not available — will ask user to capture"
+                        )
+                        effective_instructions = (
+                            "Tell the user briefly to press the camera "
+                            "capture button first, then ask again."
+                        )
+                    elif decision.system_instructions:
+                        effective_instructions = decision.system_instructions
 
                 if predicted_target != applied_target:
                     logger.debug(

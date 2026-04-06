@@ -28,13 +28,17 @@ _LABELS = [
     "MEMORY_SAVE",
     "MEMORY_RECALL",
     "DOCUMENT_QA",
+    "TRANSLATE",
     "GENERAL_CHAT",
 ]
 
 _CLASSIFICATION_PROMPT = (
     "Classify this user request into exactly one of: "
     "SCENE_DESCRIBE, READ_TEXT, SCAN_PAGE, WEB_SEARCH, "
-    "MEMORY_SAVE, MEMORY_RECALL, DOCUMENT_QA, GENERAL_CHAT. "
+    "MEMORY_SAVE, MEMORY_RECALL, DOCUMENT_QA, "
+    "TRANSLATE, GENERAL_CHAT. "
+    "TRANSLATE covers: translate this, what language is this, "
+    "translate to Hindi, translate to English, etc. "
     "Reply with ONLY the category name, nothing else.\n"
     "Request: {transcript}"
 )
@@ -48,6 +52,7 @@ class IntentCategory(str, enum.Enum):
     MEMORY_SAVE = "MEMORY_SAVE"
     MEMORY_RECALL = "MEMORY_RECALL"
     DOCUMENT_QA = "DOCUMENT_QA"
+    TRANSLATE = "TRANSLATE"
     GENERAL_CHAT = "GENERAL_CHAT"
 
 

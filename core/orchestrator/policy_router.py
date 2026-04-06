@@ -23,6 +23,7 @@ logger = logging.getLogger("ally-policy-router")
 class RouteTarget(str, enum.Enum):
     REALTIME_CHAT = "REALTIME_CHAT"
     HEAVY_VISION = "HEAVY_VISION"
+    TRANSLATE = "TRANSLATE"
     WEB_SEARCH = "WEB_SEARCH"
     MEMORY_WRITE = "MEMORY_WRITE"
     MEMORY_READ = "MEMORY_READ"
@@ -80,6 +81,15 @@ _ROUTING_TABLE: dict[IntentCategory, tuple[RouteTarget, bool, str]] = {
         RouteTarget.DOCUMENT_QA,
         False,
         "Answer from the scanned document.",
+    ),
+    IntentCategory.TRANSLATE: (
+        RouteTarget.REALTIME_CHAT,
+        False,
+        "Translate what the user said or what is visible "
+        "in the image to the requested language. "
+        "If no target language specified, detect the source "
+        "language and translate to English. "
+        "Speak the translation clearly.",
     ),
     IntentCategory.GENERAL_CHAT: (
         RouteTarget.REALTIME_CHAT,
