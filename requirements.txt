@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+httpx
+dashscope
+python-dotenv
+aiosqlite
+pillow
+orjson
+websocket-client
