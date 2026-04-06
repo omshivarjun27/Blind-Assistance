@@ -13,15 +13,17 @@ This is the first plan with a physical gate check:
 user opens browser, speaks, hears Cherry voice.
 
 ## Audio Format Note
-- `getUserMedia()` gives the browser a `MediaStream`, not bytes on the wire.
-- If the frontend uses `MediaRecorder`, the browser emits encoded `Blob` chunks in a browser-selected container/codec, not raw PCM. Common outcomes are Opus in WebM/Ogg, but the exact default is browser-dependent and therefore UNCONFIRMED unless the frontend forces `mimeType`.
-- DashScope realtime expects PCM input, so backend transcoding is required if the frontend sends MediaRecorder chunks.
-- For this plan, the safer approach is: browser mic → Web Audio / AudioWorklet → Float32 samples → convert/resample in the browser to 16kHz 16-bit mono PCM → send binary PCM bytes over WebSocket.
-- In that browser-side PCM path, the backend does not transcode; it forwards PCM bytes to QwenRealtimeClient.
-- `decodeAudioData()` is for complete encoded audio file data, not arbitrary live fragments, so it is not a good primary backend strategy for realtime MediaRecorder chunk handling.
-- UNCONFIRMED:
-  - exact default browser codec/container when `MediaRecorder` is created without explicit `mimeType`
-  - exact browser audio callback chunk size when using AudioWorklet/Web Audio
+- `getUserMedia()` gives the browser a `MediaStream`, not raw bytes by itself.
+- If the frontend uses `MediaRecorder(stream)`, browser output is recorded as encoded `Blob` chunks in the browser's default container/codec format rather than raw PCM.
+- MDN's recording example finalizes recorded audio as `audio/ogg; codecs=opus`.
+- Therefore, if the frontend uses MediaRecorder-style chunks, the backend must transcode encoded browser audio before sending it to DashScope.
+- `decodeAudioData()` is not a valid streaming primitive for arbitrary PCM fragments because it operates on complete audio file data, not fragments.
+- For this plan, the backend contract is intentionally narrowed to **binary WebSocket frames containing one complete turn of raw PCM audio**.
+- That means **no backend transcoding is in scope for Plan 03**.
+- Plan 04 frontend must intentionally capture and send PCM (for example via Web Audio / AudioWorklet / equivalent browser-side PCM extraction path) if it wants to use this route contract directly.
+- If the frontend later chooses MediaRecorder default chunks instead, a separate backend transcoder will be required before DashScope.
+- UNCONFIRMED: exact default browser MediaRecorder MIME/container is not guaranteed to be identical across browsers.
+- UNCONFIRMED: exact PCM extraction implementation choice on the frontend is deferred to Plan 04.
 
 ## Safe Deletions In This Plan
 None. This plan only adds new files.
@@ -36,18 +38,28 @@ WebSocket route: GET /ws/realtime
   - Accepts WebSocket connection
   - Creates QwenRealtimeClient per session
   - Receives messages from browser:
-      binary frames = audio PCM bytes
+      binary frames = one complete audio turn of raw PCM bytes
       text frames = JSON control messages
         {"type": "image", "data": "<base64 jpeg>"}
         {"type": "instructions", "text": "..."}
         {"type": "ping"}
   - On audio received:
-      Call client.async_send_audio_turn(audio_pcm, image_b64)
+      Call client.async_send_audio_turn(
+          audio_pcm,
+          pending_image_b64,
+          pending_instructions,
+      )
       Send result.assistant_audio_pcm back as binary frame
       Send result.assistant_transcript as text JSON:
         {"type": "transcript", "text": "...", "role": "assistant"}
       Send user transcript as text JSON:
         {"type": "transcript", "text": "...", "role": "user"}
+      After dispatch, reset:
+        pending_image_b64 = None
+        pending_instructions = None
+  - On ping control message:
+      Send text JSON:
+        {"type": "pong"}
   - On disconnect: close QwenRealtimeClient
   - On error: log, close gracefully
 
@@ -55,16 +67,16 @@ Session state per connection:
   pending_image_b64: str | None
   pending_instructions: str | None
 
-Additional planning notes for this file:
-  - Use `APIRouter()` even though the repo does not yet use routers; this becomes the first route module under `apps/backend/api/routes/`.
-  - Use `await ws.accept()` before entering the loop.
-  - Prefer `await ws.receive()` so the handler can distinguish binary frames (`bytes`) from text JSON frames (`text`) in one loop.
-  - On binary audio frames, treat payload as already-normalized PCM16 mono bytes for DashScope.
-  - On `{"type": "image", ...}` store image only for the next audio turn, then clear it after the turn finishes.
-  - On `{"type": "instructions", ...}` store instruction override only for the next audio turn, then clear it after the turn finishes.
-  - On `{"type": "ping"}` respond with text JSON such as `{"type": "pong"}` so browser keepalive is explicit.
-  - If `result.error` is set, send text JSON `{"type": "error", "message": ...}` and keep shutdown graceful.
-  - Import path should reuse the existing service client directly from `apps.backend.services.dashscope.realtime_client`.
+Route behavior details that must be specified in the implementation:
+  - The route is request/response over WebSocket, not full-duplex live upstream streaming.
+  - Each binary frame is treated as one full user audio turn.
+  - `pending_image_b64` applies to the next audio turn only.
+  - `pending_instructions` applies to the next audio turn only.
+  - If the browser disconnects before a turn completes, close the DashScope client and end the session cleanly.
+  - Use FastAPI `WebSocketDisconnect` handling for normal disconnect path.
+  - If invalid JSON is received in a text frame, log it and close gracefully.
+  - If an unknown control message type is received, log it and close gracefully.
+  - Use one lazy-created QwenRealtimeClient per WebSocket session; do not create any shared module-level client.
 
 ### apps/backend/main.py (UPDATE — not replace)
 Add router import and include:
@@ -74,10 +86,12 @@ Add router import and include:
 Describe exactly where to add these lines.
 Do not replace existing content.
 
-Placement notes:
-  - Add the import in the existing import block after FastAPI/CORS imports and before or alongside the `shared.config.settings` import so imports stay grouped at top-of-file.
-  - Add `app.include_router(realtime_route.router)` after the existing `app.add_middleware(...)` block and before the `/health` route so router wiring happens once during startup.
-  - Keep `/health` and `/config` unchanged.
+Exact placement:
+  - Add the router import immediately after the existing line:
+      `from shared.config.settings import get_config, APP_HOST, APP_PORT, DEBUG`
+  - Add `app.include_router(realtime_route.router)` immediately after the existing `app.add_middleware(...)` block
+  - Place the include_router line before the first existing route decorator `@app.get("/health")`
+  - Preserve all existing logging, FastAPI app construction, middleware, `/health`, `/config`, and `uvicorn.run(...)` code unchanged
 
 ### tests/unit/test_realtime_route.py
 
@@ -113,11 +127,11 @@ Tests to include (all mocked — no real network):
     Assert no exception raised
     Assert client.close() was called
 
-Additional testing notes:
-  - This becomes the repo’s first FastAPI route-level websocket test file.
-  - Use FastAPI/Starlette `TestClient` websocket support for route tests; that is a new pattern in this repo and should be called out in implementation.
-  - Keep all QwenRealtimeClient behavior mocked; tests should verify route wiring, message handling, and cleanup only.
-  - Continue to rely on `tests/conftest.py` for env defaults instead of introducing new fixtures unless strictly necessary.
+Testing approach requirements:
+  - Use FastAPI/Starlette test client WebSocket support only
+  - Mock QwenRealtimeClient construction and async_send_audio_turn results
+  - Do not perform any real DashScope network calls in unit tests
+  - Do not require browser microphone access in unit tests
 
 ## Physical Gate Check (human verified)
 This plan's gate requires Om to physically verify.
@@ -129,29 +143,30 @@ GATE A — Backend WebSocket starts:
 
 GATE B — Simple WebSocket smoke test:
   python -c "
-  import json, websocket
-  from apps.backend.services.dashscope.realtime_client import make_silent_pcm
+  import asyncio, websockets, json
 
-  ws = websocket.create_connection('ws://127.0.0.1:8000/ws/realtime', timeout=30)
-  try:
-      silent = make_silent_pcm(0.5)
-      ws.send_binary(silent)
-      response = ws.recv()
-      if isinstance(response, bytes):
-          print('Audio response received:', len(response), 'bytes')
-          print('GATE B PASS')
-      else:
-          data = json.loads(response)
-          print('JSON response:', data)
-          print('GATE B PASS if no error')
-  finally:
-      ws.close()
+  async def test():
+      uri = 'ws://127.0.0.1:8000/ws/realtime'
+      async with websockets.connect(uri) as ws:
+          from apps.backend.services.dashscope.realtime_client import make_silent_pcm
+          silent = make_silent_pcm(0.5)
+          await ws.send(silent)
+          response = await asyncio.wait_for(ws.recv(), timeout=30)
+          if isinstance(response, bytes):
+              print('Audio response received:', len(response), 'bytes')
+              print('GATE B PASS')
+          else:
+              data = json.loads(response)
+              print('JSON response:', data)
+              print('GATE B PASS if no error')
+
+  asyncio.run(test())
   "
   Expected: audio bytes received from Qwen
   This is the first real DashScope turn in the project.
 
 GATE C — Log cleanliness:
-  After Gate B, logs must show:
+  Startup logs must show:
     "Realtime session ready: voice=Cherry"
   Must NOT show:
     Any localhost:11434 reference
@@ -170,16 +185,19 @@ GATE C — Log cleanliness:
    data = await ws.receive()
    if data["type"] == "websocket.receive":
        if "bytes" in data and data["bytes"]:
-           # binary = audio PCM
+           # binary = one complete PCM audio turn
        elif "text" in data and data["text"]:
            # text = JSON control message
 
 3. Browser audio format:
-   Browser mic capture does not produce raw bytes on its own.
-   If frontend uses MediaRecorder, the backend will receive encoded/containerized chunks and must transcode to PCM before DashScope.
-   For this plan, the route should assume the frontend sends PCM bytes directly over WebSocket binary frames.
-   That implies browser-side conversion/resampling (for example via AudioWorklet/Web Audio) to 16kHz 16-bit mono PCM before `ws.send(...)`.
-   Exact browser default MediaRecorder codec/container is UNCONFIRMED and should not be assumed.
+   - Browser microphone capture does not arrive as raw PCM automatically.
+   - `getUserMedia()` gives a MediaStream.
+   - `MediaRecorder(stream)` yields encoded Blob chunks in the browser's default format, not raw PCM.
+   - Therefore this route contract assumes the frontend does NOT use MediaRecorder for `/ws/realtime`.
+   - Frontend must send raw PCM frames extracted with Web Audio / AudioWorklet / equivalent.
+   - If MediaRecorder is used instead, backend transcoding is needed before DashScope.
+   - That transcoding path is out of scope for Plan 03.
+   - UNCONFIRMED: exact browser default container/codec across all supported browsers.
 
 4. Sending binary audio back:
    await ws.send_bytes(result.assistant_audio_pcm)
@@ -211,6 +229,18 @@ GATE C — Log cleanliness:
    On next audio turn:
        pass pending_image_b64 to async_send_audio_turn
        then reset: pending_image_b64 = None
+
+9. Instructions accumulation:
+   Store pending_instructions = None at session start.
+   When {"type":"instructions","text":"..."} received:
+       pending_instructions = data["text"]
+   On next audio turn:
+       pass pending_instructions to async_send_audio_turn
+       then reset: pending_instructions = None
+
+10. WebSocket state handling:
+    FastAPI exposes `client_state` and `application_state`.
+    Use normal exception handling for disconnects and avoid sending after close.
 
 ---
 
