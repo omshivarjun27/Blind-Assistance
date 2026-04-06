@@ -8,3 +8,4 @@ aiosqlite
 pillow
 orjson
 websocket-client
+websockets

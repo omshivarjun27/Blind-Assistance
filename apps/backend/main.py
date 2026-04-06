@@ -7,6 +7,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from shared.config.settings import get_config, APP_HOST, APP_PORT, DEBUG
+from apps.backend.api.routes import realtime as realtime_route
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -27,6 +28,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(realtime_route.router)
 
 
 @app.get("/health")
