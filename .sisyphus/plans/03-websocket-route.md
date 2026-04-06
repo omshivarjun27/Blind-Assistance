@@ -10,7 +10,7 @@ Create the /ws/realtime WebSocket endpoint that:
 4. Handles session lifecycle and disconnects
 
 This is the first plan with a physical gate check:
-user opens browser, speaks, hears Cherry voice.
+user opens browser, speaks, hears the model-appropriate default voice.
 
 ## Audio Format Note
 - `getUserMedia()` gives the browser a `MediaStream`, not raw bytes by itself.
@@ -166,8 +166,9 @@ GATE B — Simple WebSocket smoke test:
   This is the first real DashScope turn in the project.
 
 GATE C — Log cleanliness:
-  Startup logs must show:
-    "Realtime session ready: voice=Cherry"
+  Startup logs must show a successful realtime session log for the active model voice.
+  For the current `qwen3.5-omni-plus-realtime` setup, expect:
+    "Realtime session ready: voice=Tina"
   Must NOT show:
     Any localhost:11434 reference
     Any Deepgram/ElevenLabs reference
