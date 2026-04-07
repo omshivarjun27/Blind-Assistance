@@ -1,211 +1,335 @@
 # Plan 06b — Heavy Vision Fixes
 
-## Context
+## Section 1 — Context (what is true now)
 
-Historical reference point:
-- Plan 06 Prometheus commit: `d2fd94a`
-- Post-06 gap list originally identified:
-  1. TRANSLATE intent missing
-  2. First-turn vision fallback missing
-  3. Frontend not sending a frame with each audio turn
-  4. Classification blocking turns
-  5. `mm_client` instantiated per turn
+Plans complete:
+  00 — master plan
+  01 — scaffold + settings
+  02 — DashScope realtime client
+  03 — FastAPI WebSocket route
+  04 — browser camera + frame capture
+  05 — orchestrator + intent classifier + policy router
+  06 — heavy vision path (Hephaestus executed)
 
-Current repo truth after audit (HEAD is beyond Plan 06):
-- Those five gaps are already implemented in code.
-- Therefore, Plan 06b is now a **verification/supersession plan**, not a new feature implementation plan.
-- The purpose of this file is to document the exact code locations, doc confirmations, and the remaining manual gate checks that still need a human to verify in the browser.
+Last commit: `d2fd94a2d5ded01e702af61bc386df9f5ccb8451`
+Plan 06 Prometheus commit: `d2fd94a`
 
-Current relevant commits after Plan 06:
-- `ee79273` — heavy vision path
-- `24c3a8e` — camera vision pipeline + translation intent
+What is working after Plan 06 Hephaestus execution:
+  - `multimodal_client.py` exists and implements `VisionRequest`, `VisionResponse`, and `MultimodalClient.analyze()`
+  - `capture_coach.py` exists and provides pixel-based frame quality gating
+  - `live_scene_reader.py` exists
+  - `page_reader.py` exists
+  - `realtime.py` contains a HEAVY_VISION branch
+  - `framing_judge.py` exists and is intentionally not wired yet
+  - `tests/unit/test_heavy_vision.py` passes
 
-## Step 1 — Repo audit before planning
+Critical stale-brief reconciliation:
+The user-provided 06b post-mortem is **partially stale** relative to the actual repo.
 
-### Backend and orchestrator findings (exact symbol locations)
+Already landed in code now:
+  - `TRANSLATE` intent already exists in `intent_classifier.py`
+  - `TRANSLATE` routing already exists in `policy_router.py`
+  - first-turn image fallback to `SCENE_DESCRIBE` already exists in `realtime.py`
+  - async non-blocking classification via `_asyncio.create_task(...)` already exists in `realtime.py`
+  - `mm_client` is already instantiated once per WebSocket session in `realtime.py`
+  - frontend already sends an image before audio in `useRealtimeSession.ts`
 
-#### `apps/backend/api/routes/realtime.py`
-- `last_user_transcript`: line **93**
-- `mm_client = MultimodalClient.from_settings()`: line **95**
-- `pending_classification_task`: line **96**
-- `pending_image_b64`: line **99**
-- previous-turn classification block starts: line **118**
-- first-turn image fallback:
-  - `if predicted_intent is None and pending_image_b64:` line **161**
-  - `predicted_intent = IntentCategory.SCENE_DESCRIBE` line **162**
-- heavy vision branch begins: line **174**
-- heavy vision uses current/preserved image:
-  - `vision_image_b64 = classified_image_b64 or pending_image_b64` line **176**
-- multimodal call:
-  - `mm_client.analyze(...)` lines **191-197**
-- previous-turn classification task creation:
-  - `_asyncio.create_task(classifier.classify(last_user_transcript))` lines **254-257**
-- current turn still sends image/audio to realtime client:
-  - `image_jpeg_b64=pending_image_b64` line **242**
+Therefore Plan 06b is **not** a fresh implementation plan for those five items.
+It is a **reconciliation + regression-hardening plan** that:
+  1. preserves the already-landed behavior
+  2. closes the remaining explicit regression gap
+  3. cleans up duplicated test coverage
+  4. proves the runtime behavior with fast binary gate checks
 
-Current behavioral summary:
-- Classification is non-blocking and previous-turn based.
-- If no transcript exists yet but an image is present, the route assumes `SCENE_DESCRIBE`.
-- `mm_client` is already session-scoped.
-- Heavy vision uses preserved image state from the classified turn.
+Remaining real gaps for Plan 06b:
+  - GAP A — No explicit regression test yet proves `MultimodalClient.from_settings()` is created exactly once per WebSocket session.
+  - GAP B — `tests/unit/test_intent_classifier.py` contains duplicated `TRANSLATE` tests.
+  - GAP C — `tests/unit/test_policy_router.py` contains duplicated `TRANSLATE` tests and lacks the granular assertions requested in the post-mortem.
 
-#### `core/orchestrator/intent_classifier.py`
-- `_LABELS` includes `TRANSLATE`: line **31**
-- classifier prompt includes translation wording: lines **35-43**
-- `IntentCategory.TRANSLATE`: line **55**
+Non-goals for Plan 06b:
+  - Do not re-add `TRANSLATE` to classifier or router.
+  - Do not re-implement first-turn image fallback.
+  - Do not re-implement async lookahead classification.
+  - Do not re-implement frontend frame-before-audio sending.
+  - Do not add new runtime files.
 
-#### `core/orchestrator/policy_router.py`
-- `RouteTarget.TRANSLATE`: line **26**
-- `IntentCategory.TRANSLATE` mapping: lines **85-93**
-- Current target for translate is `RouteTarget.REALTIME_CHAT`, not a separate translation backend.
+## Section 2 — Step 1: Read Before Planning (actual findings)
 
-#### `apps/backend/services/dashscope/multimodal_client.py`
-- `VisionRequest`: lines **28-33**
-- `VisionResponse`: lines **36-43**
-- `MultimodalClient.from_settings()`: lines **63-75**
-- `analyze()` method: lines **77-157**
+Files read completely:
+  - `C:/ally-vision-v2/apps/backend/api/routes/realtime.py`
+  - `C:/ally-vision-v2/core/orchestrator/intent_classifier.py`
+  - `C:/ally-vision-v2/core/orchestrator/policy_router.py`
+  - `C:/ally-vision-v2/apps/backend/services/dashscope/multimodal_client.py`
+  - `C:/ally-vision-v2/shared/config/settings.py`
+  - `C:/ally-vision-v2/tests/unit/test_intent_classifier.py`
+  - `C:/ally-vision-v2/tests/unit/test_policy_router.py`
+  - `C:/ally-vision-v2/tests/unit/test_realtime_route.py`
+  - `C:/ally-vision-v2/tests/unit/test_heavy_vision.py`
+  - `C:/ally-vision-v2/apps/frontend/hooks/useRealtimeSession.ts`
+  - `C:/ally-vision-v2/apps/frontend/hooks/useCameraCapture.ts`
+  - `C:/ally-vision-v2/apps/frontend/app/page.tsx`
 
-#### Frontend: `apps/frontend/hooks/useRealtimeSession.ts`
-- `captureFrameRef`: line **42**
-- auto-capture before audio send:
-  - `const frame = captureFrameRef.current?.();` line **60**
-  - console log `[Session] Frame captured:` line **61**
-  - send image before audio: lines **62-65**
-- `captureFrameRef.current = captureFrame`: line **110**
-- auto-preload next frame after playback: lines **121-124**
-- manual capture path still exists: lines **157-160**
+Repo findings:
 
-#### Frontend: `apps/frontend/lib/ws-client.ts`
-- `sendImage()` logs and sends image JSON: lines **73-76**
+### `apps/backend/api/routes/realtime.py`
+- Current routing decision is used in the audio-turn path before the upstream realtime call.
+- `HEAVY_VISION` is detected at:
+  - `174-175`: `if decision.target == RouteTarget.HEAVY_VISION:` then `applied_target = RouteTarget.HEAVY_VISION`
+- When `HEAVY_VISION` is routed:
+  - `176-177`: it selects `vision_image_b64 = classified_image_b64 or pending_image_b64`
+  - `177`: it runs `assess_frame_quality(vision_image_b64)`
+  - `178-185`: if unusable, it sets spoken guidance instructions and skips heavy vision HTTP
+  - `186-215`: if usable, it calls `mm_client.analyze(VisionRequest(...))`
+  - `198-206`: on success, it turns returned text into spoken instructions
+  - `207-215`: on failure, it falls back to retry guidance
+  - `239-244`: it still sends the final user turn through `client.async_send_audio_turn(...)`
 
-### Existing tests that now enforce the once-missing behavior
+### `core/orchestrator/policy_router.py`
+- `RouteTarget.HEAVY_VISION` definition:
+  - `25`: `HEAVY_VISION = "HEAVY_VISION"`
+- `requires_frame` in context means the intent needs a current camera frame before it can be served safely.
+- Evidence:
+  - `55-63`: `READ_TEXT` and `SCAN_PAGE` both route to `HEAVY_VISION` with `requires_frame=True`
+  - `115-116`: returned `RoutingDecision` includes the route target and `requires_frame` flag
 
-#### `tests/unit/test_intent_classifier.py`
-- translate classification test: lines **55-88**
+### `shared/config/settings.py`
+- `QWEN_VISION_MODEL`
+  - `50-53`
+  - dev default: `qwen3.5-flash`
+  - exam default: `qwen3.6-plus`
+- `DASHSCOPE_COMPAT_BASE`
+  - `40-43`: `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`
+- `DASHSCOPE_HTTP_BASE`
+  - `32-35`: `https://dashscope-intl.aliyuncs.com/api/v1`
 
-#### `tests/unit/test_policy_router.py`
-- translate routing test: lines **35-52**
+### Symbol search findings with exact line numbers
 
-#### `tests/unit/test_realtime_route.py`
-- image queued for next turn: lines **152-188**
-- first-turn no-transcript image fallback to scene describe: lines **190-225**
-- non-blocking pending classifier: lines **328-369**
-- empty transcript clears stale classification state: lines **372-423**
-- first heavy-vision request preserved while later transcript arrives: lines **425-510**
+`last_user_transcript` in `realtime.py`
+  - `93`: declaration
+  - `252`: assignment from `result.user_transcript`
+  - `253`: truthiness check
+  - `256`: classification task creation uses it
+  - `261`: queued lookahead stores it
 
-### Audit conclusion
+`pending_classification_task` in `realtime.py`
+  - `96`: declaration
+  - `127-132`: done-task check and result retrieval
+  - `141`: reset to `None`
+  - `147-149`: `_asyncio.create_task(classifier.classify(queued_transcript))`
+  - `153-154`: not-done branch
+  - `254-257`: `_asyncio.create_task(classifier.classify(last_user_transcript))`
 
-The five original 06b gaps are already fixed in the current codebase. There is no honest implementation work left that matches the original 06b scope.
+`pending_image_b64` in `realtime.py`
+  - `99`: declaration
+  - `161-163`: first-turn image fallback to `SCENE_DESCRIBE`
+  - `176`: consumed into `vision_image_b64`
+  - `221`: frame-required fallback branch
+  - `242`: passed to `client.async_send_audio_turn(...)`
+  - `249`: copied to `turn_image_b64`
+  - `266`: reset to `None`
+  - `325-327`: assigned from control message `{"type":"image"}`
 
-## Step 2 — Docs verification
+`mm_client` in `realtime.py`
+  - `95`: `mm_client = MultimodalClient.from_settings()`
+  - `189`: logging `mm_client._model`
+  - `191`: `vision_result = await mm_client.analyze(...)`
 
-### Point 1 — qwen-turbo for short single-label classification prompts
-**UNCONFIRMED**
+`captureFrame` in `apps/frontend/`
+  - `apps/frontend/app/page.tsx:13`: `useRealtimeSession(camera.captureFrame)`
+  - `apps/frontend/hooks/useCameraCapture.ts:33-50`: function implementation
+  - `apps/frontend/hooks/useRealtimeSession.ts:36`: hook accepts `captureFrame`
+  - `apps/frontend/hooks/useRealtimeSession.ts:42`: `captureFrameRef` declaration
+  - `apps/frontend/hooks/useRealtimeSession.ts:60-64`: frame captured and sent before audio in `flushTurn()`
+  - `apps/frontend/hooks/useRealtimeSession.ts:110`: `captureFrameRef.current = captureFrame`
+  - `apps/frontend/hooks/useRealtimeSession.ts:121-124`: capture after playback
+  - `apps/frontend/hooks/useRealtimeSession.ts:158-160`: manual capture button path
+  - `apps/frontend/hooks/useRealtimeSession.ts:172`: reset on stop
 
-Confirmed:
-- official Alibaba docs list `qwen-turbo` as a supported compatible-mode chat model.
+`useRealtimeSession` in `apps/frontend/`
+  - `apps/frontend/hooks/useRealtimeSession.ts:36`: hook export
+  - `apps/frontend/app/page.tsx:9`: import
+  - `apps/frontend/app/page.tsx:13`: usage
 
-Not confirmed:
-- I did not find an official Alibaba doc explicitly recommending `qwen-turbo` for short single-label classification prompts.
+`TRANSLATE` in `core/orchestrator/`
+  - `core/orchestrator/intent_classifier.py:31`: `_LABELS`
+  - `core/orchestrator/intent_classifier.py:39-41`: prompt includes TRANSLATE instructions
+  - `core/orchestrator/intent_classifier.py:55`: enum member
+  - `core/orchestrator/policy_router.py:26`: `RouteTarget.TRANSLATE`
+  - `core/orchestrator/policy_router.py:85-93`: routing table entry
 
-Interpretation:
-- The current classifier path is plausible and already passing tests, but not directly doc-proven as a classification best practice.
-
-### Point 2 — Qwen Omni realtime multilingual support for translation-style prompts
-**UNCONFIRMED**
-
-Confirmed:
-- official docs confirm multilingual recognition/synthesis support and configurable instructions/system goals.
-
-Not confirmed:
-- I did not find a direct official doc statement that Omni-Realtime itself should be used for prompt-driven translation, because Alibaba also documents a dedicated realtime translation model separately.
-
-Interpretation:
-- The current `TRANSLATE -> REALTIME_CHAT` design is plausible and already implemented, but not first-party doc-proven as the canonical translation path.
-
-### Point 3 — `asyncio.create_task()` safety inside FastAPI WebSocket handler
-**CONFIRMED**
-
-Confirmed from docs:
-- `asyncio.create_task()` schedules work on the running event loop.
-- FastAPI WebSocket handlers are async handlers and run on the event loop.
-- Important caveat: keep a strong reference to created tasks so they are not garbage collected.
-
-Interpretation:
-- The current route’s retained task references are consistent with safe usage.
-
-## Plan requirements (supersession status)
-
-### Goal
-No new code changes are required for the original 06b scope because all five historical gaps are already implemented.
-
-### Files to edit
-None for the original 06b gap list.
-
-### Files to create
-None.
-
-### Files to delete
-None.
-
-### Tests to update
-None required for the original 06b scope, because the relevant tests already exist and currently pass:
+Test-file findings:
 - `tests/unit/test_intent_classifier.py`
+  - `56-70`: first `test_classify_returns_translate`
+  - `74-88`: duplicate `test_classify_returns_translate`
 - `tests/unit/test_policy_router.py`
+  - `35-42`: first translate routing test
+  - `45-52`: duplicate translate routing test
 - `tests/unit/test_realtime_route.py`
+  - `190-225`: first-turn image fallback already covered
+  - `328-369`: non-blocking classifier behavior already covered
+  - No explicit `mm_client created once per session` test yet
 
-### Tests to run to confirm the 06b state remains healthy
-```bash
-C:/ally-vision-v2/.venv/Scripts/pytest.exe tests/unit/test_intent_classifier.py -v --timeout=30 -x
-C:/ally-vision-v2/.venv/Scripts/pytest.exe tests/unit/test_policy_router.py -v --timeout=30 -x
-C:/ally-vision-v2/.venv/Scripts/pytest.exe tests/unit/test_realtime_route.py -v --timeout=30 -x
-C:/ally-vision-v2/.venv/Scripts/pytest.exe tests/unit/test_heavy_vision.py -v --timeout=30 -x
-```
+## Section 3 — Step 2: Verify Docs
 
-### Remaining gate checks (manual only)
+1. DashScope compatible-mode: does qwen-turbo support classification prompts returning a single label word?
+   - **CONFIRMED (partial)**: `qwen-turbo` is a supported model on the compatible-mode chat-completions endpoint.
+   - **UNCONFIRMED (specific behavior)**: Alibaba docs do not explicitly document “single-label classification prompt” as a named supported pattern. That behavior is a prompt-design choice, not a documented product guarantee.
 
-#### Gate 1 — Translation intent live
-- Start backend + frontend.
-- Speak: `translate hello to Hindi`
-- Pass: Hindi response is heard.
+2. Qwen Omni realtime multilingual support for TRANSLATE intent
+   - **CONFIRMED**: Qwen3.5-Omni documentation explicitly lists support for **113 input languages/dialects**.
 
-#### Gate 2 — Frame auto-sent with audio turn
-- Open browser DevTools → Network → WS.
-- Speak any utterance while camera is on.
-- Pass: image JSON frame is visible before the binary audio frame.
+3. `asyncio.create_task()` safety inside FastAPI WebSocket handler
+   - **CONFIRMED**: Python docs identify `asyncio.create_task()` as the standard API for scheduling a coroutine as a task in the running event loop.
+   - **CONFIRMED**: FastAPI/Starlette WebSocket handlers are async coroutines running on the active event loop, so using `create_task()` from inside the handler is valid.
+   - **Guardrail**: create tasks only from within the handler coroutine and keep loop-bound objects session-local to avoid cross-loop test/runtime issues.
 
-#### Gate 3 — First-turn vision works
-- Open browser, point camera at object.
-- First utterance only: `what is this`
-- Pass: object is described rather than a generic chat response.
+## Section 4 — Plan Requirements
 
-## Quality self-check
+### A) Goal
+Reconcile the stale 06b post-mortem against the actual repo, preserve the already-landed runtime fixes, close the one remaining regression gap (`mm_client` once-per-session coverage), and clean up duplicated TRANSLATE test coverage.
 
-- [x] `TRANSLATE` exists in both `intent_classifier.py` and `policy_router.py`
-- [x] `TRANSLATE` maps to `REALTIME_CHAT`
-- [x] first-turn fallback uses `SCENE_DESCRIBE` when image is present
-- [x] async classification uses `create_task()` and does not block the turn
-- [x] `mm_client` is session-scoped
-- [x] frontend sends image before audio in the auto-capture path
-- [x] all five original 06b gaps are already addressed
-- [x] no new files are needed for the original gap list
+### B) Files To Edit (actual reconciled scope)
 
-## Commit rule
+Expected code edits for 06b are **test-focused**. Runtime files should remain unchanged unless a newly added regression test proves a real defect.
 
-Commit ONLY this plan file:
+1. `tests/unit/test_realtime_route.py`
+   - ADD:
+     - `test_websocket_creates_multimodal_client_once_per_session()`
+       - patch `MultimodalClient.from_settings`
+       - open one websocket session
+       - send multiple audio turns
+       - assert constructor/factory called exactly once for the session
+       - assert existing behavior still works across multiple turns
 
-```bash
-git add .sisyphus/plans/06b-heavy-vision-fixes.md
-git commit -m "plan: write plan 06b heavy vision fixes
+2. `tests/unit/test_intent_classifier.py`
+   - CLEAN UP duplicate translate coverage
+   - KEEP one translate-intent test
+   - ADD:
+     - `test_translate_in_labels()`
+       - assert `"TRANSLATE" in _LABELS`
+   - REMOVE or merge the duplicate `test_classify_returns_translate()` so coverage is not duplicated
 
-Fix 5 gaps from Plan 06:
-- TRANSLATE intent added to classifier + router
-- First-turn vision fallback (SCENE_DESCRIBE when image present)
-- Async non-blocking classification via create_task()
-- mm_client moved to session scope (not per-turn)
-- Frontend auto-sends frame before every audio turn"
-```
+3. `tests/unit/test_policy_router.py`
+   - CLEAN UP duplicate translate routing test
+   - REPLACE the duplicate pair with these explicit tests:
+     - `test_translate_routes_to_realtime_chat()`
+     - `test_translate_not_requires_frame()`
+     - `test_translate_has_system_instructions()`
 
-## Stop rule
+4. `apps/backend/api/routes/realtime.py`
+   - **Expected outcome: no code change** because the requested fixes are already present.
+   - Edit only if the new `mm_client once per session` regression test fails.
+   - If that happens, enforce this exact invariant:
+     - `MultimodalClient.from_settings()` stays above the websocket `while True` loop
+     - no per-turn `MultimodalClient()` or `.from_settings()` call exists below line `102`
 
-This plan records that the intended 06b code fixes are already present in the current repo. No further implementation should be performed under Plan 06b unless a new gap is discovered during the manual browser gates.
+5. `apps/frontend/hooks/useRealtimeSession.ts`
+   - **Expected outcome: no code change** because frame-before-audio sending is already present in `flushTurn()`.
+   - Do not edit unless Gate 2 proves a real mismatch between browser runtime behavior and current code.
+
+### C) Files To Create
+None.
+
+### D) Files To Delete
+None.
+
+### E) Tests To Update
+
+1. `tests/unit/test_intent_classifier.py`
+   ADD / NORMALIZE:
+     - `test_translate_in_labels()`
+       - verify `"TRANSLATE" in _LABELS`
+     - `test_classify_translate_intent()`
+       - mock httpx to return `"TRANSLATE"`
+       - assert `result.intent == IntentCategory.TRANSLATE`
+   CLEANUP:
+     - remove duplicate translate test definition so only one translate-classification test remains
+
+2. `tests/unit/test_policy_router.py`
+   ADD / NORMALIZE:
+     - `test_translate_routes_to_realtime_chat()`
+       - assert `route(IntentCategory.TRANSLATE).target == RouteTarget.REALTIME_CHAT`
+     - `test_translate_not_requires_frame()`
+       - assert `route(IntentCategory.TRANSLATE).requires_frame is False`
+     - `test_translate_has_system_instructions()`
+       - assert `"translate" in route(IntentCategory.TRANSLATE).system_instructions.lower()`
+   CLEANUP:
+     - remove duplicate translate routing test definition
+
+3. `tests/unit/test_realtime_route.py`
+   ADD:
+     - `test_mm_client_created_once_per_session()`
+       - verify `MultimodalClient.from_settings()` is not re-instantiated on every audio turn
+   KEEP existing tests untouched because they already cover:
+     - first-turn image fallback to `SCENE_DESCRIBE`
+     - non-blocking classifier behavior via lookahead task
+
+### F) Tests To Run (exact commands)
+`C:/ally-vision-v2/.venv/Scripts/pytest.exe tests/unit/test_intent_classifier.py -v --timeout=30 -x`
+
+`C:/ally-vision-v2/.venv/Scripts/pytest.exe tests/unit/test_policy_router.py -v --timeout=30 -x`
+
+`C:/ally-vision-v2/.venv/Scripts/pytest.exe tests/unit/test_realtime_route.py -v --timeout=30 -x`
+
+`C:/ally-vision-v2/.venv/Scripts/pytest.exe tests/unit/test_heavy_vision.py -v --timeout=30 -x`
+
+### G) Gate Checks
+
+GATE 1 — Translation intent live:
+  Start backend.
+  Open browser, speak: "translate hello to Hindi"
+  Ally must respond in Hindi. Not a generic reply.
+  PASS = Hindi response heard
+  FAIL = generic response or error
+
+GATE 2 — Frame auto-sent with audio turn:
+  Open browser DevTools → Network → WS.
+  Speak anything while camera is on.
+  WS frames must show: image JSON message sent
+  BEFORE audio binary frame.
+  PASS = image frame visible in DevTools before audio frame
+  FAIL = no image frame in WS messages
+
+GATE 3 — First-turn vision works:
+  Open browser, point camera at object.
+  Speak "what is this" as first ever message.
+  (No prior turn, no transcript history)
+  Ally must describe the object, not give generic response.
+  PASS = object described correctly
+  FAIL = generic "how can I help" response
+
+## Section 5 — Quality Self-Check
+Before committing the plan file, verify:
+  □ TRANSLATE already exists in both `intent_classifier.py` and `policy_router.py`
+  □ TRANSLATE is already mapped to `REALTIME_CHAT` (Qwen native, no new service)
+  □ first-turn fallback already uses `SCENE_DESCRIBE` when image present
+  □ async classification already uses `create_task()` — current turn is not blocked
+  □ `mm_client` is already session-scoped, not per-turn
+  □ Frontend already sends image BEFORE audio binary in same turn
+  □ All 5 stale-gap claims are reconciled against actual repo state
+  □ No existing passing tests are broken
+  □ Gate checks are binary PASS/FAIL and runnable in < 5 minutes
+  □ No always-on background processing introduced
+  □ No new runtime files created — only test cleanup/hardening expected
+
+## Section 6 — Commit Rule
+Commit ONLY the plan file:
+
+  git add .sisyphus/plans/06b-heavy-vision-fixes.md
+  git commit -m "plan: write plan 06b heavy vision fixes
+
+  Fix 5 gaps from Plan 06:
+  - TRANSLATE intent added to classifier + router
+  - First-turn vision fallback (SCENE_DESCRIBE when image present)
+  - Async non-blocking classification via create_task()
+  - mm_client moved to session scope (not per-turn)
+  - Frontend auto-sends frame before every audio turn"
+
+Commit-message note:
+  The message is preserved exactly as requested for continuity,
+  even though the repo read shows those fixes are already landed and
+  06b is now a regression-hardening / reconciliation plan.
+
+## Section 7 — Stop Rule
+STOP. Say "PLAN 06b PROMETHEUS COMPLETE"
+Wait for instruction.
