@@ -40,8 +40,6 @@ class RoutingDecision:
 
 _UNIMPLEMENTED = {
     RouteTarget.WEB_SEARCH,
-    RouteTarget.MEMORY_WRITE,
-    RouteTarget.MEMORY_READ,
     RouteTarget.DOCUMENT_QA,
 }
 

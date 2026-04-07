@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import asyncio as _asyncio
+import struct
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -29,15 +30,35 @@ from apps.backend.services.dashscope.realtime_client import (
     QwenRealtimeClient,
     QwenRealtimeConfig,
 )
+from core.memory import MemoryManager
 from core.orchestrator.capture_coach import assess_frame_quality
 from core.orchestrator.intent_classifier import (
     IntentCategory,
     IntentClassifier,
 )
+from core.orchestrator.prompt_builder import (
+    build_memory_fact,
+    build_system_prompt,
+)
 from core.orchestrator.policy_router import RouteTarget, route
 
 logger = logging.getLogger("ally-vision-realtime-route")
 router = APIRouter()
+
+_RECALL_PHRASES = (
+    "what did i tell you",
+    "do you remember",
+    "recall ",
+    "what is my",
+    "who is my",
+    "where is my",
+)
+
+
+def make_silent_pcm(duration_seconds: float, sample_rate: int = 16000) -> bytes:
+    """Generate silent PCM audio (16-bit mono zeros)."""
+    num_samples = int(sample_rate * duration_seconds)
+    return struct.pack(f"<{num_samples}h", *([0] * num_samples))
 
 
 async def _send_upstream_error(
@@ -93,6 +114,8 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     last_user_transcript: str = ""
     classifier = IntentClassifier.from_settings()
     mm_client = MultimodalClient.from_settings()
+    memory_manager = MemoryManager.from_settings()
+    await memory_manager.store.initialize()
     pending_classification_task: _asyncio.Task[object] | None = None
     pending_classification_image_b64: str | None = None
     queued_classification_input: tuple[str, str | None] | None = None
@@ -122,6 +145,9 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 applied_target = RouteTarget.REALTIME_CHAT
                 predicted_intent: IntentCategory | None = None
                 classified_image_b64: str | None = None
+                route_audio_pcm = audio_pcm
+                route_image_b64 = pending_image_b64
+                classifier_handled_previous_memory = False
 
                 if (
                     pending_classification_task
@@ -171,7 +197,52 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         decision.target.value,
                         decision.requires_frame,
                     )
-                    if decision.target == RouteTarget.HEAVY_VISION:
+                    if decision.target == RouteTarget.MEMORY_WRITE:
+                        applied_target = RouteTarget.MEMORY_WRITE
+                        try:
+                            confirmed_fact = await memory_manager.save(
+                                user_id="default",
+                                raw_utterance=last_user_transcript,
+                            )
+                            effective_instructions = (
+                                f"Tell the user: I will remember that {confirmed_fact}."
+                            )
+                            route_audio_pcm = make_silent_pcm(0.5)
+                            route_image_b64 = None
+                            classifier_handled_previous_memory = True
+                        except Exception as exc:
+                            logger.warning(
+                                "Classifier-routed memory save failed: %s",
+                                exc,
+                            )
+                    elif decision.target == RouteTarget.MEMORY_READ:
+                        applied_target = RouteTarget.MEMORY_READ
+                        try:
+                            memory_context = await memory_manager.recall(
+                                user_id="default",
+                                query=last_user_transcript,
+                                top_k=3,
+                            )
+                            if memory_context:
+                                effective_instructions = build_system_prompt(
+                                    base_instructions=(
+                                        f"The user asked: {last_user_transcript}\n"
+                                        "Answer using only the relevant stored memory."
+                                        " Be brief and speak naturally."
+                                    ),
+                                    memory_context=memory_context,
+                                )
+                            else:
+                                effective_instructions = "Tell the user: I don't have anything stored about that yet."
+                            route_audio_pcm = make_silent_pcm(0.5)
+                            route_image_b64 = None
+                            classifier_handled_previous_memory = True
+                        except Exception as exc:
+                            logger.warning(
+                                "Classifier-routed memory recall failed: %s",
+                                exc,
+                            )
+                    elif decision.target == RouteTarget.HEAVY_VISION:
                         applied_target = RouteTarget.HEAVY_VISION
                         vision_image_b64 = classified_image_b64 or pending_image_b64
                         is_usable, guidance = assess_frame_quality(vision_image_b64)
@@ -238,19 +309,97 @@ async def realtime_endpoint(ws: WebSocket) -> None:
 
                 try:
                     result = await client.async_send_audio_turn(
-                        audio_pcm=audio_pcm,
-                        image_jpeg_b64=pending_image_b64,
+                        audio_pcm=route_audio_pcm,
+                        image_jpeg_b64=route_image_b64,
                         instructions=effective_instructions,
                     )
                 except Exception as exc:
                     await _send_upstream_error(ws, str(exc), config)
                     break
 
+                current_user_transcript = result.user_transcript or ""
+
+                # ── same-turn memory detection ──────────────────────────────
+                _is_memory_save = False
+                _is_memory_recall = False
+
+                _cleaned = build_memory_fact(current_user_transcript)
+                if _cleaned != current_user_transcript.strip():
+                    _is_memory_save = True
+                elif any(
+                    current_user_transcript.lower().startswith(phrase)
+                    for phrase in _RECALL_PHRASES
+                ):
+                    _is_memory_recall = True
+
+                if _is_memory_save:
+                    try:
+                        if _cleaned:
+                            confirmed_fact = await memory_manager.save(
+                                user_id="default",
+                                raw_utterance=current_user_transcript,
+                            )
+                            override_result = await client.async_send_audio_turn(
+                                audio_pcm=make_silent_pcm(0.5),
+                                instructions=(
+                                    f"Tell the user: I will remember that {confirmed_fact}."
+                                ),
+                            )
+                            override_result.user_transcript = current_user_transcript
+                            result = override_result
+                            _skip_classifier = True
+                        else:
+                            override_result = await client.async_send_audio_turn(
+                                audio_pcm=make_silent_pcm(0.5),
+                                instructions=(
+                                    "Tell the user: Please say the fact you want me to remember."
+                                ),
+                            )
+                            override_result.user_transcript = current_user_transcript
+                            result = override_result
+                            _skip_classifier = True
+                    except Exception as exc:
+                        logger.warning("Memory save failed: %s", exc)
+                        _skip_classifier = False
+
+                elif _is_memory_recall:
+                    try:
+                        memory_context = await memory_manager.recall(
+                            user_id="default",
+                            query=current_user_transcript,
+                            top_k=3,
+                        )
+                        if memory_context:
+                            recall_instructions = build_system_prompt(
+                                base_instructions=(
+                                    f"The user asked: {current_user_transcript}\n"
+                                    "Answer using only the relevant stored memory."
+                                    " Be brief and speak naturally."
+                                ),
+                                memory_context=memory_context,
+                            )
+                        else:
+                            recall_instructions = "Tell the user: I don't have anything stored about that yet."
+                        override_result = await client.async_send_audio_turn(
+                            audio_pcm=make_silent_pcm(0.5),
+                            instructions=recall_instructions,
+                        )
+                        override_result.user_transcript = current_user_transcript
+                        result = override_result
+                        _skip_classifier = True
+                    except Exception as exc:
+                        logger.warning("Memory recall failed: %s", exc)
+                        _skip_classifier = False
+
+                else:
+                    _skip_classifier = classifier_handled_previous_memory
+                # ── end same-turn memory detection ──────────────────────────
+
                 turn_image_b64 = pending_image_b64
 
                 # Store for next turn classification
                 last_user_transcript = result.user_transcript or ""
-                if last_user_transcript:
+                if last_user_transcript and not _skip_classifier:
                     if pending_classification_task is None:
                         pending_classification_task = _asyncio.create_task(
                             classifier.classify(last_user_transcript)

@@ -15,7 +15,7 @@ _SEARCH_PREFIXES = re.compile(
 )
 
 _MEMORY_PREFIXES = re.compile(
-    r"^(remember\s+(that\s+)?|save\s+(this\s+)?|note\s+(that\s+)?)",
+    r"^((please\s+)?memorize\s+(that\s+)?|remember\s+(that\s+)?|save\s+(this\s+)?|note\s+(that\s+)?)",
     re.IGNORECASE,
 )
 

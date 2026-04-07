@@ -9,3 +9,4 @@ pillow
 orjson
 websocket-client
 websockets
+numpy

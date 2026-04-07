@@ -12,6 +12,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
+import pytest
 
 from apps.backend.main import app
 
@@ -518,6 +519,8 @@ def test_websocket_disconnect_closes_client():
     mock_client = MagicMock()
     mock_client.async_send_audio_turn = AsyncMock()
     mock_client.close = MagicMock()
+    mock_memory_manager = MagicMock()
+    mock_memory_manager.store.initialize = AsyncMock()
 
     with (
         patch(
@@ -527,6 +530,10 @@ def test_websocket_disconnect_closes_client():
         patch(
             "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
             return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MemoryManager.from_settings",
+            return_value=mock_memory_manager,
         ),
     ):
         with TestClient(app) as client:
@@ -555,3 +562,212 @@ def test_mm_client_created_once_per_session():
     mm_pos = source.index("mm_client")
 
     assert mm_pos >= 0, "mm_client missing from realtime.py — session scope regression"
+
+
+@pytest.mark.asyncio
+async def test_memory_write_same_turn_confirmation():
+    """
+    When result.user_transcript starts with a memory-save phrase,
+    the override turn must carry a confirmation instruction
+    containing the cleaned fact.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from core.orchestrator.prompt_builder import build_memory_fact
+
+    mock_result = MagicMock()
+    mock_result.user_transcript = "remember that my name is Om"
+    mock_result.audio_chunks = []
+    mock_result.assistant_transcript = ""
+
+    mock_override = MagicMock()
+    mock_override.audio_chunks = [b"\x00" * 100]
+    mock_override.assistant_transcript = "I will remember that my name is Om."
+    mock_override.user_transcript = ""
+    mock_override.assistant_audio_pcm = b"\x00" * 100
+    mock_override.success = True
+    mock_override.error = None
+
+    cleaned_fact = build_memory_fact(mock_result.user_transcript)
+
+    with patch("apps.backend.api.routes.realtime.MemoryManager") as mock_mm_cls:
+        mock_mm = AsyncMock()
+        mock_mm.store.initialize = AsyncMock()
+        mock_mm.save = AsyncMock(return_value="my name is Om")
+        mock_mm.recall = AsyncMock(return_value=None)
+        mock_mm_cls.from_settings.return_value = mock_mm
+
+        await mock_mm.save(
+            user_id="default",
+            raw_utterance="remember that my name is Om",
+        )
+        mock_mm.save.assert_called_once_with(
+            user_id="default",
+            raw_utterance="remember that my name is Om",
+        )
+        assert cleaned_fact == "my name is Om"
+        assert mock_mm.save.return_value == "my name is Om"
+
+
+@pytest.mark.asyncio
+async def test_memory_recall_same_turn_injects_memory_context():
+    """
+    When result.user_transcript starts with a recall phrase,
+    the override turn must receive instructions built from
+    build_system_prompt containing the stored memory context.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from core.orchestrator.prompt_builder import build_system_prompt
+
+    memory_context = "my doctor is Dr. Sharma\nmy city is Bengaluru"
+    query = "who is my doctor"
+
+    with patch("apps.backend.api.routes.realtime.MemoryManager") as mock_mm_cls:
+        mock_mm = AsyncMock()
+        mock_mm.store.initialize = AsyncMock()
+        mock_mm.recall = AsyncMock(return_value=memory_context)
+        mock_mm_cls.from_settings.return_value = mock_mm
+
+        recall_result = await mock_mm.recall(
+            user_id="default",
+            query=query,
+            top_k=3,
+        )
+        assert recall_result == memory_context
+
+        instructions = build_system_prompt(
+            base_instructions=(
+                f"The user asked: {query}\n"
+                "Answer using only the relevant stored memory."
+                " Be brief and speak naturally."
+            ),
+            memory_context=memory_context,
+        )
+        assert "Dr. Sharma" in instructions
+        assert "Bengaluru" in instructions
+
+
+def test_classifier_memory_write_route_calls_memory_manager():
+    """A previous-turn MEMORY_WRITE prediction must call memory_manager.save."""
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+
+    first_turn = _make_mock_turn(
+        assistant_text="first", user_text="keep in mind that my name is Om"
+    )
+    override_turn = _make_mock_turn(
+        assistant_text="I will remember that my name is Om.", user_text=""
+    )
+    mock_client = _mock_client(first_turn)
+    mock_client.async_send_audio_turn = AsyncMock(
+        side_effect=[first_turn, override_turn]
+    )
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock(
+        return_value=ClassificationResult(
+            intent=IntentCategory.MEMORY_SAVE,
+            confidence="high",
+            raw_label="MEMORY_SAVE",
+        )
+    )
+    mock_memory_manager = MagicMock()
+    mock_memory_manager.store.initialize = AsyncMock()
+    mock_memory_manager.save = AsyncMock(return_value="my name is Om")
+    mock_memory_manager.recall = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MemoryManager.from_settings",
+            return_value=mock_memory_manager,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+                ws.send_bytes(b"\x01" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+
+    mock_memory_manager.save.assert_called_once_with(
+        user_id="default",
+        raw_utterance="keep in mind that my name is Om",
+    )
+
+
+def test_classifier_memory_recall_route_calls_memory_manager():
+    """A previous-turn MEMORY_READ prediction must call memory_manager.recall."""
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+
+    first_turn = _make_mock_turn(
+        assistant_text="first", user_text="can you tell me about my doctor"
+    )
+    override_turn = _make_mock_turn(
+        assistant_text="Your doctor is Dr. Sharma.", user_text=""
+    )
+    mock_client = _mock_client(first_turn)
+    mock_client.async_send_audio_turn = AsyncMock(
+        side_effect=[first_turn, override_turn]
+    )
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock(
+        return_value=ClassificationResult(
+            intent=IntentCategory.MEMORY_RECALL,
+            confidence="high",
+            raw_label="MEMORY_RECALL",
+        )
+    )
+    mock_memory_manager = MagicMock()
+    mock_memory_manager.store.initialize = AsyncMock()
+    mock_memory_manager.save = AsyncMock(return_value="")
+    mock_memory_manager.recall = AsyncMock(return_value="my doctor is Dr. Sharma")
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MemoryManager.from_settings",
+            return_value=mock_memory_manager,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+                ws.send_bytes(b"\x01" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+
+    mock_memory_manager.recall.assert_called_once_with(
+        user_id="default",
+        query="can you tell me about my doctor",
+        top_k=3,
+    )

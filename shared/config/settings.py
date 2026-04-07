@@ -6,6 +6,7 @@ Never hardcode secrets here.
 
 from __future__ import annotations
 import os
+import pathlib
 from dotenv import load_dotenv
 
 _ = load_dotenv()
@@ -57,6 +58,10 @@ QWEN_TRANSCRIPTION_MODEL: str = _get("QWEN_TRANSCRIPTION_MODEL", "gummy-realtime
 EMBEDDING_MODEL: str = _get("EMBEDDING_MODEL", "text-embedding-v3")
 EMBEDDING_DIMENSIONS: int = int(_get("EMBEDDING_DIMENSIONS", "1024"))
 EMBEDDING_OUTPUT_TYPE: str = _get("EMBEDDING_OUTPUT_TYPE", "dense")
+MEMORY_DB_PATH: str = os.getenv("MEMORY_DB_PATH", "data/sqlite/memory.db")
+
+# Ensure parent directory exists at settings load time
+pathlib.Path(MEMORY_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 # App
 APP_HOST: str = _get("APP_HOST", "127.0.0.1")

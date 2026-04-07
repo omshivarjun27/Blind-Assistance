@@ -71,3 +71,10 @@ def test_build_memory_fact_strips_save_this():
 
     result = build_memory_fact("save this my birthday is January 5")
     assert "birthday" in result
+
+
+def test_build_memory_fact_strips_please_memorize_that():
+    from core.orchestrator.prompt_builder import build_memory_fact
+
+    result = build_memory_fact("please memorize that my name is Om")
+    assert result == "my name is Om"

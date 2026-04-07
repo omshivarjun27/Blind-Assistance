@@ -70,3 +70,19 @@ def test_scan_page_routes_to_heavy_vision():
     decision = route(IntentCategory.SCAN_PAGE)
     assert decision.target == RouteTarget.HEAVY_VISION
     assert decision.requires_frame is True
+
+
+def test_memory_write_is_implemented():
+    from core.orchestrator.intent_classifier import IntentCategory
+    from core.orchestrator.policy_router import RouteTarget, route
+
+    decision = route(IntentCategory.MEMORY_SAVE)
+    assert decision.target == RouteTarget.MEMORY_WRITE
+
+
+def test_memory_read_is_implemented():
+    from core.orchestrator.intent_classifier import IntentCategory
+    from core.orchestrator.policy_router import RouteTarget, route
+
+    decision = route(IntentCategory.MEMORY_RECALL)
+    assert decision.target == RouteTarget.MEMORY_READ
