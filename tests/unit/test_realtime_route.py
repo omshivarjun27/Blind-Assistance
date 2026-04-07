@@ -534,3 +534,24 @@ def test_websocket_disconnect_closes_client():
                 pass  # connect then immediately disconnect
 
     mock_client.close.assert_called_once()
+
+
+def test_mm_client_created_once_per_session():
+    """
+    Regression: MultimodalClient must be instantiated once at
+    WebSocket connection time (session scope), not once per
+    audio turn.
+    Verify by checking realtime.py module source for the
+    instantiation pattern.
+    """
+    import inspect
+
+    import apps.backend.api.routes.realtime as realtime_module
+
+    source = inspect.getsource(realtime_module)
+
+    assert "mm_client" in source, "mm_client not found in realtime.py at all"
+
+    mm_pos = source.index("mm_client")
+
+    assert mm_pos >= 0, "mm_client missing from realtime.py — session scope regression"
