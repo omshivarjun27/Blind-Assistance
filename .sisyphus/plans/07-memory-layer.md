@@ -71,7 +71,7 @@ Symbol and repo findings with exact line numbers:
 
 ### `shared/config/settings.py`
 - Embedding config already exists:
-  - `57`: `EMBEDDING_MODEL = "text-embedding-v3"`
+  - `57`: `EMBEDDING_MODEL = "text-embedding-v4"`
   - `58`: `EMBEDDING_DIMENSIONS = 1024`
   - `59`: `EMBEDDING_OUTPUT_TYPE = "dense"`
 - No `MEMORY_DB_PATH` exists yet.
@@ -149,13 +149,13 @@ Additional environment finding:
 
 ## Section 3 — Step 2: Verify Docs
 
-### 1) DashScope `text-embedding-v3`
+### 1) DashScope `text-embedding-v4`
 
 Compatible-mode endpoint URL:
 - **CONFIRMED**: `POST https://dashscope-intl.aliyuncs.com/compatible-mode/v1/embeddings`
 
 Model name:
-- **CONFIRMED**: `text-embedding-v3`
+- **CONFIRMED**: `text-embedding-v4`
 
 Default dimension:
 - **CONFIRMED**: `1024`
@@ -205,7 +205,7 @@ Additional dependency correction:
 ### A) Goal
 Add a persistent SQLite memory layer so Ally can store
 and retrieve user facts across turns using
-`text-embedding-v3` semantic similarity search.
+`text-embedding-v4` semantic similarity search.
 
 Critical implementation correction:
 Plan 07 must support **same-turn** memory save/recall despite the current
@@ -221,7 +221,7 @@ Omni turn that speaks the final memory-aware answer.
    - Method: `async embed(text: str) -> list[float]`
      - POST to DashScope compatible-mode embeddings endpoint
      - endpoint: `{settings.DASHSCOPE_COMPAT_BASE}/embeddings`
-     - model: `settings.EMBEDDING_MODEL` (default `text-embedding-v3`)
+     - model: `settings.EMBEDDING_MODEL` (default `text-embedding-v4`)
      - dimensions: `settings.EMBEDDING_DIMENSIONS` (default `1024`)
      - request body fields:
        - `model`
@@ -524,7 +524,7 @@ Commit ONLY the plan file:
 git add .sisyphus/plans/07-memory-layer.md
 git commit -m "plan: write plan 07 memory layer
 
-EmbeddingClient: text-embedding-v3 1024-dim dense via DashScope
+EmbeddingClient: text-embedding-v4 1024-dim dense via DashScope
 MemoryStore: aiosqlite facts table + cosine similarity recall
 MemoryManager: save + recall with prefix stripping
 realtime.py: MEMORY_WRITE and MEMORY_RECALL branches wired

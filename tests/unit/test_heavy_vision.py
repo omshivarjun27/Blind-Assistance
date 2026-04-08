@@ -24,7 +24,7 @@ async def test_multimodal_client_analyze_success():
 
     client = MultimodalClient(
         api_key="test",
-        model="qwen3.5-flash",
+        model="qwen3.6-plus",
         base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     )
     with patch("httpx.AsyncClient") as mock_cls:
@@ -48,7 +48,7 @@ async def test_multimodal_client_analyze_on_error():
 
     client = MultimodalClient(
         api_key="test",
-        model="qwen3.5-flash",
+        model="qwen3.6-plus",
         base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     )
     with patch("httpx.AsyncClient") as mock_cls:
@@ -71,7 +71,7 @@ async def test_multimodal_client_empty_image_returns_error():
 
     client = MultimodalClient(
         api_key="test",
-        model="qwen3.5-flash",
+        model="qwen3.6-plus",
         base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     )
     req = VisionRequest(image_jpeg_b64="", prompt="describe")
@@ -89,7 +89,7 @@ async def test_multimodal_client_image_in_request_body():
 
     client = MultimodalClient(
         api_key="test",
-        model="qwen3.5-flash",
+        model="qwen3.6-plus",
         base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     )
     captured_body = {}

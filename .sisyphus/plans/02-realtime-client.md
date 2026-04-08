@@ -4,7 +4,7 @@
 
 ## Goal
 Create the Python WebSocket client that connects to
-DashScope qwen3.5-omni-flash-realtime (dev profile).
+DashScope qwen3.5-omni-plus-realtime.
 This is the single most important file in the project.
 Everything else depends on it working correctly.
 

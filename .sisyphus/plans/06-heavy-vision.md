@@ -4,7 +4,7 @@
 
 ## Goal
 Implement the heavy vision path that sends camera frames
-to qwen3.5-flash (dev) or qwen3.6-plus (exam) for:
+to qwen3.6-plus for:
 - OCR / text reading ("read this")
 - Scene analysis with more detail than realtime path
 - Page capture for document sessions
@@ -27,16 +27,16 @@ calls MultimodalClient instead of Qwen Omni Realtime.
   - `data:image/jpeg;base64,...`
 - Broader DashScope vision docs confirm Base64 image input can be passed in this format and that the MIME type in the Data URL must match the actual image type.
 - Base64 input image strings are documented at **<= 10MB**.
-- Broader DashScope vision docs confirm the dev-profile visual-understanding model name:
-  - `qwen3.5-flash`
+- Broader DashScope vision docs confirm the visual-understanding model name:
+  - `qwen3.6-plus`
 - Current repo settings use:
-  - dev vision model: `qwen3.5-flash`
+  - dev vision model: `qwen3.6-plus`
   - exam vision model: `qwen3.6-plus`
 
 UNCONFIRMED:
-- The dedicated compatible-mode vision page explicitly lists Qwen-VL family models, not `qwen3.5-flash` / `qwen3.6-plus` by name.
-- Broader vision docs show OpenAI-compatible image input examples with `qwen3.5-plus`, and native DashScope examples with `qwen3.5-plus` / `qwen3.5-flash`.
-- Therefore the exact pairing of `qwen3.5-flash` or `qwen3.6-plus` with the compatible-mode chat-completions endpoint should be treated as a runtime-verified assumption.
+- The dedicated compatible-mode vision page explicitly lists Qwen-VL family models, not `qwen3.6-plus` by name.
+- Broader vision docs show OpenAI-compatible image input examples with `qwen3.6-plus`, and native DashScope examples with `qwen3.6-plus`.
+- Therefore the exact pairing of `qwen3.6-plus` with the compatible-mode chat-completions endpoint should be treated as a runtime-verified assumption.
 - If the configured model rejects compatible-mode image input, Hephaestus must fail fast with a clear error and document the required override rather than silently falling back to another endpoint.
 
 ## Safe Deletions In This Plan

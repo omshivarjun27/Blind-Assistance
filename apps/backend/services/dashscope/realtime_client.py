@@ -38,13 +38,9 @@ _SESSION_MAX_LIFETIME_S = 110 * 60
 def default_voice_for_model(model: str) -> str:
     """Return the safest default voice for a realtime model family."""
     model_lower = model.lower()
-    if "qwen3.5-omni" in model_lower:
-        return "Tina"
     if "qwen3-omni-flash-realtime" in model_lower:
         return "Cherry"
-    if "qwen-omni-turbo-realtime" in model_lower:
-        return "Chelsie"
-    return "Tina"
+    return "Cherry"
 
 
 @dataclass
@@ -52,7 +48,7 @@ class QwenRealtimeConfig:
     """Configuration for QwenRealtimeClient."""
 
     api_key: str
-    model: str = "qwen3.5-omni-flash-realtime"
+    model: str = "qwen3-omni-flash-realtime"
     endpoint: str = "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime"
     voice: str = "Cherry"
     instructions: str = (

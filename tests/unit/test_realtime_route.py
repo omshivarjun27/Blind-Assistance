@@ -252,14 +252,14 @@ def test_websocket_upstream_failure_returns_structured_error():
     turn = _make_mock_turn(audio=b"", assistant_text="", user_text="")
     turn.success = False
     turn.error = (
-        "DashScope session.update failed for model=qwen3.5-omni-plus-realtime "
-        "voice=Tina endpoint=wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime "
+        "DashScope session.update failed for model=qwen3-omni-flash-realtime "
+        "voice=Cherry endpoint=wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime "
         "session_id=sess_123: Access denied."
     )
     mock_client = _mock_client(turn)
     mock_config = MagicMock(
-        model="qwen3.5-omni-plus-realtime",
-        voice="Tina",
+        model="qwen3-omni-flash-realtime",
+        voice="Cherry",
         endpoint="wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime",
     )
 
@@ -291,15 +291,15 @@ def test_websocket_upstream_exception_returns_structured_error():
     mock_client = MagicMock()
     mock_client.async_send_audio_turn = AsyncMock(
         side_effect=RuntimeError(
-            "DashScope session.update failed for model=qwen3.5-omni-plus-realtime "
-            "voice=Tina endpoint=wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime "
+            "DashScope session.update failed for model=qwen3-omni-flash-realtime "
+            "voice=Cherry endpoint=wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime "
             "session_id=sess_123: Access denied."
         )
     )
     mock_client.close = MagicMock()
     mock_config = MagicMock(
-        model="qwen3.5-omni-plus-realtime",
-        voice="Tina",
+        model="qwen3-omni-flash-realtime",
+        voice="Cherry",
         endpoint="wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime",
     )
 
@@ -457,7 +457,7 @@ def test_websocket_pending_classifier_with_next_transcript_preserves_first_heavy
     mock_classifier = MagicMock()
     mock_classifier.classify = classify_side_effect
     mock_mm_client = MagicMock()
-    mock_mm_client._model = "qwen3.5-flash"
+    mock_mm_client._model = "qwen3.6-plus"
     mock_mm_client.analyze = AsyncMock(
         return_value=MagicMock(success=True, text="READ RESULT")
     )

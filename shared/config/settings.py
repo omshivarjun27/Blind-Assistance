@@ -46,16 +46,16 @@ DASHSCOPE_COMPAT_BASE: str = _get(
 # Model selection by profile
 QWEN_REALTIME_MODEL: str = _get(
     "QWEN_REALTIME_EXAM" if _is_exam else "QWEN_REALTIME_DEV",
-    "qwen3.5-omni-plus-realtime" if _is_exam else "qwen3.5-omni-flash-realtime",
+    "qwen3-omni-flash-realtime" if _is_exam else "qwen3-omni-flash-realtime",
 )
 QWEN_VISION_MODEL: str = _get(
     "QWEN_VISION_EXAM" if _is_exam else "QWEN_VISION_DEV",
-    "qwen3.6-plus" if _is_exam else "qwen3.5-flash",
+    "qwen3.6-plus" if _is_exam else "qwen3.6-plus",
 )
 QWEN_TRANSCRIPTION_MODEL: str = _get("QWEN_TRANSCRIPTION_MODEL", "gummy-realtime-v1")
 
 # Embedding
-EMBEDDING_MODEL: str = _get("EMBEDDING_MODEL", "text-embedding-v3")
+EMBEDDING_MODEL: str = _get("EMBEDDING_MODEL", "text-embedding-v4")
 EMBEDDING_DIMENSIONS: int = int(_get("EMBEDDING_DIMENSIONS", "1024"))
 EMBEDDING_OUTPUT_TYPE: str = _get("EMBEDDING_OUTPUT_TYPE", "dense")
 MEMORY_DB_PATH: str = os.getenv("MEMORY_DB_PATH", "data/sqlite/memory.db")

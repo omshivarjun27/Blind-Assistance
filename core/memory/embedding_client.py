@@ -1,4 +1,4 @@
-"""Ally Vision v2 — DashScope text-embedding-v3 client."""
+"""Ally Vision v2 — DashScope text-embedding-v4 client."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ class EmbeddingClient:
         )
 
     async def embed(self, text: str) -> list[float]:
-        """Embed text using text-embedding-v3.
+        """Embed text using text-embedding-v4.
 
         Returns list[float] of length self._dimensions.
         Raises EmbeddingError on any failure.

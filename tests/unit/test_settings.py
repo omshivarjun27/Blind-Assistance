@@ -25,7 +25,7 @@ def test_vision_model_set():
 def test_embedding_model_set():
     from shared.config import settings
 
-    assert settings.EMBEDDING_MODEL == "text-embedding-v3"
+    assert settings.EMBEDDING_MODEL == "text-embedding-v4"
     assert settings.EMBEDDING_DIMENSIONS == 1024
     assert settings.EMBEDDING_OUTPUT_TYPE == "dense"
 

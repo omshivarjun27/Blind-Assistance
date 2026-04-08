@@ -43,8 +43,8 @@ Pytest:   C:/ally-vision-v2/.venv/Scripts/pytest.exe
 Plans:    .sisyphus/plans/
 
 ## Profile Switch
-PROFILE=dev  → qwen3.5-omni-flash-realtime + qwen3.5-flash
-PROFILE=exam → qwen3.5-omni-plus-realtime  + qwen3.6-plus
+PROFILE=dev  → qwen3-omni-flash-realtime + qwen3.6-plus
+PROFILE=exam → qwen3-omni-flash-realtime  + qwen3.6-plus
 
 ## Stack
 Backend:  FastAPI + Python 3.11 + aiosqlite

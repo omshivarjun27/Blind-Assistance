@@ -19,7 +19,7 @@ async def test_embed_returns_list_of_floats():
         client = EmbeddingClient(
             api_key="test",
             base_url="https://example.com",
-            model="text-embedding-v3",
+            model="text-embedding-v4",
             dimensions=1024,
         )
         result = await client.embed("hello")
@@ -38,7 +38,7 @@ async def test_embed_raises_on_error():
         client = EmbeddingClient(
             api_key="test",
             base_url="https://example.com",
-            model="text-embedding-v3",
+            model="text-embedding-v4",
             dimensions=1024,
         )
         with pytest.raises(EmbeddingError):

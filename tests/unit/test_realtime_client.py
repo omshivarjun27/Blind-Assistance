@@ -33,19 +33,19 @@ def test_config_defaults():
     assert cfg.voice == "Cherry"
 
 
-def test_default_voice_for_model_prefers_tina_for_qwen35_omni():
-    """Qwen 3.5 omni realtime models should default to Tina."""
+def test_default_voice_for_model_prefers_cherry_for_qwen3_flash_realtime():
+    """Qwen 3 flash realtime models should default to Cherry."""
     from apps.backend.services.dashscope.realtime_client import default_voice_for_model
 
-    assert default_voice_for_model("qwen3.5-omni-flash-realtime") == "Tina"
-    assert default_voice_for_model("qwen3.5-omni-plus-realtime") == "Tina"
+    assert default_voice_for_model("qwen3-omni-flash-realtime") == "Cherry"
+    assert default_voice_for_model("qwen3-omni-flash-realtime") == "Cherry"
 
 
 def test_default_voice_for_model_keeps_cherry_for_qwen3_flash():
     """Legacy qwen3 flash realtime model should keep Cherry."""
     from apps.backend.services.dashscope.realtime_client import default_voice_for_model
 
-    assert default_voice_for_model("qwen3-omni-flash-realtime") == "Cherry"
+    assert default_voice_for_model("flash-realtime") == "Cherry"
 
 
 def test_config_from_settings_reads_env():
@@ -56,7 +56,7 @@ def test_config_from_settings_reads_env():
     assert cfg.api_key == "test-key-for-unit-tests"
     assert "realtime" in cfg.model
     assert cfg.endpoint.startswith("wss://")
-    assert cfg.voice == "Tina"
+    assert cfg.voice == "Cherry"
 
 
 def test_config_from_settings_reads_transcription_model_env():
@@ -247,7 +247,7 @@ def test_connect_surfaces_session_update_failure_context():
     )
 
     cfg = QwenRealtimeConfig(
-        api_key="test-key", model="qwen3.5-omni-plus-realtime", voice="Tina"
+        api_key="test-key", model="qwen3-omni-flash-realtime", voice="Cherry"
     )
     client = QwenRealtimeClient(cfg)
     fake_ws = MagicMock()
@@ -267,7 +267,7 @@ def test_connect_surfaces_session_update_failure_context():
 
         with pytest.raises(
             RuntimeError,
-            match="qwen3.5-omni-plus-realtime.*Tina.*api-ws/v1/realtime.*sess-created",
+            match="qwen3-omni-flash-realtime.*Cherry.*api-ws/v1/realtime.*sess-created",
         ):
             client.connect()
 

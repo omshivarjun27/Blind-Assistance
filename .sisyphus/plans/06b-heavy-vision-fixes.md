@@ -95,7 +95,7 @@ Repo findings:
 ### `shared/config/settings.py`
 - `QWEN_VISION_MODEL`
   - `50-53`
-  - dev default: `qwen3.5-flash`
+  - dev default: `qwen3.6-plus`
   - exam default: `qwen3.6-plus`
 - `DASHSCOPE_COMPAT_BASE`
   - `40-43`: `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`

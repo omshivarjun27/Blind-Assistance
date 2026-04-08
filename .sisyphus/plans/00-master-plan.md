@@ -122,9 +122,9 @@ Ally Vision Assistant v2 is a blind-first, camera-first laptop web assistant whe
 The orchestrator classifies intent, decides whether the turn belongs to realtime dialogue, heavy vision, search, or memory, runs capture coach before expensive visual work, and applies verification/recapture rules when confidence is weak or the frame is unusable.
 
 **Layer 4: DashScope API layer**  
-- **4A: Realtime** — `qwen3.5-omni-plus-realtime` in exam mode and corrected flash-path dev mode over WebSocket for audio in/out, quick image turns, and live dialogue. `gummy-realtime-v1` stays transcript-only and reference-only.  
-- **4B: Heavy vision** — `qwen3.5-flash` as the doc-confirmed visual-understanding baseline over HTTP for scene analysis, OCR, page understanding, comparison, and grounded document QA; `qwen3.6-plus` remains the configured exam override for heavier multimodal reasoning where enabled.  
-- **4C: Search + memory** — DashScope web search and `text-embedding-v3` are called by backend services explicitly. Search is not treated as the source of truth for state or memory, and memory retrieval is not delegated to the realtime session itself.
+- **4A: Realtime** — `qwen3.5-omni-plus-realtime` over WebSocket for audio in/out, quick image turns, and live dialogue. `gummy-realtime-v1` stays transcript-only and reference-only.  
+- **4B: Heavy vision** — `qwen3.6-plus` over HTTP for scene analysis, OCR, page understanding, comparison, and grounded document QA.  
+- **4C: Search + memory** — DashScope web search and `text-embedding-v4` are called by backend services explicitly. Search is not treated as the source of truth for state or memory, and memory retrieval is not delegated to the realtime session itself.
 
 **Layer 5: Evidence + session layer**  
 This layer stores the latest live frames, captured page images, page order, page summaries, search results, user memory, and transcript records. It produces the current-page pack, document pack, and final grounded context bundle that answer generation consumes.
@@ -138,19 +138,19 @@ Online learning judges corrected turns during a live session, adapts prompts/rou
 
 | Use case | PROFILE=dev | PROFILE=exam |
 |---|---|---|
-| Realtime voice+image | qwen3.5-omni-flash-realtime | qwen3.5-omni-plus-realtime |
-| Heavy vision/document | qwen3.5-flash | qwen3.6-plus |
+| Realtime voice+image | qwen3.5-omni-plus-realtime | qwen3.5-omni-plus-realtime |
+| Heavy vision/document | qwen3.6-plus | qwen3.6-plus |
 | Transcription | gummy-realtime-v1 (fixed) | gummy-realtime-v1 (fixed) |
-| Memory embeddings | text-embedding-v3 1024 dense | text-embedding-v3 1024 dense |
+| Memory embeddings | text-embedding-v4 1024 dense | text-embedding-v4 1024 dense |
 
 Note: `gummy-realtime-v1` is fixed by DashScope, transcript is reference-only, and may differ from the omni model's own interpretation.
 
-Note: `text-embedding-v3` uses the DashScope native endpoint:  
+Note: `text-embedding-v4` uses the DashScope native endpoint:  
 `https://dashscope-intl.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding`
 
-Note: DashScope 2026 realtime docs confirm `qwen3.5-omni-plus-realtime`, PCM audio, `gummy-realtime-v1`, and a 120-minute WebSocket cap. The repo currently names the dev realtime model as `qwen3.5-omni-flash-realtime`, and the plan uses `qwen3.5-omni-flash-realtime` consistently.
+Note: DashScope 2026 realtime docs confirm `qwen3.5-omni-plus-realtime`, PCM audio, `gummy-realtime-v1`, and a 120-minute WebSocket cap.
 
-Note: `qwen3.5-flash` is the doc-confirmed heavy-vision baseline. `qwen3.6-plus` is a valid configured exam-path model with official Alibaba launch-material multimodal evidence, but execution should make the full document path work on `qwen3.5-flash` first and treat `qwen3.6-plus` as the exam/high-accuracy override.
+Note: `qwen3.6-plus` is the configured heavy-vision model.
 
 ---
 

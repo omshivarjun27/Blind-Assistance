@@ -1,10 +1,10 @@
 """
 Ally Vision v2 — DashScope multimodal client.
 
-Sends camera frame + text prompt to qwen3.5-flash (dev)
-or qwen3.6-plus (exam) via DashScope compatible mode.
+Sends camera frame + text prompt to qwen3.6-plus
+via DashScope compatible mode.
 
-UNCONFIRMED: qwen3.5-flash/qwen3.6-plus compatibility with
+UNCONFIRMED: qwen3.6-plus compatibility with
 compatible-mode image input is runtime-verified, not doc-proven.
 If the model rejects image input, the error will surface in
 VisionResponse.error and must be investigated.
