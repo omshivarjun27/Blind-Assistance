@@ -119,6 +119,7 @@ class QwenRealtimeClient:
         self._connected: bool = False
         self._session_start_time: Optional[float] = None
         self._session_id: Optional[str] = None
+        self._response_active: bool = False
 
     # ── connection lifecycle ──────────────────────────────────
 
@@ -172,6 +173,7 @@ class QwenRealtimeClient:
                 pass
             self._ws = None
         self._connected = False
+        self._response_active = False
         logger.info("Realtime session closed")
 
     def needs_reconnect(self) -> bool:
@@ -275,6 +277,16 @@ class QwenRealtimeClient:
         payload["event_id"] = "event_" + uuid.uuid4().hex
         self._require_ws().send(json.dumps(payload))
 
+    def cancel_response(self) -> None:
+        """Send response.cancel to DashScope to stop current output."""
+        if not self._connected or self._ws is None or not self._response_active:
+            return
+        try:
+            self._send_event({"type": "response.cancel"})
+            logger.info("response.cancel sent to DashScope")
+        except Exception as exc:
+            logger.warning("cancel_response failed: %s", exc)
+
     def _recv_event(self, timeout: Optional[float] = None) -> dict[str, Any]:
         ws = self._require_ws()
         if timeout is not None:
@@ -327,7 +339,13 @@ class QwenRealtimeClient:
                     "input_audio_transcription": {
                         "model": self._config.transcription_model,
                     },
-                    "turn_detection": None,
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 500,
+                        "interrupt_response": True,
+                    },
                 },
             }
         )
@@ -359,6 +377,7 @@ class QwenRealtimeClient:
         self._send_event({"type": "input_audio_buffer.commit"})
         self._wait_for_event("input_audio_buffer.committed", timeout=10.0)
         self._send_event({"type": "response.create"})
+        self._response_active = True
         logger.debug(
             "Streamed %d bytes audio, image=%s",
             len(pcm_bytes),
@@ -371,6 +390,7 @@ class QwenRealtimeClient:
         text_deltas: list[str] = []
         deadline = time.monotonic() + self._config.response_timeout_s
         saw_response_done = False
+        saw_response_cancelled = False
 
         while time.monotonic() < deadline:
             remaining = max(0.5, deadline - time.monotonic())
@@ -406,8 +426,16 @@ class QwenRealtimeClient:
             elif t == "response.audio.done":
                 pass  # audio.delta already collected
 
+            elif t == "response.cancelled":
+                logger.info("Response cancelled by DashScope")
+                saw_response_cancelled = True
+                self._response_active = False
+                result.error = None
+                break
+
             elif t == "response.done":
                 saw_response_done = True
+                self._response_active = False
                 response = event.get("response", {})
                 if isinstance(response, dict):
                     usage = response.get("usage", {})
@@ -421,12 +449,18 @@ class QwenRealtimeClient:
                 break
 
             elif t == "error":
+                self._response_active = False
                 result.error = str(event)
                 logger.error("Server error event: %s", event)
                 return
 
-        if not saw_response_done and result.error is None:
+        if (
+            not saw_response_done
+            and not saw_response_cancelled
+            and result.error is None
+        ):
             result.error = "Response ended before response.done"
+            self._response_active = False
 
         result.assistant_audio_pcm = bytes(audio_chunks)
         logger.info(

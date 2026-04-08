@@ -486,6 +486,13 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 elif msg_type == "ping":
                     await ws.send_text(json.dumps({"type": "pong"}))
 
+                elif msg_type == "interrupt":
+                    # User started speaking — cancel any in-progress response
+                    client.cancel_response()
+                    logger.info(
+                        "Interrupt received from browser — response.cancel sent"
+                    )
+
                 else:
                     logger.warning("Unknown control message type: %r", msg_type)
                     break

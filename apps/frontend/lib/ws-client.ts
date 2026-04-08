@@ -83,6 +83,10 @@ export class RealtimeWSClient {
     this.ws?.send(JSON.stringify({ type: 'ping' }));
   }
 
+  sendInterrupt(): void {
+    this.ws?.send(JSON.stringify({ type: 'interrupt' }));
+  }
+
   disconnect(): void {
     this.ws?.close();
     this.ws = null;

@@ -771,3 +771,34 @@ def test_classifier_memory_recall_route_calls_memory_manager():
         query="can you tell me about my doctor",
         top_k=3,
     )
+
+
+def test_interrupt_control_message_calls_cancel_response():
+    """{"type": "interrupt"} must call client.cancel_response()."""
+    turn = _make_mock_turn()
+    mock_client = _mock_client(turn)
+    mock_client.cancel_response = MagicMock()
+    mock_memory_manager = MagicMock()
+    mock_memory_manager.store.initialize = AsyncMock()
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MemoryManager.from_settings",
+            return_value=mock_memory_manager,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_text(json.dumps({"type": "interrupt"}))
+                ws.send_bytes(b"\x00" * 3200)
+                ws.receive_bytes()
+
+    mock_client.cancel_response.assert_called_once()

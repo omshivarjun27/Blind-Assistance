@@ -166,7 +166,13 @@ def test_session_update_payload_structure():
     assert session["voice"] == "Cherry"
     assert session["input_audio_format"] == "pcm"
     assert session["output_audio_format"] == "pcm"
-    assert session["turn_detection"] is None
+    assert session["turn_detection"] == {
+        "type": "server_vad",
+        "threshold": 0.5,
+        "prefix_padding_ms": 300,
+        "silence_duration_ms": 500,
+        "interrupt_response": True,
+    }
     assert session["input_audio_transcription"]["model"] == "gummy-realtime-v1"
 
 
@@ -474,6 +480,79 @@ def test_collect_response_errors_if_deadline_expires_without_response_done():
 
     assert result.success is False
     assert result.error == "Response ended before response.done"
+
+
+def test_cancel_response_sends_event():
+    """cancel_response() must send response.cancel to DashScope."""
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+    )
+
+    config = QwenRealtimeConfig(api_key="test", model="qwen3-omni-flash-realtime")
+    client = QwenRealtimeClient(config)
+    client._connected = True
+    client._response_active = True
+    client._ws = MagicMock()
+    client.cancel_response()
+    sent = json.loads(client._ws.send.call_args[0][0])
+    assert sent["type"] == "response.cancel"
+
+
+def test_cancel_response_noop_when_not_connected():
+    """cancel_response() must not raise when disconnected."""
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+    )
+
+    config = QwenRealtimeConfig(api_key="test", model="qwen3-omni-flash-realtime")
+    client = QwenRealtimeClient(config)
+    client._connected = False
+    client._ws = None
+    client.cancel_response()
+
+
+def test_cancel_response_noop_when_no_active_response():
+    """cancel_response() must not send when no upstream response is active."""
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+    )
+
+    config = QwenRealtimeConfig(api_key="test", model="qwen3-omni-flash-realtime")
+    client = QwenRealtimeClient(config)
+    client._connected = True
+    client._response_active = False
+    client._ws = MagicMock()
+    client.cancel_response()
+    client._ws.send.assert_not_called()
+
+
+def test_collect_response_handles_response_cancelled():
+    """collect_response() must stop collecting on response.cancelled."""
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+        QwenRealtimeTurn,
+    )
+
+    config = QwenRealtimeConfig(api_key="test", model="qwen3-omni-flash-realtime")
+    client = QwenRealtimeClient(config)
+    result = QwenRealtimeTurn()
+    events = iter(
+        [
+            {"type": "response.audio.delta", "delta": "AAAA"},
+            {"type": "response.cancelled"},
+        ]
+    )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "_recv_event", lambda timeout=None: next(events))
+        client._collect_response(result)
+
+    assert result.error is None
+    assert result.assistant_audio_pcm is not None
 
 
 # ── compress_image tests ──────────────────────────────────────────

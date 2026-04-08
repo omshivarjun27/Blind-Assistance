@@ -2,7 +2,7 @@
 
 import { useCallback, useRef, useState } from 'react';
 
-import { playPcmAudio, concatArrayBuffers, calcRms } from '@/lib/audio-utils';
+import { concatArrayBuffers, calcRms } from '@/lib/audio-utils';
 import { RealtimeWSClient } from '@/lib/ws-client';
 import { useMicStream } from '@/hooks/useMicStream';
 
@@ -45,6 +45,10 @@ export function useRealtimeSession(captureFrame: () => string | null) {
   const isSpeakingRef = useRef(false);
   const isSendingRef = useRef(false);
   const hasSpeechRef = useRef(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const currentSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const scheduledSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const nextPlayTimeRef = useRef(0);
   const mic = useMicStream();
 
   const appendTranscript = useCallback((entry: TranscriptEntry) => {
@@ -69,9 +73,100 @@ export function useRealtimeSession(captureFrame: () => string | null) {
     wsRef.current?.sendAudio(pcm);
   }, []);
 
+  function chunkHasSpeechEnergy(pcmInt16Buffer: ArrayBuffer): boolean {
+    const pcmInt16 = new Int16Array(pcmInt16Buffer);
+    let sum = 0;
+    for (let i = 0; i < pcmInt16.length; i++) {
+      sum += pcmInt16[i] * pcmInt16[i];
+    }
+    const rms = Math.sqrt(sum / pcmInt16.length);
+    return rms > 500;
+  }
+
+  const ensureAudioContext = useCallback(async () => {
+    let ctx = audioContextRef.current;
+    if (!ctx || ctx.state === 'closed') {
+      ctx = new AudioContext({ sampleRate: 24000 });
+      audioContextRef.current = ctx;
+    }
+    if (ctx.state === 'suspended') {
+      await ctx.resume();
+    }
+    return ctx;
+  }, []);
+
+  const stopAssistantPlayback = useCallback(() => {
+    for (const source of scheduledSourcesRef.current) {
+      try {
+        source.stop();
+      } catch {}
+      try {
+        source.disconnect();
+      } catch {}
+    }
+    scheduledSourcesRef.current = [];
+    currentSourceRef.current = null;
+    nextPlayTimeRef.current = 0;
+    isSpeakingRef.current = false;
+  }, []);
+
+  const playPCMChunk = useCallback(
+    async (pcmBytes: ArrayBuffer): Promise<void> => {
+      const int16 = new Int16Array(pcmBytes);
+      const float32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) {
+        float32[i] = int16[i] / 32768.0;
+      }
+
+      const audioContext = await ensureAudioContext();
+      const audioBuffer = audioContext.createBuffer(1, float32.length, 24000);
+      audioBuffer.copyToChannel(float32, 0);
+
+      const source = audioContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(audioContext.destination);
+      const nextPlayTime = Math.max(nextPlayTimeRef.current, audioContext.currentTime);
+      source.start(nextPlayTime);
+      nextPlayTimeRef.current = nextPlayTime + audioBuffer.duration;
+      currentSourceRef.current = source;
+      scheduledSourcesRef.current.push(source);
+      isSpeakingRef.current = true;
+      setStatus('speaking');
+
+      source.onended = () => {
+        scheduledSourcesRef.current = scheduledSourcesRef.current.filter(
+          (item) => item !== source
+        );
+        if (currentSourceRef.current === source) {
+          currentSourceRef.current = null;
+        }
+        if (scheduledSourcesRef.current.length === 0) {
+          nextPlayTimeRef.current = 0;
+          const newFrame = captureFrameRef.current?.();
+          if (newFrame) {
+            wsRef.current?.sendImage(newFrame);
+          }
+          isSpeakingRef.current = false;
+          isSendingRef.current = false;
+          setStatus('listening');
+        }
+      };
+    },
+    [ensureAudioContext]
+  );
+
   const onPcmChunk = useCallback(
     (chunk: ArrayBuffer) => {
-      if (isSpeakingRef.current) return; // don't capture while assistant speaks
+      if (isSpeakingRef.current && chunkHasSpeechEnergy(chunk)) {
+        wsRef.current?.sendInterrupt();
+        stopAssistantPlayback();
+        isSendingRef.current = false;
+      }
+      if (isSendingRef.current && chunkHasSpeechEnergy(chunk)) {
+        wsRef.current?.sendInterrupt();
+        isSendingRef.current = false;
+      }
+      if (isSpeakingRef.current) return;
       if (isSendingRef.current) return;
 
       // Silence detection
@@ -98,7 +193,7 @@ export function useRealtimeSession(captureFrame: () => string | null) {
         }
       }
     },
-    [flushTurn]
+    [flushTurn, stopAssistantPlayback]
   );
 
   async function startSession(): Promise<void> {
@@ -113,19 +208,7 @@ export function useRealtimeSession(captureFrame: () => string | null) {
       wsRef.current = ws;
 
       ws.onAudio = async (pcm) => {
-        isSpeakingRef.current = true;
-        setStatus('speaking');
-        await playPcmAudio(pcm);
-
-        // Auto-capture new frame for next potential vision turn.
-        const newFrame = captureFrameRef.current?.();
-        if (newFrame) {
-          wsRef.current?.sendImage(newFrame);
-        }
-
-        isSpeakingRef.current = false;
-        isSendingRef.current = false;
-        setStatus('listening');
+        await playPCMChunk(pcm);
       };
 
       ws.onTranscript = (role, text) => {
@@ -149,6 +232,12 @@ export function useRealtimeSession(captureFrame: () => string | null) {
       setError(msg);
       setStatus('error');
       mic.stopListening();
+      stopAssistantPlayback();
+      void audioContextRef.current?.close();
+      audioContextRef.current = null;
+      nextPlayTimeRef.current = 0;
+      currentSourceRef.current = null;
+      scheduledSourcesRef.current = [];
       wsRef.current?.disconnect();
       wsRef.current = null;
     }
@@ -171,6 +260,12 @@ export function useRealtimeSession(captureFrame: () => string | null) {
       isSendingRef.current = false;
       captureFrameRef.current = null;
       mic.stopListening();
+      stopAssistantPlayback();
+      void audioContextRef.current?.close();
+      audioContextRef.current = null;
+      nextPlayTimeRef.current = 0;
+      currentSourceRef.current = null;
+      scheduledSourcesRef.current = [];
       wsRef.current?.disconnect();
       wsRef.current = null;
       setStatus('idle');
