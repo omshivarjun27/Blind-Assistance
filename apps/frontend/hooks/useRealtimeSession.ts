@@ -32,6 +32,9 @@ export interface TranscriptEntry {
 
 const SILENCE_THRESHOLD = 0.01;   // RMS below this = silent
 const SILENCE_TIMEOUT_MS = 1500;  // ms of silence before flushing turn
+const PLAYBACK_INTERRUPT_ARM_MS = 1500;
+const PLAYBACK_BARGE_IN_CHUNKS = 3;
+const PLAYBACK_COOLDOWN_MS = 500;
 
 export function useRealtimeSession(captureFrame: () => string | null) {
   const [status, setStatus] = useState<SessionStatus>('idle');
@@ -42,13 +45,18 @@ export function useRealtimeSession(captureFrame: () => string | null) {
   const captureFrameRef = useRef<(() => string | null) | null>(null);
   const chunksRef = useRef<ArrayBuffer[]>([]);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const playbackEndTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isSpeakingRef = useRef(false);
+  const isPlayingRef = useRef(false);
   const isSendingRef = useRef(false);
   const hasSpeechRef = useRef(false);
   const audioContextRef = useRef<AudioContext | null>(null);
   const currentSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const scheduledSourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const nextPlayTimeRef = useRef(0);
+  const interruptArmedAtRef = useRef(0);
+  const micCooldownUntilRef = useRef(0);
+  const playbackSpeechChunksRef = useRef(0);
   const mic = useMicStream();
 
   const appendTranscript = useCallback((entry: TranscriptEntry) => {
@@ -57,6 +65,7 @@ export function useRealtimeSession(captureFrame: () => string | null) {
 
   const flushTurn = useCallback(() => {
     if (isSendingRef.current) return;
+    if (isPlayingRef.current) return;
     if (chunksRef.current.length === 0) return;
     isSendingRef.current = true;
     hasSpeechRef.current = false;
@@ -96,6 +105,10 @@ export function useRealtimeSession(captureFrame: () => string | null) {
   }, []);
 
   const stopAssistantPlayback = useCallback(() => {
+    if (playbackEndTimerRef.current) {
+      clearTimeout(playbackEndTimerRef.current);
+      playbackEndTimerRef.current = null;
+    }
     for (const source of scheduledSourcesRef.current) {
       try {
         source.stop();
@@ -107,6 +120,10 @@ export function useRealtimeSession(captureFrame: () => string | null) {
     scheduledSourcesRef.current = [];
     currentSourceRef.current = null;
     nextPlayTimeRef.current = 0;
+    interruptArmedAtRef.current = 0;
+    playbackSpeechChunksRef.current = 0;
+    micCooldownUntilRef.current = 0;
+    isPlayingRef.current = false;
     isSpeakingRef.current = false;
   }, []);
 
@@ -121,6 +138,17 @@ export function useRealtimeSession(captureFrame: () => string | null) {
       const audioContext = await ensureAudioContext();
       const audioBuffer = audioContext.createBuffer(1, float32.length, 24000);
       audioBuffer.copyToChannel(float32, 0);
+
+      if (!isPlayingRef.current) {
+        if (playbackEndTimerRef.current) {
+          clearTimeout(playbackEndTimerRef.current);
+          playbackEndTimerRef.current = null;
+        }
+        isPlayingRef.current = true;
+        interruptArmedAtRef.current = performance.now() + PLAYBACK_INTERRUPT_ARM_MS;
+        playbackSpeechChunksRef.current = 0;
+        micCooldownUntilRef.current = 0;
+      }
 
       const source = audioContext.createBufferSource();
       source.buffer = audioBuffer;
@@ -141,14 +169,20 @@ export function useRealtimeSession(captureFrame: () => string | null) {
           currentSourceRef.current = null;
         }
         if (scheduledSourcesRef.current.length === 0) {
-          nextPlayTimeRef.current = 0;
-          const newFrame = captureFrameRef.current?.();
-          if (newFrame) {
-            wsRef.current?.sendImage(newFrame);
-          }
-          isSpeakingRef.current = false;
-          isSendingRef.current = false;
-          setStatus('listening');
+          micCooldownUntilRef.current = performance.now() + PLAYBACK_COOLDOWN_MS;
+          playbackEndTimerRef.current = setTimeout(() => {
+            playbackEndTimerRef.current = null;
+            nextPlayTimeRef.current = 0;
+            const newFrame = captureFrameRef.current?.();
+            if (newFrame) {
+              wsRef.current?.sendImage(newFrame);
+            }
+            isPlayingRef.current = false;
+            isSpeakingRef.current = false;
+            isSendingRef.current = false;
+            playbackSpeechChunksRef.current = 0;
+            setStatus('listening');
+          }, PLAYBACK_COOLDOWN_MS);
         }
       };
     },
@@ -157,16 +191,39 @@ export function useRealtimeSession(captureFrame: () => string | null) {
 
   const onPcmChunk = useCallback(
     (chunk: ArrayBuffer) => {
-      if (isSpeakingRef.current && chunkHasSpeechEnergy(chunk)) {
+      const hasSpeechEnergy = chunkHasSpeechEnergy(chunk);
+      const now = performance.now();
+
+      if (isPlayingRef.current) {
+        if (now < interruptArmedAtRef.current || now < micCooldownUntilRef.current) {
+          playbackSpeechChunksRef.current = 0;
+          return;
+        }
+
+        if (hasSpeechEnergy) {
+          playbackSpeechChunksRef.current += 1;
+          if (playbackSpeechChunksRef.current >= PLAYBACK_BARGE_IN_CHUNKS) {
+            wsRef.current?.sendInterrupt();
+            stopAssistantPlayback();
+            isSendingRef.current = false;
+          }
+        } else {
+          playbackSpeechChunksRef.current = 0;
+        }
+
+        if (isPlayingRef.current) {
+          return;
+        }
+      }
+
+      if (now < micCooldownUntilRef.current) {
+        return;
+      }
+
+      if (isSendingRef.current && hasSpeechEnergy) {
         wsRef.current?.sendInterrupt();
-        stopAssistantPlayback();
         isSendingRef.current = false;
       }
-      if (isSendingRef.current && chunkHasSpeechEnergy(chunk)) {
-        wsRef.current?.sendInterrupt();
-        isSendingRef.current = false;
-      }
-      if (isSpeakingRef.current) return;
       if (isSendingRef.current) return;
 
       // Silence detection
@@ -258,6 +315,14 @@ export function useRealtimeSession(captureFrame: () => string | null) {
       chunksRef.current = [];
       hasSpeechRef.current = false;
       isSendingRef.current = false;
+      isPlayingRef.current = false;
+      interruptArmedAtRef.current = 0;
+      micCooldownUntilRef.current = 0;
+      playbackSpeechChunksRef.current = 0;
+      if (playbackEndTimerRef.current) {
+        clearTimeout(playbackEndTimerRef.current);
+        playbackEndTimerRef.current = null;
+      }
       captureFrameRef.current = null;
       mic.stopListening();
       stopAssistantPlayback();

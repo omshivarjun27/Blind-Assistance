@@ -18,6 +18,7 @@ import json
 import logging
 import asyncio as _asyncio
 import struct
+import time
 from collections.abc import Coroutine
 from typing import Any
 from uuid import uuid4
@@ -364,6 +365,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     _scene_described_once: bool = False
     _last_instructions: str = default_instructions
     _turns_since_corr: int = 0
+    _last_response_complete_at: float = 0.0
 
     try:
         while True:
@@ -587,6 +589,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 except Exception as exc:
                     await _send_upstream_error(ws, str(exc), config)
                     break
+                _last_response_complete_at = time.monotonic()
 
                 if not result.user_transcript:
                     result.user_transcript = current_user_transcript
@@ -737,9 +740,21 @@ async def realtime_endpoint(ws: WebSocket) -> None:
 
                 elif msg_type == "interrupt":
                     # User started speaking — cancel any in-progress response
+                    elapsed = (
+                        time.monotonic() - _last_response_complete_at
+                        if _last_response_complete_at > 0.0
+                        else float("inf")
+                    )
+                    if elapsed < 1.5:
+                        logger.debug(
+                            "Interrupt BLOCKED (premature): %.2fs since last response",
+                            elapsed,
+                        )
+                        continue
                     client.cancel_response()
                     logger.info(
-                        "Interrupt received from browser — response.cancel sent"
+                        "Interrupt received from browser — response.cancel sent (%.2fs since last response complete)",
+                        elapsed,
                     )
 
                 else:
