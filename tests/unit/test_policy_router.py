@@ -29,7 +29,7 @@ def test_general_chat_no_frame_needed():
     decision = route(IntentCategory.GENERAL_CHAT)
     assert decision.target == RouteTarget.REALTIME_CHAT
     assert decision.requires_frame is False
-    assert decision.system_instructions == ""
+    assert "Do NOT describe the camera scene" in decision.system_instructions
 
 
 def test_translate_routes_to_realtime_chat_with_instructions():
@@ -42,13 +42,14 @@ def test_translate_routes_to_realtime_chat_with_instructions():
     assert "Translate" in decision.system_instructions
 
 
-def test_web_search_routes_to_web_search_target():
-    """WEB_SEARCH is implemented and should route directly."""
+def test_web_search_routes_to_realtime_chat_with_search_instructions():
+    """WEB_SEARCH now uses REALTIME_CHAT with time-sensitive disclaimer guidance."""
     from core.orchestrator.intent_classifier import IntentCategory
     from core.orchestrator.policy_router import RouteTarget, route
 
     decision = route(IntentCategory.WEB_SEARCH)
-    assert decision.target == RouteTarget.WEB_SEARCH
+    assert decision.target == RouteTarget.REALTIME_CHAT
+    assert "As of my last update" in decision.system_instructions
 
 
 def test_all_intents_have_routing():

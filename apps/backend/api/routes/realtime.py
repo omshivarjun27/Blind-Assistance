@@ -31,7 +31,6 @@ from apps.backend.services.dashscope.realtime_client import (
     QwenRealtimeConfig,
 )
 from core.memory import MemoryManager, SessionMemory, compose_memory_context
-from core.search import SearchManager
 from core.orchestrator.capture_coach import assess_frame_quality
 from core.orchestrator.intent_classifier import (
     IntentCategory,
@@ -270,7 +269,6 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     classifier = IntentClassifier.from_settings()
     mm_client = MultimodalClient.from_settings()
     memory_manager = MemoryManager.from_settings()
-    search_manager = SearchManager.from_settings()
     if hasattr(type(memory_manager.store), "initialize_all"):
         await memory_manager.store.initialize_all()
     else:
@@ -286,6 +284,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     queued_classification_input: tuple[str, str | None] | None = None
     pending_image_b64: str | None = None
     pending_instructions: str | None = None
+    _scene_described_once: bool = False
 
     try:
         while True:
@@ -314,6 +313,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 route_image_b64 = pending_image_b64
                 classifier_handled_previous_memory = False
                 session_memory_recorded = False
+                scene_fallback_this_turn = False
 
                 if (
                     pending_classification_task
@@ -350,9 +350,30 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     )
 
                 # If no transcript yet but image is present, assume a visual request.
-                if predicted_intent is None and pending_image_b64:
+                if (
+                    not last_user_transcript
+                    and pending_image_b64
+                    and not _scene_described_once
+                ):
                     predicted_intent = IntentCategory.SCENE_DESCRIBE
+                    _scene_described_once = True
+                    scene_fallback_this_turn = True
                     logger.debug("No transcript yet, image present → SCENE_DESCRIBE")
+                elif predicted_intent is None and _scene_described_once:
+                    effective_instructions = route(
+                        IntentCategory.GENERAL_CHAT
+                    ).system_instructions
+
+                if (
+                    _scene_described_once
+                    and predicted_intent is None
+                    and not pending_image_b64
+                    and not pending_instructions
+                    and not any(audio_pcm)
+                ):
+                    logger.debug("Silent turn after first scene — skipping response")
+                    last_user_transcript = ""
+                    continue
 
                 if predicted_intent is not None:
                     decision = route(predicted_intent)
@@ -472,6 +493,8 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                             "capture button first, then ask again."
                         )
                     elif decision.system_instructions:
+                        # WEB_SEARCH: currently uses Qwen knowledge + disclaimer.
+                        # TODO Plan 08: wire DashScope search tool here for live results.
                         effective_instructions = decision.system_instructions
 
                 if predicted_target != applied_target:
@@ -492,6 +515,18 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     break
 
                 current_user_transcript = result.user_transcript or ""
+
+                if (
+                    not current_user_transcript.strip()
+                    and _scene_described_once
+                    and not scene_fallback_this_turn
+                    and predicted_intent is None
+                ):
+                    logger.debug("Silent turn after first scene — skipping response")
+                    pending_image_b64 = None
+                    pending_instructions = None
+                    last_user_transcript = ""
+                    continue
 
                 # ── same-turn memory detection ──────────────────────────────
                 _is_memory_save = False
@@ -581,19 +616,11 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         _skip_classifier = False
 
                 elif _is_search_query(current_user_transcript):
-                    search_answer = await search_manager.search(current_user_transcript)
-                    if search_answer == "I was unable to search for that right now.":
-                        search_instructions = (
-                            f"Say exactly this to the user: {search_answer}"
-                        )
-                    else:
-                        search_instructions = (
-                            "Tell the user this search result naturally and conversationally, "
-                            f"without adding facts that are not present: {search_answer}"
-                        )
                     override_result = await client.async_send_audio_turn(
                         audio_pcm=make_silent_pcm(0.5),
-                        instructions=search_instructions,
+                        instructions=route(
+                            IntentCategory.WEB_SEARCH
+                        ).system_instructions,
                     )
                     override_result.user_transcript = current_user_transcript
                     result = override_result

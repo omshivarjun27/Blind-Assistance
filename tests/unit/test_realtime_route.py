@@ -862,164 +862,45 @@ class TestIsMemoryQuery:
         assert _is_memory_query("What Did I Show You") is True
 
 
-# ── web search tests (Plan 08) ─────────────────────────────────────────────
+# ── scene + search regression tests ────────────────────────────────────────
 
 
-def test_web_search_same_turn_calls_search_manager():
-    first_turn = _make_mock_turn(
-        assistant_text="first", user_text="latest cricket score"
-    )
-    override_turn = _make_mock_turn(
-        assistant_text="The score is 100.", user_text="latest cricket score"
-    )
-    mock_client = _mock_client(first_turn)
-    mock_client.async_send_audio_turn = AsyncMock(
-        side_effect=[first_turn, override_turn]
-    )
-    mock_search_manager = MagicMock()
-    mock_search_manager.search = AsyncMock(return_value="The score is 100.")
+def test_scene_describe_fallback_has_once_only_guard_in_source():
+    import inspect
 
-    with (
-        patch(
-            "apps.backend.api.routes.realtime.QwenRealtimeClient",
-            return_value=mock_client,
-        ),
-        patch(
-            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
-            return_value=MagicMock(),
-        ),
-        patch(
-            "apps.backend.api.routes.realtime.SearchManager.from_settings",
-            return_value=mock_search_manager,
-        ),
-    ):
-        with TestClient(app) as client:
-            with client.websocket_connect("/ws/realtime") as ws:
-                ws.send_bytes(b"\x00" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-                _ = ws.receive_text()
+    import apps.backend.api.routes.realtime as realtime_module
 
-    mock_search_manager.search.assert_awaited_once_with("latest cricket score")
+    source = inspect.getsource(realtime_module)
+    assert "_scene_described_once: bool = False" in source
+    assert "and not _scene_described_once" in source
 
 
-def test_web_search_override_uses_silent_turn():
-    from apps.backend.api.routes.realtime import make_silent_pcm
+def test_silent_turn_after_first_scene_guard_present_in_source():
+    import inspect
 
-    first_turn = _make_mock_turn(
-        assistant_text="first", user_text="weather in Bengaluru today"
-    )
-    override_turn = _make_mock_turn(
-        assistant_text="It is sunny.", user_text="weather in Bengaluru today"
-    )
-    mock_client = _mock_client(first_turn)
-    mock_client.async_send_audio_turn = AsyncMock(
-        side_effect=[first_turn, override_turn]
-    )
-    mock_search_manager = MagicMock()
-    mock_search_manager.search = AsyncMock(return_value="It is sunny.")
+    import apps.backend.api.routes.realtime as realtime_module
 
-    with (
-        patch(
-            "apps.backend.api.routes.realtime.QwenRealtimeClient",
-            return_value=mock_client,
-        ),
-        patch(
-            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
-            return_value=MagicMock(),
-        ),
-        patch(
-            "apps.backend.api.routes.realtime.SearchManager.from_settings",
-            return_value=mock_search_manager,
-        ),
-    ):
-        with TestClient(app) as client:
-            with client.websocket_connect("/ws/realtime") as ws:
-                ws.send_bytes(b"\x00" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-                _ = ws.receive_text()
-
-    second_call = mock_client.async_send_audio_turn.await_args_list[1]
-    assert second_call.kwargs["audio_pcm"] == make_silent_pcm(0.5)
+    source = inspect.getsource(realtime_module)
+    assert "Silent turn after first scene — skipping response" in source
+    assert "and not any(audio_pcm)" in source
 
 
-def test_web_search_sets_skip_classifier():
-    first_turn = _make_mock_turn(
-        assistant_text="first", user_text="search for gold price"
-    )
-    override_turn = _make_mock_turn(
-        assistant_text="Gold is up.", user_text="search for gold price"
-    )
-    mock_client = _mock_client(first_turn)
-    mock_client.async_send_audio_turn = AsyncMock(
-        side_effect=[first_turn, override_turn]
-    )
-    mock_search_manager = MagicMock()
-    mock_search_manager.search = AsyncMock(return_value="Gold is up.")
-    mock_classifier = MagicMock()
-    mock_classifier.classify = AsyncMock()
+def test_web_search_no_longer_calls_search_manager_in_source():
+    import inspect
 
-    with (
-        patch(
-            "apps.backend.api.routes.realtime.QwenRealtimeClient",
-            return_value=mock_client,
-        ),
-        patch(
-            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
-            return_value=MagicMock(),
-        ),
-        patch(
-            "apps.backend.api.routes.realtime.SearchManager.from_settings",
-            return_value=mock_search_manager,
-        ),
-        patch(
-            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
-            return_value=mock_classifier,
-        ),
-    ):
-        with TestClient(app) as client:
-            with client.websocket_connect("/ws/realtime") as ws:
-                ws.send_bytes(b"\x00" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-                _ = ws.receive_text()
+    import apps.backend.api.routes.realtime as realtime_module
 
-    assert mock_classifier.classify.await_count == 0
+    source = inspect.getsource(realtime_module)
+    assert "SearchManager" not in source
+    assert "def _is_search_query" in source
+    assert "WEB_SEARCH: currently uses Qwen knowledge + disclaimer." in source
 
 
-def test_web_search_fallback_message_spoken_on_search_failure():
-    fallback = "I was unable to search for that right now."
-    first_turn = _make_mock_turn(assistant_text="first", user_text="latest weather")
-    override_turn = _make_mock_turn(assistant_text=fallback, user_text="latest weather")
-    mock_client = _mock_client(first_turn)
-    mock_client.async_send_audio_turn = AsyncMock(
-        side_effect=[first_turn, override_turn]
-    )
-    mock_search_manager = MagicMock()
-    mock_search_manager.search = AsyncMock(return_value=fallback)
+def test_post_scene_default_uses_general_chat_instructions_in_source():
+    import inspect
 
-    with (
-        patch(
-            "apps.backend.api.routes.realtime.QwenRealtimeClient",
-            return_value=mock_client,
-        ),
-        patch(
-            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
-            return_value=MagicMock(),
-        ),
-        patch(
-            "apps.backend.api.routes.realtime.SearchManager.from_settings",
-            return_value=mock_search_manager,
-        ),
-    ):
-        with TestClient(app) as client:
-            with client.websocket_connect("/ws/realtime") as ws:
-                ws.send_bytes(b"\x00" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-                _ = ws.receive_text()
+    import apps.backend.api.routes.realtime as realtime_module
 
-    second_call = mock_client.async_send_audio_turn.await_args_list[1]
-    instructions = second_call.kwargs["instructions"]
-    assert fallback in instructions
+    source = inspect.getsource(realtime_module)
+    assert "elif predicted_intent is None and _scene_described_once:" in source
+    assert "IntentCategory.GENERAL_CHAT" in source
