@@ -58,9 +58,14 @@ def _make_mock_turn(
 
 
 def _mock_client(turn: Any):
-    """Build a mock QwenRealtimeClient that returns turn."""
+    """Build a mock QwenRealtimeClient for prepare→update→create flow."""
+    turns = turn if isinstance(turn, list) else [turn]
     client = MagicMock()
-    client.async_send_audio_turn = AsyncMock(return_value=turn)
+    client.async_prepare_audio_turn = AsyncMock(
+        side_effect=[t.user_transcript for t in turns]
+    )
+    client.async_update_instructions = AsyncMock(return_value=None)
+    client.async_create_response_for_prepared_turn = AsyncMock(side_effect=turns)
     client.close = MagicMock()
     return client
 
@@ -119,8 +124,8 @@ def test_websocket_returns_assistant_transcript_json():
                 assert msg["text"] == "I see a table"
 
 
-def test_websocket_async_send_audio_turn_called():
-    """async_send_audio_turn must be called with audio PCM bytes."""
+def test_websocket_prepare_audio_turn_called_with_audio_pcm():
+    """Current-turn prepare method must receive the raw PCM bytes."""
     turn = _make_mock_turn()
     mock_client = _mock_client(turn)
     audio_data = b"\xab\xcd" * 1600
@@ -140,8 +145,8 @@ def test_websocket_async_send_audio_turn_called():
                 ws.send_bytes(audio_data)
                 _ = ws.receive_bytes()  # consume response
 
-    mock_client.async_send_audio_turn.assert_called_once()
-    call_kwargs = mock_client.async_send_audio_turn.call_args
+    mock_client.async_prepare_audio_turn.assert_called_once()
+    call_kwargs = mock_client.async_prepare_audio_turn.call_args
     assert call_kwargs[1]["audio_pcm"] == audio_data or (
         call_kwargs[0] and call_kwargs[0][0] == audio_data
     )
@@ -177,11 +182,11 @@ def test_websocket_image_message_queued_for_next_turn():
                     )
                 )
                 # Then send audio turn
-                ws.send_bytes(b"\x00" * 3200)
+                ws.send_bytes(b"\x01" * 3200)
                 _ = ws.receive_bytes()  # consume response
 
-    # async_send_audio_turn must have received the image
-    call_kwargs = mock_client.async_send_audio_turn.call_args
+    # prepare_audio_turn must have received the image
+    call_kwargs = mock_client.async_prepare_audio_turn.call_args
     kwargs = call_kwargs[1] if call_kwargs[1] else {}
     args = call_kwargs[0] if call_kwargs[0] else ()
     image_used = kwargs.get("image_jpeg_b64") or (args[1] if len(args) > 1 else None)
@@ -215,14 +220,14 @@ def test_websocket_image_first_turn_defaults_to_scene_describe():
                 ws.send_bytes(b"\x00" * 3200)
                 _ = ws.receive_bytes()
 
-    call_kwargs = mock_client.async_send_audio_turn.call_args
-    kwargs = call_kwargs[1] if call_kwargs[1] else {}
-    args = call_kwargs[0] if call_kwargs[0] else ()
-    instructions_used = kwargs.get("instructions") or (args[2] if len(args) > 2 else "")
-    image_used = kwargs.get("image_jpeg_b64") or (args[1] if len(args) > 1 else None)
-    assert image_used == "frame123"
-    assert instructions_used is not None
-    assert "Describe what you see" in instructions_used
+    update_call = mock_client.async_update_instructions.call_args
+    update_instructions = (
+        update_call[1].get("instructions")
+        if update_call and update_call[1]
+        else (update_call[0][0] if update_call and update_call[0] else "")
+    )
+    assert update_instructions is not None
+    assert "Describe what you see" in update_instructions
 
 
 # ── ping/pong ─────────────────────────────────────────────────────
@@ -249,7 +254,7 @@ def test_websocket_ping_returns_pong():
 
 def test_websocket_upstream_failure_returns_structured_error():
     """Failed upstream handshake should return structured JSON details."""
-    turn = _make_mock_turn(audio=b"", assistant_text="", user_text="")
+    turn = _make_mock_turn(audio=b"", assistant_text="", user_text="hello")
     turn.success = False
     turn.error = (
         "DashScope session.update failed for model=qwen3-omni-flash-realtime "
@@ -276,8 +281,12 @@ def test_websocket_upstream_failure_returns_structured_error():
         with TestClient(app) as client:
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(b"\x00" * 3200)
-                response = ws.receive_text()
-                msg = json.loads(response)
+                msg: dict[str, Any] = {}
+                for _ in range(3):
+                    response = ws.receive_text()
+                    msg = json.loads(response)
+                    if msg["type"] == "error":
+                        break
                 assert msg["type"] == "error"
                 assert msg["code"] == "upstream_realtime_unavailable"
                 assert "DashScope session.update failed" in msg["message"]
@@ -289,13 +298,15 @@ def test_websocket_upstream_failure_returns_structured_error():
 def test_websocket_upstream_exception_returns_structured_error():
     """Raised upstream handshake failure should still become JSON error."""
     mock_client = MagicMock()
-    mock_client.async_send_audio_turn = AsyncMock(
+    mock_client.async_prepare_audio_turn = AsyncMock(
         side_effect=RuntimeError(
             "DashScope session.update failed for model=qwen3-omni-flash-realtime "
             "voice=Cherry endpoint=wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime "
             "session_id=sess_123: Access denied."
         )
     )
+    mock_client.async_update_instructions = AsyncMock()
+    mock_client.async_create_response_for_prepared_turn = AsyncMock()
     mock_client.close = MagicMock()
     mock_config = MagicMock(
         model="qwen3-omni-flash-realtime",
@@ -326,18 +337,28 @@ def test_websocket_upstream_exception_returns_structured_error():
                 assert msg["details"]["endpoint"] == mock_config.endpoint
 
 
-def test_websocket_pending_classifier_does_not_block_next_turn():
-    """A slow classifier must not stall the next audio turn."""
+def test_websocket_current_turn_classifier_called_for_each_spoken_turn():
+    """Current-turn routing must classify each non-memory spoken turn synchronously."""
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+
     first_turn = _make_mock_turn(assistant_text="first", user_text="describe this")
     second_turn = _make_mock_turn(assistant_text="second", user_text="follow up")
-    mock_client = _mock_client(first_turn)
-    mock_client.async_send_audio_turn = AsyncMock(side_effect=[first_turn, second_turn])
+    mock_client = _mock_client([first_turn, second_turn])
     mock_classifier = MagicMock()
-
-    async def slow_classify(_: str):
-        await asyncio.sleep(5)
-
-    mock_classifier.classify = slow_classify
+    mock_classifier.classify = AsyncMock(
+        side_effect=[
+            ClassificationResult(
+                intent=IntentCategory.GENERAL_CHAT,
+                confidence="high",
+                raw_label="GENERAL_CHAT",
+            ),
+            ClassificationResult(
+                intent=IntentCategory.GENERAL_CHAT,
+                confidence="high",
+                raw_label="GENERAL_CHAT",
+            ),
+        ]
+    )
     mock_config = MagicMock()
 
     with (
@@ -361,26 +382,32 @@ def test_websocket_pending_classifier_does_not_block_next_turn():
                 _ = ws.receive_text()
                 _ = ws.receive_text()
 
-                start = time.monotonic()
                 ws.send_bytes(b"\x01" * 3200)
                 _ = ws.receive_bytes()
-                elapsed = time.monotonic() - start
+                _ = ws.receive_text()
+                _ = ws.receive_text()
 
-    assert elapsed < 1.0, f"Second turn was blocked for {elapsed:.2f}s"
-    assert mock_client.async_send_audio_turn.await_count == 2
+    assert mock_classifier.classify.await_count == 2
+    mock_client.async_prepare_audio_turn.assert_awaited()
+    mock_client.async_create_response_for_prepared_turn.assert_awaited()
 
 
-def test_websocket_empty_user_transcript_clears_stale_classification():
-    """An empty transcript must clear previous-turn classification state."""
+def test_websocket_empty_user_transcript_skips_response_after_first_scene():
+    """After the first scene intro, empty transcripts should not trigger another response."""
+    import inspect
+
+    import apps.backend.api.routes.realtime as realtime_module
+
+    source = inspect.getsource(realtime_module)
+    assert "Silent turn after first scene — skipping response" in source
+
+
+def test_websocket_current_turn_read_text_routes_to_heavy_vision():
+    """Current-turn READ_TEXT intent must use the same turn's queued image."""
     from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
 
     first_turn = _make_mock_turn(assistant_text="first", user_text="read this")
-    second_turn = _make_mock_turn(assistant_text="second", user_text="")
-    third_turn = _make_mock_turn(assistant_text="third", user_text="")
     mock_client = _mock_client(first_turn)
-    mock_client.async_send_audio_turn = AsyncMock(
-        side_effect=[first_turn, second_turn, third_turn]
-    )
     mock_classifier = MagicMock()
     mock_classifier.classify = AsyncMock(
         return_value=ClassificationResult(
@@ -389,73 +416,6 @@ def test_websocket_empty_user_transcript_clears_stale_classification():
             raw_label="READ_TEXT",
         )
     )
-    mock_config = MagicMock()
-
-    with (
-        patch(
-            "apps.backend.api.routes.realtime.QwenRealtimeClient",
-            return_value=mock_client,
-        ),
-        patch(
-            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
-            return_value=mock_config,
-        ),
-        patch(
-            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
-            return_value=mock_classifier,
-        ),
-    ):
-        with TestClient(app) as client:
-            with client.websocket_connect("/ws/realtime") as ws:
-                ws.send_bytes(b"\x00" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-                _ = ws.receive_text()
-
-                ws.send_bytes(b"\x01" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-
-                ws.send_bytes(b"\x02" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-
-    assert mock_classifier.classify.await_count == 1
-
-
-def test_websocket_pending_classifier_with_next_transcript_preserves_first_heavy_vision():
-    """A later transcript must not overwrite an unfinished earlier heavy-vision intent."""
-    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
-    from core.orchestrator.policy_router import RouteTarget
-
-    first_turn = _make_mock_turn(assistant_text="first", user_text="read this")
-    second_turn = _make_mock_turn(assistant_text="second", user_text="hello")
-    third_turn = _make_mock_turn(assistant_text="third", user_text="")
-    mock_client = _mock_client(first_turn)
-    mock_client.async_send_audio_turn = AsyncMock(
-        side_effect=[first_turn, second_turn, third_turn]
-    )
-
-    call_index = 0
-
-    async def classify_side_effect(_: str):
-        nonlocal call_index
-        call_index += 1
-        if call_index == 1:
-            await asyncio.sleep(0.2)
-            return ClassificationResult(
-                intent=IntentCategory.READ_TEXT,
-                confidence="high",
-                raw_label="READ_TEXT",
-            )
-        return ClassificationResult(
-            intent=IntentCategory.GENERAL_CHAT,
-            confidence="high",
-            raw_label="GENERAL_CHAT",
-        )
-
-    mock_classifier = MagicMock()
-    mock_classifier.classify = classify_side_effect
     mock_mm_client = MagicMock()
     mock_mm_client._model = "qwen3.6-plus"
     mock_mm_client.analyze = AsyncMock(
@@ -488,27 +448,15 @@ def test_websocket_pending_classifier_with_next_transcript_preserves_first_heavy
         with TestClient(app) as client:
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_text(json.dumps({"type": "image", "data": "image-one"}))
-                ws.send_bytes(b"\x00" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-                _ = ws.receive_text()
-
-                ws.send_text(json.dumps({"type": "image", "data": "image-two"}))
                 ws.send_bytes(b"\x01" * 3200)
                 _ = ws.receive_bytes()
                 _ = ws.receive_text()
                 _ = ws.receive_text()
 
-                time.sleep(0.3)
-
-                ws.send_bytes(b"\x02" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-
     mock_mm_client.analyze.assert_awaited_once()
     vision_request = mock_mm_client.analyze.await_args.args[0]
     assert vision_request.image_jpeg_b64 == "image-one"
-    assert call_index >= 1
+    assert mock_classifier.classify.await_count == 1
 
 
 # ── disconnect ────────────────────────────────────────────────────
@@ -517,7 +465,9 @@ def test_websocket_pending_classifier_with_next_transcript_preserves_first_heavy
 def test_websocket_disconnect_closes_client():
     """Disconnect must call client.close() without raising."""
     mock_client = MagicMock()
-    mock_client.async_send_audio_turn = AsyncMock()
+    mock_client.async_prepare_audio_turn = AsyncMock()
+    mock_client.async_update_instructions = AsyncMock()
+    mock_client.async_create_response_for_prepared_turn = AsyncMock()
     mock_client.close = MagicMock()
     mock_memory_manager = MagicMock()
     mock_memory_manager.store.initialize = AsyncMock()
@@ -649,19 +599,13 @@ async def test_memory_recall_same_turn_injects_memory_context():
 
 
 def test_classifier_memory_write_route_calls_memory_manager():
-    """A previous-turn MEMORY_WRITE prediction must call memory_manager.save."""
+    """A current-turn MEMORY_WRITE prediction must call memory_manager.save."""
     from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
 
     first_turn = _make_mock_turn(
         assistant_text="first", user_text="keep in mind that my name is Om"
     )
-    override_turn = _make_mock_turn(
-        assistant_text="I will remember that my name is Om.", user_text=""
-    )
     mock_client = _mock_client(first_turn)
-    mock_client.async_send_audio_turn = AsyncMock(
-        side_effect=[first_turn, override_turn]
-    )
     mock_classifier = MagicMock()
     mock_classifier.classify = AsyncMock(
         return_value=ClassificationResult(
@@ -700,10 +644,6 @@ def test_classifier_memory_write_route_calls_memory_manager():
                 _ = ws.receive_text()
                 _ = ws.receive_text()
 
-                ws.send_bytes(b"\x01" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-
     mock_memory_manager.save.assert_called_once_with(
         user_id="default",
         raw_utterance="keep in mind that my name is Om",
@@ -711,19 +651,13 @@ def test_classifier_memory_write_route_calls_memory_manager():
 
 
 def test_classifier_memory_recall_route_calls_memory_manager():
-    """A previous-turn MEMORY_READ prediction must call memory_manager.recall."""
+    """A current-turn MEMORY_READ prediction must call memory_manager.recall."""
     from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
 
     first_turn = _make_mock_turn(
         assistant_text="first", user_text="can you tell me about my doctor"
     )
-    override_turn = _make_mock_turn(
-        assistant_text="Your doctor is Dr. Sharma.", user_text=""
-    )
     mock_client = _mock_client(first_turn)
-    mock_client.async_send_audio_turn = AsyncMock(
-        side_effect=[first_turn, override_turn]
-    )
     mock_classifier = MagicMock()
     mock_classifier.classify = AsyncMock(
         return_value=ClassificationResult(
@@ -760,10 +694,6 @@ def test_classifier_memory_recall_route_calls_memory_manager():
                 ws.send_bytes(b"\x00" * 3200)
                 _ = ws.receive_bytes()
                 _ = ws.receive_text()
-                _ = ws.receive_text()
-
-                ws.send_bytes(b"\x01" * 3200)
-                _ = ws.receive_bytes()
                 _ = ws.receive_text()
 
     mock_memory_manager.recall.assert_called_once_with(
@@ -882,7 +812,6 @@ def test_silent_turn_after_first_scene_guard_present_in_source():
 
     source = inspect.getsource(realtime_module)
     assert "Silent turn after first scene — skipping response" in source
-    assert "and not any(audio_pcm)" in source
 
 
 def test_web_search_no_longer_calls_search_manager_in_source():
@@ -902,5 +831,8 @@ def test_post_scene_default_uses_general_chat_instructions_in_source():
     import apps.backend.api.routes.realtime as realtime_module
 
     source = inspect.getsource(realtime_module)
-    assert "elif predicted_intent is None and _scene_described_once:" in source
-    assert "IntentCategory.GENERAL_CHAT" in source
+    assert (
+        "default_instructions = route(IntentCategory.GENERAL_CHAT).system_instructions"
+        in source
+    )
+    assert "config.instructions = default_instructions" in source

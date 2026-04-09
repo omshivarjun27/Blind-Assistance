@@ -225,18 +225,19 @@ class QwenRealtimeClient:
         result = QwenRealtimeTurn()
         try:
             if instructions is not None:
-                self._send_session_update(instructions=instructions)
-                self._wait_for_event("session.updated", timeout=10.0)
-            self._stream_audio(audio_pcm, image_jpeg_b64)
-            self._collect_response(result)
+                self.update_instructions(instructions=instructions)
+            user_transcript = self.prepare_audio_turn(audio_pcm, image_jpeg_b64)
+            response = self.create_response_for_prepared_turn()
+            if not response.user_transcript:
+                response.user_transcript = user_transcript
+            result = response
         except Exception as exc:
             logger.error("Realtime turn failed: %s", exc)
             result.error = str(exc)
         finally:
             if instructions is not None and self._connected and self._ws is not None:
                 try:
-                    self._send_session_update()
-                    self._wait_for_event("session.updated", timeout=10.0)
+                    self.update_instructions()
                 except Exception as exc:
                     logger.warning(
                         "Failed to restore default instructions after turn: %s",
@@ -258,6 +259,52 @@ class QwenRealtimeClient:
             None,
             lambda: self.send_audio_turn(audio_pcm, image_jpeg_b64, instructions),
         )
+
+    def prepare_audio_turn(
+        self,
+        audio_pcm: bytes,
+        image_jpeg_b64: Optional[str] = None,
+    ) -> str:
+        """Stream a turn, commit it, and wait for the input transcript."""
+        self.ensure_connected()
+        self._stream_audio(audio_pcm, image_jpeg_b64, auto_create_response=False)
+        return self._wait_for_input_transcript(timeout=10.0)
+
+    async def async_prepare_audio_turn(
+        self,
+        audio_pcm: bytes,
+        image_jpeg_b64: Optional[str] = None,
+    ) -> str:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.prepare_audio_turn(audio_pcm, image_jpeg_b64),
+        )
+
+    def update_instructions(self, instructions: Optional[str] = None) -> None:
+        """Apply session instructions and wait until DashScope acknowledges them."""
+        self.ensure_connected()
+        self._send_session_update(instructions=instructions)
+        self._wait_for_event("session.updated", timeout=10.0)
+
+    async def async_update_instructions(
+        self, instructions: Optional[str] = None
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: self.update_instructions(instructions))
+
+    def create_response_for_prepared_turn(self) -> QwenRealtimeTurn:
+        """Create a response for already-committed input and collect output."""
+        self.ensure_connected()
+        result = QwenRealtimeTurn()
+        self._send_event({"type": "response.create"})
+        self._response_active = True
+        self._collect_response(result)
+        return result
+
+    async def async_create_response_for_prepared_turn(self) -> QwenRealtimeTurn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.create_response_for_prepared_turn)
 
     # ── internal helpers ──────────────────────────────────────
 
@@ -363,7 +410,38 @@ class QwenRealtimeClient:
             }
         )
 
-    def _stream_audio(self, pcm_bytes: bytes, image_jpeg_b64: Optional[str]) -> None:
+    def _wait_for_input_transcript(self, timeout: float = 10.0) -> str:
+        """Wait for current-turn transcription before creating a response."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            remaining = max(0.5, deadline - time.monotonic())
+            try:
+                event = self._recv_event(timeout=remaining)
+            except websocket.WebSocketTimeoutException:
+                break
+
+            if not event:
+                continue
+
+            event_type = event.get("type", "")
+            if event_type == "conversation.item.input_audio_transcription.completed":
+                transcript = event.get("transcript", "")
+                return transcript if isinstance(transcript, str) else ""
+            if event_type == "error":
+                raise RuntimeError(f"Server error waiting for transcript: {event}")
+
+            logger.debug(
+                "Skipping event type=%s while waiting for transcript", event_type
+            )
+
+        return ""
+
+    def _stream_audio(
+        self,
+        pcm_bytes: bytes,
+        image_jpeg_b64: Optional[str],
+        auto_create_response: bool = True,
+    ) -> None:
         """Stream PCM chunks and optional image, then commit."""
         chunk = self._config.chunk_bytes
         image_sent = False
@@ -394,8 +472,9 @@ class QwenRealtimeClient:
 
         self._send_event({"type": "input_audio_buffer.commit"})
         self._wait_for_event("input_audio_buffer.committed", timeout=10.0)
-        self._send_event({"type": "response.create"})
-        self._response_active = True
+        if auto_create_response:
+            self._send_event({"type": "response.create"})
+            self._response_active = True
         logger.debug(
             "Streamed %d bytes audio, image=%s",
             len(pcm_bytes),

@@ -49,7 +49,10 @@ def test_web_search_routes_to_realtime_chat_with_search_instructions():
 
     decision = route(IntentCategory.WEB_SEARCH)
     assert decision.target == RouteTarget.REALTIME_CHAT
-    assert "As of my last update" in decision.system_instructions
+    assert (
+        "For the latest update, please check a live app or website."
+        in decision.system_instructions
+    )
 
 
 def test_all_intents_have_routing():

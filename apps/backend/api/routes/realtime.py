@@ -125,6 +125,11 @@ def _is_search_query(transcript: str) -> bool:
     return any(trigger in t for trigger in _SEARCH_TRIGGERS)
 
 
+def _is_effective_silence(transcript: str) -> bool:
+    cleaned = transcript.strip().lower().strip(".?!,;:。！？،")
+    return cleaned in {"", "uh", "um", "hmm", "mm", "mhm", "嗯", "嗯嗯"}
+
+
 def _normalize_memory_fact(fact: str) -> str:
     cleaned = fact.strip()
     if cleaned.lower().startswith("object/text seen: "):
@@ -201,6 +206,10 @@ def make_silent_pcm(duration_seconds: float, sample_rate: int = 16000) -> bytes:
     return struct.pack(f"<{num_samples}h", *([0] * num_samples))
 
 
+def _is_silent_audio(audio_pcm: bytes) -> bool:
+    return not any(audio_pcm)
+
+
 async def _defer_auto_extract(
     memory_manager: MemoryManager,
     user_id: str,
@@ -251,18 +260,9 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     await ws.accept()
     logger.info("WebSocket client connected")
 
+    default_instructions = route(IntentCategory.GENERAL_CHAT).system_instructions
     config = QwenRealtimeConfig.from_settings()
-    config.instructions = (
-        "You are Ally, a voice and vision assistant "
-        "for blind and visually impaired users. "
-        "When an image is provided, ALWAYS describe "
-        "or analyze it as part of your response. "
-        "Be specific about what you see — objects, "
-        "text, positions, distances, colors. "
-        "Speak clearly and concisely. "
-        "Support all languages — respond in the same "
-        "language the user speaks."
-    )
+    config.instructions = default_instructions
     client = QwenRealtimeClient(config)
 
     last_user_transcript: str = ""
@@ -279,12 +279,10 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     else:
         session_memory = SessionMemory()
         memory_manager.session_memory = session_memory
-    pending_classification_task: _asyncio.Task[object] | None = None
-    pending_classification_image_b64: str | None = None
-    queued_classification_input: tuple[str, str | None] | None = None
     pending_image_b64: str | None = None
     pending_instructions: str | None = None
     _scene_described_once: bool = False
+    _last_instructions: str = default_instructions
 
     try:
         while True:
@@ -302,76 +300,61 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     continue
                 logger.debug("Audio turn received: %d bytes", len(audio_pcm))
 
-                # Classify intent from PREVIOUS turn's transcript
-                # (current transcript arrives WITH the response)
-                effective_instructions = pending_instructions
+                if (
+                    _scene_described_once
+                    and not pending_image_b64
+                    and not pending_instructions
+                    and _is_silent_audio(audio_pcm)
+                ):
+                    logger.debug("Silent turn after first scene — skipping response")
+                    last_user_transcript = ""
+                    continue
+
+                effective_instructions = pending_instructions or _last_instructions
                 predicted_target = RouteTarget.REALTIME_CHAT
                 applied_target = RouteTarget.REALTIME_CHAT
                 predicted_intent: IntentCategory | None = None
-                classified_image_b64: str | None = None
-                route_audio_pcm = audio_pcm
                 route_image_b64 = pending_image_b64
-                classifier_handled_previous_memory = False
                 session_memory_recorded = False
                 scene_fallback_this_turn = False
+                current_user_transcript = ""
 
-                if (
-                    pending_classification_task
-                    and pending_classification_task.done()
-                    and not pending_instructions
-                ):
-                    try:
-                        clf_result = pending_classification_task.result()
-                        predicted_intent = clf_result.intent
-                        classified_image_b64 = pending_classification_image_b64
-                    except Exception as exc:
-                        logger.warning(
-                            "Orchestrator failed, using default: %s",
-                            exc,
-                        )
-                    finally:
-                        pending_classification_task = None
-                        pending_classification_image_b64 = None
-                        if queued_classification_input:
-                            queued_transcript, queued_image_b64 = (
-                                queued_classification_input
-                            )
-                            pending_classification_task = _asyncio.create_task(
-                                classifier.classify(queued_transcript)
-                            )
-                            pending_classification_image_b64 = queued_image_b64
-                            queued_classification_input = None
-                elif (
-                    pending_classification_task
-                    and not pending_classification_task.done()
-                ):
-                    logger.debug(
-                        "Intent classification still pending for previous turn — using default realtime behavior"
+                try:
+                    current_user_transcript = await client.async_prepare_audio_turn(
+                        audio_pcm=audio_pcm,
+                        image_jpeg_b64=route_image_b64,
                     )
+                except Exception as exc:
+                    await _send_upstream_error(ws, str(exc), config)
+                    break
 
-                # If no transcript yet but image is present, assume a visual request.
-                if (
-                    not last_user_transcript
-                    and pending_image_b64
-                    and not _scene_described_once
-                ):
+                _cleaned = build_memory_fact(current_user_transcript)
+                _silence_like = _is_effective_silence(current_user_transcript)
+                _is_memory_save = (
+                    bool(current_user_transcript.strip())
+                    and not _silence_like
+                    and (_cleaned != current_user_transcript.strip())
+                )
+                _is_memory_recall = bool(
+                    current_user_transcript.strip() and not _silence_like
+                ) and _is_memory_query(current_user_transcript)
+
+                if _is_memory_save:
+                    predicted_intent = IntentCategory.MEMORY_SAVE
+                elif _is_memory_recall:
+                    predicted_intent = IntentCategory.MEMORY_RECALL
+                elif current_user_transcript.strip() and not _silence_like:
+                    clf_result = await classifier.classify(current_user_transcript)
+                    predicted_intent = clf_result.intent
+                elif route_image_b64 and not _scene_described_once:
                     predicted_intent = IntentCategory.SCENE_DESCRIBE
                     _scene_described_once = True
                     scene_fallback_this_turn = True
                     logger.debug("No transcript yet, image present → SCENE_DESCRIBE")
-                elif predicted_intent is None and _scene_described_once:
-                    effective_instructions = route(
-                        IntentCategory.GENERAL_CHAT
-                    ).system_instructions
-
-                if (
-                    _scene_described_once
-                    and predicted_intent is None
-                    and not pending_image_b64
-                    and not pending_instructions
-                    and not any(audio_pcm)
-                ):
+                else:
                     logger.debug("Silent turn after first scene — skipping response")
+                    pending_image_b64 = None
+                    pending_instructions = None
                     last_user_transcript = ""
                     continue
 
@@ -389,14 +372,11 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         try:
                             confirmed_fact = await memory_manager.save(
                                 user_id="default",
-                                raw_utterance=last_user_transcript,
+                                raw_utterance=current_user_transcript,
                             )
                             effective_instructions = (
                                 f"Tell the user: I will remember that {confirmed_fact}."
                             )
-                            route_audio_pcm = make_silent_pcm(0.5)
-                            route_image_b64 = None
-                            classifier_handled_previous_memory = True
                         except Exception as exc:
                             logger.warning(
                                 "Classifier-routed memory save failed: %s",
@@ -407,13 +387,13 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         try:
                             memory_context = await memory_manager.recall(
                                 user_id="default",
-                                query=last_user_transcript,
+                                query=current_user_transcript,
                                 top_k=3,
                             )
                             if memory_context:
                                 effective_instructions = build_system_prompt(
                                     base_instructions=(
-                                        f"The user asked: {last_user_transcript}\n"
+                                        f"The user asked: {current_user_transcript}\n"
                                         "Answer using only the relevant stored memory."
                                         " Be brief and speak naturally."
                                     ),
@@ -421,9 +401,6 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                                 )
                             else:
                                 effective_instructions = "Tell the user: I don't have anything stored about that yet."
-                            route_audio_pcm = make_silent_pcm(0.5)
-                            route_image_b64 = None
-                            classifier_handled_previous_memory = True
                         except Exception as exc:
                             logger.warning(
                                 "Classifier-routed memory recall failed: %s",
@@ -431,7 +408,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                             )
                     elif decision.target == RouteTarget.HEAVY_VISION:
                         applied_target = RouteTarget.HEAVY_VISION
-                        vision_image_b64 = classified_image_b64 or pending_image_b64
+                        vision_image_b64 = route_image_b64
                         is_usable, guidance = assess_frame_quality(vision_image_b64)
                         if not is_usable:
                             effective_instructions = (
@@ -459,7 +436,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                                     f"{vision_result.text}"
                                 )
                                 session_memory.add_turn(
-                                    user_transcript=last_user_transcript,
+                                    user_transcript=current_user_transcript,
                                     assistant_response=vision_result.text,
                                     vision_objects=[
                                         f"Object/text seen: {vision_result.text[:120]}"
@@ -504,139 +481,28 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         applied_target.value,
                     )
 
+                if effective_instructions != _last_instructions:
+                    try:
+                        await client.async_update_instructions(effective_instructions)
+                        _last_instructions = effective_instructions
+                    except Exception as exc:
+                        await _send_upstream_error(ws, str(exc), config)
+                        break
+
                 try:
-                    result = await client.async_send_audio_turn(
-                        audio_pcm=route_audio_pcm,
-                        image_jpeg_b64=route_image_b64,
-                        instructions=effective_instructions,
-                    )
+                    result = await client.async_create_response_for_prepared_turn()
                 except Exception as exc:
                     await _send_upstream_error(ws, str(exc), config)
                     break
 
-                current_user_transcript = result.user_transcript or ""
-
-                if (
-                    not current_user_transcript.strip()
-                    and _scene_described_once
-                    and not scene_fallback_this_turn
-                    and predicted_intent is None
-                ):
-                    logger.debug("Silent turn after first scene — skipping response")
-                    pending_image_b64 = None
-                    pending_instructions = None
-                    last_user_transcript = ""
-                    continue
-
-                # ── same-turn memory detection ──────────────────────────────
-                _is_memory_save = False
-                _is_memory_recall = _is_memory_query(current_user_transcript)
-
-                _cleaned = build_memory_fact(current_user_transcript)
-                if _cleaned != current_user_transcript.strip():
-                    _is_memory_save = True
-
-                if _is_memory_save:
-                    try:
-                        if _cleaned:
-                            confirmed_fact = await memory_manager.save(
-                                user_id="default",
-                                raw_utterance=current_user_transcript,
-                            )
-                            override_result = await client.async_send_audio_turn(
-                                audio_pcm=make_silent_pcm(0.5),
-                                instructions=(
-                                    f"Tell the user: I will remember that {confirmed_fact}."
-                                ),
-                            )
-                            override_result.user_transcript = current_user_transcript
-                            result = override_result
-                            _skip_classifier = True
-                        else:
-                            override_result = await client.async_send_audio_turn(
-                                audio_pcm=make_silent_pcm(0.5),
-                                instructions=(
-                                    "Tell the user: Please say the fact you want me to remember."
-                                ),
-                            )
-                            override_result.user_transcript = current_user_transcript
-                            result = override_result
-                            _skip_classifier = True
-                    except Exception as exc:
-                        logger.warning("Memory save failed: %s", exc)
-                        _skip_classifier = False
-
-                elif _is_memory_recall:
-                    try:
-                        query_embedding = await memory_manager.embedder.embed(
-                            current_user_transcript
-                        )
-                        st_facts_list = await memory_manager.store.recall_facts(
-                            "default",
-                            query_embedding,
-                            top_k=3,
-                            tier="short",
-                        )
-                        lt_facts_list = await memory_manager.store.recall_facts(
-                            "default",
-                            query_embedding,
-                            top_k=3,
-                            tier="long",
-                        )
-                        st_facts = "\n".join(st_facts_list) if st_facts_list else None
-                        lt_facts = "\n".join(lt_facts_list) if lt_facts_list else None
-                        combined = compose_memory_context(
-                            session_memory.get_recent(5),
-                            st_facts,
-                            lt_facts,
-                            session_memory.get_objects_seen(),
-                        )
-                        memory_reply = _build_memory_reply(
-                            current_user_transcript,
-                            st_facts_list,
-                            lt_facts_list,
-                            session_memory.get_objects_seen(),
-                        )
-                        if combined:
-                            recall_instructions = (
-                                "Reply with exactly this sentence and nothing else: "
-                                f'"{memory_reply or combined}"'
-                            )
-                        else:
-                            recall_instructions = "Tell the user: I don't have anything stored about that yet."
-                        override_result = await client.async_send_audio_turn(
-                            audio_pcm=make_silent_pcm(0.5),
-                            instructions=recall_instructions,
-                        )
-                        override_result.user_transcript = current_user_transcript
-                        result = override_result
-                        _skip_classifier = True
-                    except Exception as exc:
-                        logger.warning("Memory recall failed: %s", exc)
-                        _skip_classifier = False
-
-                elif _is_search_query(current_user_transcript):
-                    override_result = await client.async_send_audio_turn(
-                        audio_pcm=make_silent_pcm(0.5),
-                        instructions=route(
-                            IntentCategory.WEB_SEARCH
-                        ).system_instructions,
-                    )
-                    override_result.user_transcript = current_user_transcript
-                    result = override_result
-                    _skip_classifier = True
-
-                else:
-                    _skip_classifier = classifier_handled_previous_memory
-                # ── end same-turn memory detection ──────────────────────────
+                if not result.user_transcript:
+                    result.user_transcript = current_user_transcript
 
                 current_user_transcript = (
                     result.user_transcript or current_user_transcript
                 )
-                if (
+                if current_user_transcript and not _is_memory_query(
                     current_user_transcript
-                    and not _is_memory_query(current_user_transcript)
-                    and not _is_search_query(current_user_transcript)
                 ):
                     _asyncio.create_task(
                         _defer_auto_extract(
@@ -655,24 +521,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
 
                 turn_image_b64 = pending_image_b64
 
-                # Store for next turn classification
-                last_user_transcript = result.user_transcript or ""
-                if last_user_transcript and not _skip_classifier:
-                    if pending_classification_task is None:
-                        pending_classification_task = _asyncio.create_task(
-                            classifier.classify(last_user_transcript)
-                        )
-                        pending_classification_image_b64 = turn_image_b64
-                    else:
-                        queued_classification_input = (
-                            last_user_transcript,
-                            turn_image_b64,
-                        )
-                    if _is_memory_query(last_user_transcript or ""):
-                        logger.debug(
-                            "Memory query detected in transcript: %r — Plan 07 will handle recall",
-                            (last_user_transcript or "")[:60],
-                        )
+                last_user_transcript = current_user_transcript
 
                 # Reset per-turn context
                 pending_image_b64 = None
