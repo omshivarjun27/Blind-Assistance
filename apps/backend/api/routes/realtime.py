@@ -31,6 +31,7 @@ from apps.backend.services.dashscope.realtime_client import (
     QwenRealtimeConfig,
 )
 from core.memory import MemoryManager, SessionMemory, compose_memory_context
+from core.search import SearchManager
 from core.orchestrator.capture_coach import assess_frame_quality
 from core.orchestrator.intent_classifier import (
     IntentCategory,
@@ -96,6 +97,33 @@ def _is_memory_query(transcript: str) -> bool:
         return False
     t = transcript.lower().strip()
     return any(trigger.lower() in t for trigger in _PAST_TENSE_TRIGGERS)
+
+
+_SEARCH_TRIGGERS = [
+    "search for",
+    "look up",
+    "find out",
+    "what is the latest",
+    "latest news",
+    "current price",
+    "today's",
+    "news about",
+    "who won",
+    "what happened",
+    "how much does",
+    "is it open",
+    "weather",
+    "score",
+    "trending",
+    "right now",
+    "currently",
+    "live score",
+]
+
+
+def _is_search_query(transcript: str) -> bool:
+    t = transcript.lower().strip()
+    return any(trigger in t for trigger in _SEARCH_TRIGGERS)
 
 
 def _normalize_memory_fact(fact: str) -> str:
@@ -174,6 +202,20 @@ def make_silent_pcm(duration_seconds: float, sample_rate: int = 16000) -> bytes:
     return struct.pack(f"<{num_samples}h", *([0] * num_samples))
 
 
+async def _defer_auto_extract(
+    memory_manager: MemoryManager,
+    user_id: str,
+    user_transcript: str,
+    assistant_transcript: str,
+) -> None:
+    await _asyncio.sleep(0.05)
+    await memory_manager.auto_extract_and_store(
+        user_id=user_id,
+        user_transcript=user_transcript,
+        assistant_transcript=assistant_transcript,
+    )
+
+
 async def _send_upstream_error(
     ws: WebSocket,
     message: str,
@@ -228,6 +270,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     classifier = IntentClassifier.from_settings()
     mm_client = MultimodalClient.from_settings()
     memory_manager = MemoryManager.from_settings()
+    search_manager = SearchManager.from_settings()
     if hasattr(type(memory_manager.store), "initialize_all"):
         await memory_manager.store.initialize_all()
     else:
@@ -537,6 +580,25 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         logger.warning("Memory recall failed: %s", exc)
                         _skip_classifier = False
 
+                elif _is_search_query(current_user_transcript):
+                    search_answer = await search_manager.search(current_user_transcript)
+                    if search_answer == "I was unable to search for that right now.":
+                        search_instructions = (
+                            f"Say exactly this to the user: {search_answer}"
+                        )
+                    else:
+                        search_instructions = (
+                            "Tell the user this search result naturally and conversationally, "
+                            f"without adding facts that are not present: {search_answer}"
+                        )
+                    override_result = await client.async_send_audio_turn(
+                        audio_pcm=make_silent_pcm(0.5),
+                        instructions=search_instructions,
+                    )
+                    override_result.user_transcript = current_user_transcript
+                    result = override_result
+                    _skip_classifier = True
+
                 else:
                     _skip_classifier = classifier_handled_previous_memory
                 # ── end same-turn memory detection ──────────────────────────
@@ -544,16 +606,19 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 current_user_transcript = (
                     result.user_transcript or current_user_transcript
                 )
-                if current_user_transcript and not _is_memory_query(
+                if (
                     current_user_transcript
+                    and not _is_memory_query(current_user_transcript)
+                    and not _is_search_query(current_user_transcript)
                 ):
-                    extract_coro = memory_manager.auto_extract_and_store(
-                        user_id="default",
-                        user_transcript=current_user_transcript,
-                        assistant_transcript=result.assistant_transcript or "",
+                    _asyncio.create_task(
+                        _defer_auto_extract(
+                            memory_manager,
+                            "default",
+                            current_user_transcript,
+                            result.assistant_transcript or "",
+                        )
                     )
-                    if _asyncio.iscoroutine(extract_coro):
-                        _asyncio.create_task(extract_coro)
 
                 if not session_memory_recorded:
                     session_memory.add_turn(

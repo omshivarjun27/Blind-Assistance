@@ -860,3 +860,166 @@ class TestIsMemoryQuery:
 
         assert _is_memory_query("WHAT IS MY NAME") is True
         assert _is_memory_query("What Did I Show You") is True
+
+
+# ── web search tests (Plan 08) ─────────────────────────────────────────────
+
+
+def test_web_search_same_turn_calls_search_manager():
+    first_turn = _make_mock_turn(
+        assistant_text="first", user_text="latest cricket score"
+    )
+    override_turn = _make_mock_turn(
+        assistant_text="The score is 100.", user_text="latest cricket score"
+    )
+    mock_client = _mock_client(first_turn)
+    mock_client.async_send_audio_turn = AsyncMock(
+        side_effect=[first_turn, override_turn]
+    )
+    mock_search_manager = MagicMock()
+    mock_search_manager.search = AsyncMock(return_value="The score is 100.")
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.SearchManager.from_settings",
+            return_value=mock_search_manager,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+    mock_search_manager.search.assert_awaited_once_with("latest cricket score")
+
+
+def test_web_search_override_uses_silent_turn():
+    from apps.backend.api.routes.realtime import make_silent_pcm
+
+    first_turn = _make_mock_turn(
+        assistant_text="first", user_text="weather in Bengaluru today"
+    )
+    override_turn = _make_mock_turn(
+        assistant_text="It is sunny.", user_text="weather in Bengaluru today"
+    )
+    mock_client = _mock_client(first_turn)
+    mock_client.async_send_audio_turn = AsyncMock(
+        side_effect=[first_turn, override_turn]
+    )
+    mock_search_manager = MagicMock()
+    mock_search_manager.search = AsyncMock(return_value="It is sunny.")
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.SearchManager.from_settings",
+            return_value=mock_search_manager,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+    second_call = mock_client.async_send_audio_turn.await_args_list[1]
+    assert second_call.kwargs["audio_pcm"] == make_silent_pcm(0.5)
+
+
+def test_web_search_sets_skip_classifier():
+    first_turn = _make_mock_turn(
+        assistant_text="first", user_text="search for gold price"
+    )
+    override_turn = _make_mock_turn(
+        assistant_text="Gold is up.", user_text="search for gold price"
+    )
+    mock_client = _mock_client(first_turn)
+    mock_client.async_send_audio_turn = AsyncMock(
+        side_effect=[first_turn, override_turn]
+    )
+    mock_search_manager = MagicMock()
+    mock_search_manager.search = AsyncMock(return_value="Gold is up.")
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock()
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.SearchManager.from_settings",
+            return_value=mock_search_manager,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+    assert mock_classifier.classify.await_count == 0
+
+
+def test_web_search_fallback_message_spoken_on_search_failure():
+    fallback = "I was unable to search for that right now."
+    first_turn = _make_mock_turn(assistant_text="first", user_text="latest weather")
+    override_turn = _make_mock_turn(assistant_text=fallback, user_text="latest weather")
+    mock_client = _mock_client(first_turn)
+    mock_client.async_send_audio_turn = AsyncMock(
+        side_effect=[first_turn, override_turn]
+    )
+    mock_search_manager = MagicMock()
+    mock_search_manager.search = AsyncMock(return_value=fallback)
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.SearchManager.from_settings",
+            return_value=mock_search_manager,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+    second_call = mock_client.async_send_audio_turn.await_args_list[1]
+    instructions = second_call.kwargs["instructions"]
+    assert fallback in instructions

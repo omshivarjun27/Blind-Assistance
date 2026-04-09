@@ -4,9 +4,8 @@ Ally Vision v2 — Policy router.
 Maps IntentCategory to RouteTarget and injects
 system instructions into Qwen turns.
 
-Unimplemented targets (WEB_SEARCH, MEMORY_WRITE,
-MEMORY_READ, DOCUMENT_QA) fall back to REALTIME_CHAT
-until Plans 07-09 implement those services.
+Only DOCUMENT_QA remains unimplemented and falls back
+to REALTIME_CHAT until a later plan wires it.
 """
 
 from __future__ import annotations
@@ -39,7 +38,6 @@ class RoutingDecision:
 
 
 _UNIMPLEMENTED = {
-    RouteTarget.WEB_SEARCH,
     RouteTarget.DOCUMENT_QA,
 }
 
