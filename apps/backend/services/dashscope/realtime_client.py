@@ -52,11 +52,17 @@ class QwenRealtimeConfig:
     endpoint: str = "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime"
     voice: str = "Cherry"
     instructions: str = (
-        "You are Ally, a helpful voice and vision assistant "
-        "for blind and visually impaired users. "
-        "Respond clearly and briefly in the same language the user speaks. "
-        "For scene descriptions, be specific about objects, "
-        "their positions, and distances."
+        "You are Cherry, a helpful voice and vision assistant for blind and low-vision users. "
+        "You are warm, clear, and concise. "
+        "LANGUAGE RULE: Respond in whatever language the user speaks. "
+        "If the user speaks Kannada, reply in Kannada. "
+        "If the user speaks Hindi, reply in Hindi. "
+        "If the user speaks English, reply in English. "
+        "If the user speaks Tamil, reply in Tamil. "
+        "If the user speaks Telugu, reply in Telugu. "
+        "Mirror the user's language exactly. "
+        "Only switch languages if the user explicitly asks you to translate or respond in a different language. "
+        "Never reply in English if the user spoke in another language unless they asked for it."
     )
     transcription_model: str = "gummy-realtime-v1"
     audio_in_rate: int = 16000
@@ -326,6 +332,15 @@ class QwenRealtimeClient:
             )
         raise TimeoutError(f"Timed out waiting for event: {expected_type}")
 
+    # TODO Plan 07: Re-enable server_vad for barge-in/interruption support.
+    # Requires:
+    #   1. Frontend streams live mic chunks (not batched turns)
+    #   2. Backend calls response.cancel when new speech detected mid-response
+    #   3. Image must be sent BEFORE any audio chunks to avoid VAD race condition
+    # Currently using manual turn_detection (None) because the frontend
+    # batches one complete turn before sending. Switching back to server_vad
+    # without changing the frontend architecture will cause the COMMON_ERROR
+    # "invalid URL" regression — the image arrives after VAD auto-commits the turn.
     def _send_session_update(self, instructions: Optional[str] = None) -> None:
         self._send_event(
             {
@@ -339,13 +354,11 @@ class QwenRealtimeClient:
                     "input_audio_transcription": {
                         "model": self._config.transcription_model,
                     },
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": 0.5,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 500,
-                        "interrupt_response": True,
-                    },
+                    # The frontend already batches one complete user turn per
+                    # binary frame, so manual mode keeps the realtime session
+                    # aligned with our explicit commit/create flow and avoids
+                    # provider errors on multimodal turns.
+                    "turn_detection": None,
                 },
             }
         )
@@ -365,6 +378,11 @@ class QwenRealtimeClient:
             )
             # Image must be sent AFTER first audio chunk
             if image_jpeg_b64 is not None and not image_sent:
+                logger.debug(
+                    "Sending image: size=%d bytes, prefix=%s",
+                    len(image_jpeg_b64),
+                    image_jpeg_b64[:30],
+                )
                 self._send_event(
                     {
                         "type": "input_image_buffer.append",

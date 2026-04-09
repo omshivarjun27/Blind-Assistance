@@ -166,13 +166,8 @@ def test_session_update_payload_structure():
     assert session["voice"] == "Cherry"
     assert session["input_audio_format"] == "pcm"
     assert session["output_audio_format"] == "pcm"
-    assert session["turn_detection"] == {
-        "type": "server_vad",
-        "threshold": 0.5,
-        "prefix_padding_ms": 300,
-        "silence_duration_ms": 500,
-        "interrupt_response": True,
-    }
+    assert "LANGUAGE RULE" in session.get("instructions", "")
+    assert session["turn_detection"] is None
     assert session["input_audio_transcription"]["model"] == "gummy-realtime-v1"
 
 
@@ -316,6 +311,44 @@ def test_audio_sent_before_image():
     audio_idx = next(i for i, t in enumerate(types) if t == "input_audio_buffer.append")
     image_idx = next(i for i, t in enumerate(types) if t == "input_image_buffer.append")
     assert audio_idx < image_idx, "Audio must precede image"
+
+
+def test_stream_audio_image_field_is_raw_base64():
+    """image field in input_image_buffer.append must stay raw base64."""
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+    )
+
+    config = QwenRealtimeConfig(
+        api_key="test",
+        model="qwen3-omni-flash-realtime",
+    )
+    client = QwenRealtimeClient(config)
+    client._ws = MagicMock()
+
+    sent_events: list[dict[str, Any]] = []
+    client._ws.send = lambda data: sent_events.append(json.loads(data))
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            client,
+            "_wait_for_event",
+            lambda expected_type, timeout=10.0: {"type": expected_type},
+        )
+        fake_jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+        fake_b64 = base64.b64encode(fake_jpeg).decode("utf-8")
+        client._stream_audio(b"\x00" * 3200, fake_b64)
+
+    image_events = [
+        e for e in sent_events if e.get("type") == "input_image_buffer.append"
+    ]
+    assert len(image_events) == 1, (
+        "Expected exactly one input_image_buffer.append event"
+    )
+    val = image_events[0]["image"]
+    assert not val.startswith("data:"), f"Expected raw base64, got: {val[:60]}"
+    assert val == fake_b64, "Base64 payload must be unchanged"
 
 
 def test_commit_sent_after_all_audio():
