@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 
 import aiosqlite
 import numpy as np
 
 from shared.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryStore:
@@ -74,6 +77,7 @@ class MemoryStore:
                       fact          TEXT NOT NULL,
                       embedding_json TEXT NOT NULL,
                       category      TEXT NOT NULL DEFAULT 'GENERAL',
+                      priority      INTEGER DEFAULT 0,
                       created_at    TEXT NOT NULL,
                       updated_at    TEXT NOT NULL DEFAULT ''
                   )
@@ -90,6 +94,13 @@ class MemoryStore:
                 await db.execute(
                     "ALTER TABLE long_term_memories ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"
                 )
+            if "priority" not in columns:
+                try:
+                    await db.execute(
+                        "ALTER TABLE long_term_memories ADD COLUMN priority INTEGER DEFAULT 0"
+                    )
+                except Exception as exc:
+                    logger.info("priority column migration skipped: %s", exc)
             await db.execute(
                 """
                   CREATE INDEX IF NOT EXISTS long_term_memories_user_id
@@ -281,3 +292,50 @@ class MemoryStore:
             )
             await db.commit()
             return cursor.rowcount if cursor.rowcount is not None else 0
+
+    async def mark_priority_facts(
+        self,
+        user_id: str,
+        facts: list[str],
+    ) -> int:
+        """Mark matching facts as priority=1. Returns count updated. Never raises."""
+        try:
+            updated = 0
+            async with aiosqlite.connect(self._db_path) as db:
+                for fact in facts:
+                    cursor = await db.execute(
+                        """
+                        UPDATE long_term_memories
+                        SET priority = 1
+                        WHERE user_id = ? AND fact LIKE ?
+                        """,
+                        (user_id, f"%{fact}%"),
+                    )
+                    updated += cursor.rowcount or 0
+                await db.commit()
+            return updated
+        except Exception:
+            return 0
+
+    async def get_priority_facts(
+        self,
+        user_id: str,
+        top_k: int = 5,
+    ) -> list[str]:
+        """Return top_k priority facts for user_id. Never raises."""
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                cursor = await db.execute(
+                    """
+                    SELECT fact
+                    FROM long_term_memories
+                    WHERE user_id = ? AND priority = 1
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (user_id, top_k),
+                )
+                rows = await cursor.fetchall()
+            return [str(row[0]) for row in rows]
+        except Exception:
+            return []

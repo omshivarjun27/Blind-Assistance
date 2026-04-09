@@ -22,18 +22,29 @@ _MEMORY_PREFIXES = re.compile(
 
 def build_system_prompt(
     base_instructions: str,
-    memory_context: str = "",
-    document_context: str = "",
+    memory_context: str | None = None,
+    document_context: str | None = None,
+    verbosity_mode: str = "NORMAL",
+    intent_penalty: bool = False,
 ) -> str:
     """
     Combine base instructions with optional memory and document context.
     Avoids leading/trailing blank sections.
     """
     parts = [base_instructions.strip()]
-    if memory_context.strip():
+    if memory_context and memory_context.strip():
         parts.append(f"Relevant memory:\n{memory_context.strip()}")
-    if document_context.strip():
+    if document_context and document_context.strip():
         parts.append(f"Document context:\n{document_context.strip()}")
+    if intent_penalty:
+        parts.insert(
+            0,
+            "The user has corrected this type of answer before. Be especially careful and clear.",
+        )
+    if verbosity_mode == "COMPACT":
+        parts.append("Keep your answer under 2 sentences.")
+    elif verbosity_mode == "VERBOSE":
+        parts.append("Give a thorough, detailed explanation.")
     return "\n\n".join(p for p in parts if p)
 
 

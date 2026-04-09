@@ -18,10 +18,13 @@ import json
 import logging
 import asyncio as _asyncio
 import struct
+from collections.abc import Coroutine
 from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from apps.backend.db.bootstrap import bootstrap_learning_tables
 from apps.backend.services.dashscope.multimodal_client import (
     MultimodalClient,
     VisionRequest,
@@ -30,6 +33,7 @@ from apps.backend.services.dashscope.realtime_client import (
     QwenRealtimeClient,
     QwenRealtimeConfig,
 )
+from core.learning import CorrectionStore, OfflineReplay, OnlineReflection, PatchStore
 from core.memory import MemoryManager, SessionMemory, compose_memory_context
 from core.orchestrator.capture_coach import assess_frame_quality
 from core.orchestrator.intent_classifier import (
@@ -41,6 +45,7 @@ from core.orchestrator.prompt_builder import (
     build_system_prompt,
 )
 from core.orchestrator.policy_router import RouteTarget, route
+from shared.config import settings
 
 # Past-tense phrases that signal the user is asking about memory/history.
 # Used by Plan 07 memory recall to auto-trigger MEMORY_READ without
@@ -128,6 +133,40 @@ def _is_search_query(transcript: str) -> bool:
 def _is_effective_silence(transcript: str) -> bool:
     cleaned = transcript.strip().lower().strip(".?!,;:。！？،")
     return cleaned in {"", "uh", "um", "hmm", "mm", "mhm", "嗯", "嗯嗯"}
+
+
+_CORRECTION_SIGNALS: frozenset[str] = frozenset(
+    {
+        "that's wrong",
+        "thats wrong",
+        "no that's not right",
+        "no thats not right",
+        "incorrect",
+        "not what i asked",
+        "wrong answer",
+        "try again",
+        "that's not it",
+        "thats not it",
+        "stop",
+        "no no",
+        "ತಪ್ಪು",
+        "ಇಲ್ಲ",
+        "ಸರಿಯಿಲ್ಲ",
+        "गलत है",
+        "गलत",
+        "नहीं",
+        "यह सही नहीं",
+    }
+)
+
+
+def _is_correction_signal(transcript: str) -> tuple[bool, str]:
+    """Returns (is_correction, matched_signal). Never raises."""
+    t = transcript.lower().strip()
+    for sig in _CORRECTION_SIGNALS:
+        if sig in t:
+            return True, sig
+    return False, ""
 
 
 def _normalize_memory_fact(fact: str) -> str:
@@ -224,6 +263,16 @@ async def _defer_auto_extract(
     )
 
 
+def _schedule_background_task(
+    coro: Coroutine[Any, Any, object],
+    label: str,
+) -> None:
+    try:
+        _ = _asyncio.create_task(coro)
+    except Exception as exc:
+        logger.warning("%s create_task failed: %s", label, exc)
+
+
 async def _send_upstream_error(
     ws: WebSocket,
     message: str,
@@ -260,6 +309,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     await ws.accept()
     logger.info("WebSocket client connected")
 
+    session_id = uuid4().hex
     default_instructions = route(IntentCategory.GENERAL_CHAT).system_instructions
     config = QwenRealtimeConfig.from_settings()
     config.instructions = default_instructions
@@ -269,6 +319,24 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     classifier = IntentClassifier.from_settings()
     mm_client = MultimodalClient.from_settings()
     memory_manager = MemoryManager.from_settings()
+    offline_replay_api_key = settings.DASHSCOPE_API_KEY
+    if not offline_replay_api_key:
+        try:
+            offline_replay_api_key = settings.get_api_key()
+        except Exception as exc:
+            logger.warning("Offline replay API key unavailable: %s", exc)
+    correction_store = CorrectionStore.from_settings()
+    online_reflection = OnlineReflection.from_settings()
+    patch_store = PatchStore.from_settings()
+    offline_replay = OfflineReplay(
+        db_path=settings.MEMORY_DB_PATH,
+        correction_store=correction_store,
+        patch_store=patch_store,
+        priority_min_recalls=settings.LEARNING_PRIORITY_PROMOTION_MIN_RECALLS,
+        turbo_model=settings.QWEN_TURBO_MODEL,
+        api_key=offline_replay_api_key,
+        base_url=settings.DASHSCOPE_COMPAT_BASE,
+    )
     if hasattr(type(memory_manager.store), "initialize_all"):
         await memory_manager.store.initialize_all()
     else:
@@ -279,10 +347,23 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     else:
         session_memory = SessionMemory()
         memory_manager.session_memory = session_memory
+    await bootstrap_learning_tables(settings.MEMORY_DB_PATH)
+    try:
+        startup_ctx = await memory_manager.get_startup_memory_context("default")
+    except Exception as exc:
+        logger.warning("Startup priority memory load failed: %s", exc)
+        startup_ctx = None
+    if startup_ctx:
+        default_instructions = build_system_prompt(
+            base_instructions=route(IntentCategory.GENERAL_CHAT).system_instructions,
+            memory_context=startup_ctx,
+        )
+        config.instructions = default_instructions
     pending_image_b64: str | None = None
     pending_instructions: str | None = None
     _scene_described_once: bool = False
     _last_instructions: str = default_instructions
+    _turns_since_corr: int = 0
 
     try:
         while True:
@@ -314,6 +395,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 predicted_target = RouteTarget.REALTIME_CHAT
                 applied_target = RouteTarget.REALTIME_CHAT
                 predicted_intent: IntentCategory | None = None
+                routing_decision = route(IntentCategory.GENERAL_CHAT)
                 route_image_b64 = pending_image_b64
                 session_memory_recorded = False
                 scene_fallback_this_turn = False
@@ -360,7 +442,12 @@ async def realtime_endpoint(ws: WebSocket) -> None:
 
                 if predicted_intent is not None:
                     decision = route(predicted_intent)
+                    routing_decision = decision
                     predicted_target = decision.target
+                    prompt_verbosity = online_reflection.get_verbosity_mode(session_id)
+                    prompt_penalty = online_reflection.get_intent_penalty(
+                        str(predicted_intent)
+                    )
                     logger.debug(
                         "Intent: %s → Route: %s (frame=%s)",
                         predicted_intent.value,
@@ -398,6 +485,8 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                                         " Be brief and speak naturally."
                                     ),
                                     memory_context=memory_context,
+                                    verbosity_mode=prompt_verbosity,
+                                    intent_penalty=prompt_penalty,
                                 )
                             else:
                                 effective_instructions = "Tell the user: I don't have anything stored about that yet."
@@ -472,7 +561,11 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     elif decision.system_instructions:
                         # WEB_SEARCH: currently uses Qwen knowledge + disclaimer.
                         # TODO Plan 08: wire DashScope search tool here for live results.
-                        effective_instructions = decision.system_instructions
+                        effective_instructions = build_system_prompt(
+                            base_instructions=decision.system_instructions,
+                            verbosity_mode=prompt_verbosity,
+                            intent_penalty=prompt_penalty,
+                        )
 
                 if predicted_target != applied_target:
                     logger.debug(
@@ -504,13 +597,14 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 if current_user_transcript and not _is_memory_query(
                     current_user_transcript
                 ):
-                    _asyncio.create_task(
+                    _schedule_background_task(
                         _defer_auto_extract(
                             memory_manager,
                             "default",
                             current_user_transcript,
                             result.assistant_transcript or "",
-                        )
+                        ),
+                        "defer_auto_extract",
                     )
 
                 if not session_memory_recorded:
@@ -518,6 +612,49 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         current_user_transcript,
                         result.assistant_transcript or "",
                     )
+
+                _turn_id = f"{session_id}:{uuid4().hex}"
+                _response_text = result.assistant_transcript or ""
+                _current_intent = str(predicted_intent)
+                _current_target = str(routing_decision.target)
+
+                _schedule_background_task(
+                    correction_store.log_turn(
+                        session_id=session_id,
+                        turn_id=_turn_id,
+                        transcript=current_user_transcript,
+                        response=_response_text,
+                        intent=_current_intent,
+                        route_target=_current_target,
+                    ),
+                    "correction_store.log_turn",
+                )
+
+                _is_corr, _corr_sig = _is_correction_signal(current_user_transcript)
+                if _is_corr:
+                    _schedule_background_task(
+                        correction_store.log_correction(
+                            session_id=session_id,
+                            turn_id=_turn_id,
+                            transcript=current_user_transcript,
+                            response=_response_text,
+                            signal=_corr_sig,
+                            intent=_current_intent,
+                        ),
+                        "correction_store.log_correction",
+                    )
+                    _turns_since_corr = 0
+                else:
+                    _turns_since_corr += 1
+
+                online_reflection.record_turn(
+                    session_id=session_id,
+                    turn_id=_turn_id,
+                    intent=_current_intent,
+                    was_corrected=_is_corr,
+                    turns_since_last_correction=_turns_since_corr,
+                )
+                online_reflection.update_verbosity(session_id, current_user_transcript)
 
                 turn_image_b64 = pending_image_b64
 
@@ -618,4 +755,12 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     finally:
         session_memory.clear()
         client.close()
+        _schedule_background_task(
+            offline_replay.run_replay(session_id),
+            "offline_replay.run_replay",
+        )
+        _schedule_background_task(
+            offline_replay.promote_priority_memories(session_id),
+            "offline_replay.promote_priority_memories",
+        )
         logger.info("WebSocket session ended, client closed")

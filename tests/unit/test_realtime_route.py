@@ -487,8 +487,13 @@ def test_websocket_disconnect_closes_client():
         ),
     ):
         with TestClient(app) as client:
-            with client.websocket_connect("/ws/realtime"):
-                pass  # connect then immediately disconnect
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_text(json.dumps({"type": "ping"}))
+                assert json.loads(ws.receive_text())["type"] == "pong"
+
+    deadline = time.time() + 1.0
+    while mock_client.close.call_count == 0 and time.time() < deadline:
+        time.sleep(0.01)
 
     mock_client.close.assert_called_once()
 

@@ -88,3 +88,10 @@ def get_config() -> dict[str, object]:
         "app_port": APP_PORT,
         "debug": DEBUG,
     }
+
+
+# Learning layer knobs (Plan 10)
+LEARNING_DECAY_FACTOR: float = 0.3
+LEARNING_FAILURE_THRESHOLD: float = 1.5
+LEARNING_PATCH_MONITOR_TURNS: int = 10
+LEARNING_PRIORITY_PROMOTION_MIN_RECALLS: int = 3

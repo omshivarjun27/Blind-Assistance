@@ -120,3 +120,25 @@ class MemoryManager:
         if not facts:
             return None
         return "\n".join(facts)
+
+    async def get_startup_memory_context(
+        self,
+        user_id: str,
+        top_k: int = 5,
+    ) -> str | None:
+        """
+        Returns a formatted string of priority memories for session-start
+        injection. Returns None if nothing is found or on any failure.
+        Never raises.
+        """
+        try:
+            priority_facts = await self.store.get_priority_facts(
+                user_id=user_id, top_k=top_k
+            )
+            if not priority_facts:
+                return None
+            lines = [f"- {fact}" for fact in priority_facts]
+            return "Remembered context:\n" + "\n".join(lines)
+        except Exception as exc:
+            logger.warning("get_startup_memory_context failed: %s", exc)
+            return None
