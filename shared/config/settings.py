@@ -53,6 +53,7 @@ QWEN_VISION_MODEL: str = _get(
     "qwen3.6-plus" if _is_exam else "qwen3.6-plus",
 )
 QWEN_TRANSCRIPTION_MODEL: str = _get("QWEN_TRANSCRIPTION_MODEL", "gummy-realtime-v1")
+QWEN_TURBO_MODEL: str = _get("QWEN_TURBO_MODEL", "qwen-turbo")
 
 # Embedding
 EMBEDDING_MODEL: str = _get("EMBEDDING_MODEL", "text-embedding-v4")

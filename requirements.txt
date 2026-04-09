@@ -10,3 +10,4 @@ orjson
 websocket-client
 websockets
 numpy
+mem0ai

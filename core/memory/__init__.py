@@ -3,8 +3,19 @@
 from importlib import import_module
 
 from .embedding_client import EmbeddingClient, EmbeddingError
+from .mem0_extractor import Mem0Extractor
+from .memory_context_composer import compose_memory_context
+from .session_memory import SessionMemory
 
-__all__ = ["EmbeddingClient", "EmbeddingError", "MemoryStore", "MemoryManager"]
+__all__ = [
+    "EmbeddingClient",
+    "EmbeddingError",
+    "MemoryStore",
+    "MemoryManager",
+    "SessionMemory",
+    "Mem0Extractor",
+    "compose_memory_context",
+]
 
 
 def __getattr__(name: str):

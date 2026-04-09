@@ -30,7 +30,7 @@ from apps.backend.services.dashscope.realtime_client import (
     QwenRealtimeClient,
     QwenRealtimeConfig,
 )
-from core.memory import MemoryManager
+from core.memory import MemoryManager, SessionMemory, compose_memory_context
 from core.orchestrator.capture_coach import assess_frame_quality
 from core.orchestrator.intent_classifier import (
     IntentCategory,
@@ -69,6 +69,24 @@ _PAST_TENSE_TRIGGERS: tuple[str, ...] = (
     "ನಾನು ಯಾರು",
     "मेरा नाम",
     "मैं कौन हूं",
+    "before",
+    "previously",
+    "nanna hesaru",
+    "neevu",
+    "hinde",
+    "mundhe",
+    "mera naam",
+    "meri",
+    "tumhe yaad hai",
+    "pehle",
+    "aage",
+    "was ",
+    "were ",
+    "had ",
+    "did ",
+    "showed",
+    "told ",
+    "said ",
 )
 
 
@@ -78,6 +96,63 @@ def _is_memory_query(transcript: str) -> bool:
         return False
     t = transcript.lower().strip()
     return any(trigger.lower() in t for trigger in _PAST_TENSE_TRIGGERS)
+
+
+def _normalize_memory_fact(fact: str) -> str:
+    cleaned = fact.strip()
+    if cleaned.lower().startswith("object/text seen: "):
+        cleaned = cleaned.split(":", 1)[1].strip()
+    return cleaned.rstrip(".")
+
+
+def _build_memory_reply(
+    query: str,
+    st_facts: list[str],
+    lt_facts: list[str],
+    objects_seen: list[dict[str, str]],
+) -> str | None:
+    q = query.lower().strip()
+    object_facts = [
+        _normalize_memory_fact(obj.get("object_desc", ""))
+        for obj in objects_seen
+        if obj.get("object_desc")
+    ]
+    normalized_long = [
+        _normalize_memory_fact(fact) for fact in lt_facts if fact.strip()
+    ]
+    normalized_short = [
+        _normalize_memory_fact(fact) for fact in st_facts if fact.strip()
+    ]
+    combined = list(dict.fromkeys([*object_facts, *normalized_short, *normalized_long]))
+    if not combined:
+        return None
+
+    if "name" in q:
+        candidates = [*normalized_long, *normalized_short]
+        for fact in candidates:
+            lower = fact.lower()
+            if lower.startswith("my name is "):
+                return f"Your name is {fact[11:].strip()}."
+            if lower.startswith("user name is "):
+                return f"Your name is {fact[13:].strip()}."
+        plain_candidates = [
+            fact
+            for fact in candidates
+            if "name" not in fact.lower() and len(fact.split()) <= 4
+        ]
+        if plain_candidates:
+            best_name = min(
+                plain_candidates, key=lambda value: (len(value.split()), len(value))
+            )
+            return f"Your name is {best_name}."
+
+    if ("show" in q or "earlier" in q) and object_facts:
+        return f"You showed me {object_facts[0]}."
+
+    if len(combined) == 1:
+        return f"I remember: {combined[0]}."
+
+    return "Here’s what I remember: " + "; ".join(combined[:3]) + "."
 
 
 logger = logging.getLogger("ally-vision-realtime-route")
@@ -153,7 +228,16 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     classifier = IntentClassifier.from_settings()
     mm_client = MultimodalClient.from_settings()
     memory_manager = MemoryManager.from_settings()
-    await memory_manager.store.initialize()
+    if hasattr(type(memory_manager.store), "initialize_all"):
+        await memory_manager.store.initialize_all()
+    else:
+        await memory_manager.store.initialize()
+    session_memory_obj = getattr(memory_manager, "session_memory", None)
+    if isinstance(session_memory_obj, SessionMemory):
+        session_memory = session_memory_obj
+    else:
+        session_memory = SessionMemory()
+        memory_manager.session_memory = session_memory
     pending_classification_task: _asyncio.Task[object] | None = None
     pending_classification_image_b64: str | None = None
     queued_classification_input: tuple[str, str | None] | None = None
@@ -186,6 +270,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 route_audio_pcm = audio_pcm
                 route_image_b64 = pending_image_b64
                 classifier_handled_previous_memory = False
+                session_memory_recorded = False
 
                 if (
                     pending_classification_task
@@ -309,6 +394,14 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                                     "Say exactly this to the user: "
                                     f"{vision_result.text}"
                                 )
+                                session_memory.add_turn(
+                                    user_transcript=last_user_transcript,
+                                    assistant_response=vision_result.text,
+                                    vision_objects=[
+                                        f"Object/text seen: {vision_result.text[:120]}"
+                                    ],
+                                )
+                                session_memory_recorded = True
                                 logger.info(
                                     "HEAVY_VISION result: %d chars",
                                     len(vision_result.text),
@@ -359,16 +452,11 @@ async def realtime_endpoint(ws: WebSocket) -> None:
 
                 # ── same-turn memory detection ──────────────────────────────
                 _is_memory_save = False
-                _is_memory_recall = False
+                _is_memory_recall = _is_memory_query(current_user_transcript)
 
                 _cleaned = build_memory_fact(current_user_transcript)
                 if _cleaned != current_user_transcript.strip():
                     _is_memory_save = True
-                elif any(
-                    current_user_transcript.lower().startswith(phrase)
-                    for phrase in _RECALL_PHRASES
-                ):
-                    _is_memory_recall = True
 
                 if _is_memory_save:
                     try:
@@ -402,19 +490,39 @@ async def realtime_endpoint(ws: WebSocket) -> None:
 
                 elif _is_memory_recall:
                     try:
-                        memory_context = await memory_manager.recall(
-                            user_id="default",
-                            query=current_user_transcript,
-                            top_k=3,
+                        query_embedding = await memory_manager.embedder.embed(
+                            current_user_transcript
                         )
-                        if memory_context:
-                            recall_instructions = build_system_prompt(
-                                base_instructions=(
-                                    f"The user asked: {current_user_transcript}\n"
-                                    "Answer using only the relevant stored memory."
-                                    " Be brief and speak naturally."
-                                ),
-                                memory_context=memory_context,
+                        st_facts_list = await memory_manager.store.recall_facts(
+                            "default",
+                            query_embedding,
+                            top_k=3,
+                            tier="short",
+                        )
+                        lt_facts_list = await memory_manager.store.recall_facts(
+                            "default",
+                            query_embedding,
+                            top_k=3,
+                            tier="long",
+                        )
+                        st_facts = "\n".join(st_facts_list) if st_facts_list else None
+                        lt_facts = "\n".join(lt_facts_list) if lt_facts_list else None
+                        combined = compose_memory_context(
+                            session_memory.get_recent(5),
+                            st_facts,
+                            lt_facts,
+                            session_memory.get_objects_seen(),
+                        )
+                        memory_reply = _build_memory_reply(
+                            current_user_transcript,
+                            st_facts_list,
+                            lt_facts_list,
+                            session_memory.get_objects_seen(),
+                        )
+                        if combined:
+                            recall_instructions = (
+                                "Reply with exactly this sentence and nothing else: "
+                                f'"{memory_reply or combined}"'
                             )
                         else:
                             recall_instructions = "Tell the user: I don't have anything stored about that yet."
@@ -432,6 +540,26 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 else:
                     _skip_classifier = classifier_handled_previous_memory
                 # ── end same-turn memory detection ──────────────────────────
+
+                current_user_transcript = (
+                    result.user_transcript or current_user_transcript
+                )
+                if current_user_transcript and not _is_memory_query(
+                    current_user_transcript
+                ):
+                    extract_coro = memory_manager.auto_extract_and_store(
+                        user_id="default",
+                        user_transcript=current_user_transcript,
+                        assistant_transcript=result.assistant_transcript or "",
+                    )
+                    if _asyncio.iscoroutine(extract_coro):
+                        _asyncio.create_task(extract_coro)
+
+                if not session_memory_recorded:
+                    session_memory.add_turn(
+                        current_user_transcript,
+                        result.assistant_transcript or "",
+                    )
 
                 turn_image_b64 = pending_image_b64
 
@@ -547,5 +675,6 @@ async def realtime_endpoint(ws: WebSocket) -> None:
         logger.error("WebSocket error: %s", exc)
 
     finally:
+        session_memory.clear()
         client.close()
         logger.info("WebSocket session ended, client closed")

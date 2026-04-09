@@ -7,6 +7,9 @@ from importlib import import_module
 from typing import Any
 
 from .embedding_client import EmbeddingClient, EmbeddingError
+from .mem0_extractor import Mem0Extractor
+from .memory_context_composer import compose_memory_context
+from .session_memory import SessionMemory
 from core.orchestrator.prompt_builder import build_memory_fact
 
 logger = logging.getLogger(__name__)
@@ -17,9 +20,12 @@ class MemoryManager:
         self,
         embedder: EmbeddingClient,
         store: Any,
+        extractor: Mem0Extractor | None = None,
     ) -> None:
         self.embedder: EmbeddingClient = embedder
         self.store: Any = store
+        self.extractor: Mem0Extractor | None = extractor
+        self.session_memory = SessionMemory()
 
     @classmethod
     def from_settings(cls) -> "MemoryManager":
@@ -27,7 +33,62 @@ class MemoryManager:
         return cls(
             embedder=EmbeddingClient.from_settings(),
             store=memory_store_cls.from_settings(),
+            extractor=Mem0Extractor.from_settings(),
         )
+
+    async def auto_extract_and_store(
+        self,
+        user_id: str,
+        user_transcript: str,
+        assistant_transcript: str,
+    ) -> None:
+        if self.extractor is None:
+            return
+        try:
+            facts = await self.extractor.extract(user_transcript, assistant_transcript)
+            for fact_data in facts:
+                fact_text = fact_data.get("fact", "").strip()
+                category = fact_data.get("category", "GENERAL").upper()
+                tier = fact_data.get("tier", "long")
+                if not fact_text:
+                    continue
+                try:
+                    embedding = await self.embedder.embed(fact_text)
+                    await self.store.save_fact(
+                        user_id,
+                        fact_text,
+                        embedding,
+                        tier=tier,
+                        category=category,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "auto_extract: save_fact failed for %r: %s", fact_text, exc
+                    )
+        except Exception as exc:
+            logger.warning("auto_extract_and_store failed: %s", exc)
+
+    async def recall_all_tiers(
+        self,
+        user_id: str,
+        query: str,
+        top_k: int = 3,
+    ) -> str | None:
+        try:
+            embedding = await self.embedder.embed(query)
+            st_facts = await self.store.recall_facts(
+                user_id, embedding, top_k, tier="short"
+            )
+            lt_facts = await self.store.recall_facts(
+                user_id, embedding, top_k, tier="long"
+            )
+            st_str = "\n".join(st_facts) if st_facts else None
+            lt_str = "\n".join(lt_facts) if lt_facts else None
+            result = compose_memory_context([], st_str, lt_str, [])
+            return result if result else None
+        except Exception as exc:
+            logger.warning("recall_all_tiers failed: %s", exc)
+            return None
 
     async def save(self, user_id: str, raw_utterance: str) -> str:
         """Strip memory-save prefix, embed, and store.

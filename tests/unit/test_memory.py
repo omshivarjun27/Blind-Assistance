@@ -3,7 +3,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from core.memory import EmbeddingClient, EmbeddingError, MemoryManager, MemoryStore
+from core.memory import (
+    EmbeddingClient,
+    EmbeddingError,
+    Mem0Extractor,
+    MemoryManager,
+    MemoryStore,
+    SessionMemory,
+    compose_memory_context,
+)
 
 
 @pytest.mark.asyncio
@@ -148,3 +156,233 @@ async def test_memory_manager_recall_returns_none_when_empty():
     manager = MemoryManager(embedder=mock_embedder, store=mock_store)
     result = await manager.recall("u1", "who is my doctor")
     assert result is None
+
+
+def test_session_memory_add_and_recall():
+    session = SessionMemory()
+    session.add_turn("u1", "a1")
+    session.add_turn("u2", "a2")
+    session.add_turn("u3", "a3")
+
+    recent = session.get_recent(2)
+    assert [turn["user"] for turn in recent] == ["u2", "u3"]
+    assert [turn["assistant"] for turn in recent] == ["a2", "a3"]
+
+
+def test_session_memory_objects_seen():
+    session = SessionMemory()
+    session.add_turn(
+        "show this", "It looks like medicine.", vision_objects=["medicine bottle"]
+    )
+
+    objects_seen = session.get_objects_seen()
+    assert len(objects_seen) == 1
+    assert objects_seen[0]["object_desc"] == "medicine bottle"
+
+
+def test_session_memory_ring_buffer_max():
+    session = SessionMemory(max_turns=5)
+    for idx in range(8):
+        session.add_turn(f"u{idx}", f"a{idx}")
+
+    recent = session.get_recent(10)
+    assert len(recent) == 5
+    assert recent[0]["user"] == "u3"
+    assert recent[-1]["user"] == "u7"
+
+
+@pytest.mark.asyncio
+async def test_mem0_extractor_returns_facts():
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": '[{"fact": "user name is Om", "category": "IDENTITY", "tier": "long"}]'
+                    }
+                }
+            ]
+        }
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        extractor = Mem0Extractor(
+            api_key="test",
+            base_url="https://example.com/compatible-mode/v1",
+            model="qwen-turbo",
+        )
+        result = await extractor.extract("My name is Om", "Nice to meet you Om")
+
+    assert result == [
+        {"fact": "user name is Om", "category": "IDENTITY", "tier": "long"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mem0_extractor_returns_empty_on_no_facts():
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {"choices": [{"message": {"content": "[]"}}]}
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        extractor = Mem0Extractor(
+            api_key="test",
+            base_url="https://example.com/compatible-mode/v1",
+            model="qwen-turbo",
+        )
+        result = await extractor.extract("Hello", "Hi")
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_mem0_extractor_returns_empty_on_failure():
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=Exception("boom"))
+        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        extractor = Mem0Extractor(
+            api_key="test",
+            base_url="https://example.com/compatible-mode/v1",
+            model="qwen-turbo",
+        )
+        result = await extractor.extract("Hello", "Hi")
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_memory_store_short_term_save():
+    count_cursor = AsyncMock()
+    count_cursor.fetchone = AsyncMock(return_value=(0,))
+    insert_cursor = AsyncMock()
+    insert_cursor.lastrowid = 7
+    mock_db = AsyncMock()
+    mock_db.execute = AsyncMock(side_effect=[count_cursor, insert_cursor])
+    mock_db.commit = AsyncMock()
+
+    with patch("aiosqlite.connect") as mock_connect:
+        mock_connect.return_value.__aenter__ = AsyncMock(return_value=mock_db)
+        mock_connect.return_value.__aexit__ = AsyncMock(return_value=False)
+        store = MemoryStore(db_path=":memory:")
+        row_id = await store.save_fact(
+            user_id="u1",
+            fact="reading now",
+            embedding=[0.1] * 1024,
+            tier="short",
+            category="OBSERVATION",
+        )
+
+    assert row_id == 7
+    insert_sql, insert_params = mock_db.execute.await_args_list[1].args
+    assert "INSERT INTO short_term_memories" in insert_sql
+    assert insert_params[0] == "u1"
+    assert insert_params[1] == "reading now"
+    assert insert_params[3] == "OBSERVATION"
+    assert insert_params[5]
+
+
+@pytest.mark.asyncio
+async def test_memory_store_long_term_dedup():
+    existing_embedding = [1.0] + [0.0] * 1023
+    select_cursor = AsyncMock()
+    select_cursor.fetchall = AsyncMock(
+        return_value=[(1, "Om", json.dumps(existing_embedding), "IDENTITY")]
+    )
+    update_cursor = AsyncMock()
+    mock_db = AsyncMock()
+    mock_db.execute = AsyncMock(side_effect=[select_cursor, update_cursor])
+    mock_db.commit = AsyncMock()
+    mock_db.__aenter__ = AsyncMock(return_value=mock_db)
+    mock_db.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("aiosqlite.connect", return_value=mock_db):
+        store = MemoryStore(db_path=":memory:")
+        row_id = await store.save_fact(
+            user_id="u1",
+            fact="my name is Omkar",
+            embedding=existing_embedding,
+            tier="long",
+            category="IDENTITY",
+        )
+
+    assert row_id == 1
+    executed_sql = [call.args[0] for call in mock_db.execute.await_args_list]
+    assert any("UPDATE long_term_memories" in sql for sql in executed_sql)
+    assert not any("INSERT INTO long_term_memories" in sql for sql in executed_sql)
+
+
+@pytest.mark.asyncio
+async def test_memory_store_purge_expired():
+    delete_cursor = AsyncMock()
+    delete_cursor.rowcount = 2
+    mock_db = AsyncMock()
+    mock_db.execute = AsyncMock(return_value=delete_cursor)
+    mock_db.commit = AsyncMock()
+    mock_db.__aenter__ = AsyncMock(return_value=mock_db)
+    mock_db.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("aiosqlite.connect", return_value=mock_db):
+        store = MemoryStore(db_path=":memory:")
+        deleted = await store.purge_expired()
+
+    assert deleted == 2
+    sql = mock_db.execute.await_args.args[0]
+    assert "DELETE FROM short_term_memories WHERE expires_at < ?" == sql
+
+
+@pytest.mark.asyncio
+async def test_memory_manager_auto_extract_stores_facts():
+    mock_embedder = AsyncMock()
+    mock_embedder.embed = AsyncMock(return_value=[0.2] * 1024)
+    mock_store = AsyncMock()
+    mock_store.save_fact = AsyncMock(return_value=1)
+    mock_extractor = MagicMock()
+    mock_extractor.extract = AsyncMock(
+        return_value=[{"fact": "Om", "category": "IDENTITY", "tier": "long"}]
+    )
+
+    manager = MemoryManager(
+        embedder=mock_embedder,
+        store=mock_store,
+        extractor=mock_extractor,
+    )
+    await manager.auto_extract_and_store("default", "My name is Om", "Hello Om")
+
+    mock_store.save_fact.assert_called_once_with(
+        "default",
+        "Om",
+        [0.2] * 1024,
+        tier="long",
+        category="IDENTITY",
+    )
+
+
+@pytest.mark.asyncio
+async def test_recall_all_tiers_returns_combined_context():
+    mock_embedder = AsyncMock()
+    mock_embedder.embed = AsyncMock(return_value=[0.1] * 1024)
+    mock_store = AsyncMock()
+    mock_store.recall_facts = AsyncMock(side_effect=[["fact A"], ["fact B"]])
+
+    manager = MemoryManager(embedder=mock_embedder, store=mock_store)
+    result = await manager.recall_all_tiers("default", "test query")
+
+    assert result is not None
+    assert "fact A" in result
+    assert "fact B" in result
+
+
+def test_compose_memory_context_empty_inputs():
+    result = compose_memory_context([], None, None, [])
+    assert result == ""
