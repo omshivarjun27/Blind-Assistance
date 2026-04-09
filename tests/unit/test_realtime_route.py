@@ -802,3 +802,61 @@ def test_interrupt_control_message_calls_cancel_response():
                 ws.receive_bytes()
 
     mock_client.cancel_response.assert_called_once()
+
+
+# ── _is_memory_query tests (Plan 05 patch) ──────────────────────────────────
+
+
+class TestIsMemoryQuery:
+    """Tests for the past-tense memory trigger detector."""
+
+    def test_what_is_my_name(self):
+        from apps.backend.api.routes.realtime import _is_memory_query
+
+        assert _is_memory_query("what is my name") is True
+
+    def test_what_was_triggers(self):
+        from apps.backend.api.routes.realtime import _is_memory_query
+
+        assert _is_memory_query("what was that thing I showed you") is True
+
+    def test_do_you_remember(self):
+        from apps.backend.api.routes.realtime import _is_memory_query
+
+        assert _is_memory_query("do you remember what I told you") is True
+
+    def test_earlier_triggers(self):
+        from apps.backend.api.routes.realtime import _is_memory_query
+
+        assert _is_memory_query("what did I say earlier") is True
+
+    def test_casual_chat_not_triggered(self):
+        from apps.backend.api.routes.realtime import _is_memory_query
+
+        assert _is_memory_query("how are you today") is False
+
+    def test_empty_string(self):
+        from apps.backend.api.routes.realtime import _is_memory_query
+
+        assert _is_memory_query("") is False
+
+    def test_none_equivalent_empty(self):
+        from apps.backend.api.routes.realtime import _is_memory_query
+
+        assert _is_memory_query("   ") is False
+
+    def test_kannada_name_trigger(self):
+        from apps.backend.api.routes.realtime import _is_memory_query
+
+        assert _is_memory_query("ನನ್ನ ಹೆಸರು ಏನು") is True
+
+    def test_hindi_name_trigger(self):
+        from apps.backend.api.routes.realtime import _is_memory_query
+
+        assert _is_memory_query("मेरा नाम क्या है") is True
+
+    def test_case_insensitive(self):
+        from apps.backend.api.routes.realtime import _is_memory_query
+
+        assert _is_memory_query("WHAT IS MY NAME") is True
+        assert _is_memory_query("What Did I Show You") is True

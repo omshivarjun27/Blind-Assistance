@@ -42,6 +42,44 @@ from core.orchestrator.prompt_builder import (
 )
 from core.orchestrator.policy_router import RouteTarget, route
 
+# Past-tense phrases that signal the user is asking about memory/history.
+# Used by Plan 07 memory recall to auto-trigger MEMORY_READ without
+# the user needing to say an explicit "recall" or "remember" command.
+_PAST_TENSE_TRIGGERS: tuple[str, ...] = (
+    "what is my",
+    "what's my",
+    "what was",
+    "what did i",
+    "what did you",
+    "what have i",
+    "what have you",
+    "do you remember",
+    "do you recall",
+    "earlier",
+    "last time",
+    "before this",
+    "who am i",
+    "where do i live",
+    "where do i work",
+    "what do i do",
+    "what did i show",
+    "what did i tell",
+    "what did i say",
+    "ನನ್ನ ಹೆಸರು",
+    "ನಾನು ಯಾರು",
+    "मेरा नाम",
+    "मैं कौन हूं",
+)
+
+
+def _is_memory_query(transcript: str) -> bool:
+    """Return True if transcript appears to be asking about past memory or history."""
+    if not transcript:
+        return False
+    t = transcript.lower().strip()
+    return any(trigger.lower() in t for trigger in _PAST_TENSE_TRIGGERS)
+
+
 logger = logging.getLogger("ally-vision-realtime-route")
 router = APIRouter()
 
@@ -409,6 +447,11 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         queued_classification_input = (
                             last_user_transcript,
                             turn_image_b64,
+                        )
+                    if _is_memory_query(last_user_transcript or ""):
+                        logger.debug(
+                            "Memory query detected in transcript: %r — Plan 07 will handle recall",
+                            (last_user_transcript or "")[:60],
                         )
 
                 # Reset per-turn context
