@@ -2,12 +2,7 @@
 Ally Vision v2 — DashScope multimodal client.
 
 Sends camera frame + text prompt to qwen3.6-plus
-via DashScope compatible mode.
-
-UNCONFIRMED: qwen3.6-plus compatibility with
-compatible-mode image input is runtime-verified, not doc-proven.
-If the model rejects image input, the error will surface in
-VisionResponse.error and must be investigated.
+via the native DashScope multimodal HTTP endpoint.
 
 Image size limit: base64 string must be <= 10MB.
 """
@@ -46,7 +41,7 @@ class VisionResponse:
 class MultimodalClient:
     """
     Sends image + text to DashScope vision model.
-    Uses compatible-mode chat completions endpoint.
+    Uses the native DashScope multimodal generation endpoint.
     Falls back with VisionResponse.error on any failure.
     """
 
@@ -63,7 +58,7 @@ class MultimodalClient:
     @classmethod
     def from_settings(cls) -> "MultimodalClient":
         from shared.config.settings import (
-            DASHSCOPE_COMPAT_BASE,
+            DASHSCOPE_HTTP_BASE,
             QWEN_VISION_MODEL,
             get_api_key,
         )
@@ -71,7 +66,7 @@ class MultimodalClient:
         return cls(
             api_key=get_api_key(),
             model=QWEN_VISION_MODEL,
-            base_url=DASHSCOPE_COMPAT_BASE,
+            base_url=DASHSCOPE_HTTP_BASE,
         )
 
     async def analyze(self, request: VisionRequest) -> VisionResponse:
@@ -94,35 +89,29 @@ class MultimodalClient:
             )
 
         model = request.model or self._model
+        url = f"{self._base_url}/services/aigc/multimodal-generation/generation"
 
         payload = {
             "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": (
-                                    f"data:image/jpeg;base64,{request.image_jpeg_b64}"
-                                )
+            "input": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "image": f"data:image/jpeg;base64,{request.image_jpeg_b64}"
                             },
-                        },
-                        {
-                            "type": "text",
-                            "text": request.prompt,
-                        },
-                    ],
-                }
-            ],
-            "max_tokens": request.max_tokens,
+                            {"text": request.prompt},
+                        ],
+                    }
+                ]
+            },
         }
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(
-                    f"{self._base_url}/chat/completions",
+                    url,
                     headers={
                         "Authorization": f"Bearer {self._api_key}",
                         "Content-Type": "application/json",
@@ -131,7 +120,9 @@ class MultimodalClient:
                 )
                 resp.raise_for_status()
                 data = resp.json()
-                text = data["choices"][0]["message"]["content"].strip()
+                text = data["output"]["choices"][0]["message"]["content"][0][
+                    "text"
+                ].strip()
                 logger.info(
                     "Vision analysis complete: %d chars, model=%s",
                     len(text),

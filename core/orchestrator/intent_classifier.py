@@ -1,7 +1,7 @@
 """
 Ally Vision v2 — Intent classifier using qwen-turbo.
 
-Classifies user transcript into one of 8 intent categories.
+Classifies user transcript into one of 9 intent categories.
 Uses DashScope compatible mode (text-only, fast, cheap).
 Falls back to GENERAL_CHAT on any error — never blocks a turn.
 

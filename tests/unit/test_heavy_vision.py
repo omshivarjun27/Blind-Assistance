@@ -11,7 +11,21 @@ def _make_httpx_response(text: str, status: int = 200):
     resp = MagicMock()
     resp.status_code = status
     resp.raise_for_status = MagicMock()
-    resp.json.return_value = {"choices": [{"message": {"content": text}}]}
+    resp.json.return_value = {
+        "output": {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {
+                                "text": text,
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    }
     return resp
 
 
@@ -25,7 +39,7 @@ async def test_multimodal_client_analyze_success():
     client = MultimodalClient(
         api_key="test",
         model="qwen3.6-plus",
-        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        base_url="https://dashscope-intl.aliyuncs.com/api/v1",
     )
     with patch("httpx.AsyncClient") as mock_cls:
         mock_http = AsyncMock()
@@ -49,7 +63,7 @@ async def test_multimodal_client_analyze_on_error():
     client = MultimodalClient(
         api_key="test",
         model="qwen3.6-plus",
-        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        base_url="https://dashscope-intl.aliyuncs.com/api/v1",
     )
     with patch("httpx.AsyncClient") as mock_cls:
         mock_http = AsyncMock()
@@ -72,7 +86,7 @@ async def test_multimodal_client_empty_image_returns_error():
     client = MultimodalClient(
         api_key="test",
         model="qwen3.6-plus",
-        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        base_url="https://dashscope-intl.aliyuncs.com/api/v1",
     )
     req = VisionRequest(image_jpeg_b64="", prompt="describe")
     result = await client.analyze(req)
@@ -90,11 +104,13 @@ async def test_multimodal_client_image_in_request_body():
     client = MultimodalClient(
         api_key="test",
         model="qwen3.6-plus",
-        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        base_url="https://dashscope-intl.aliyuncs.com/api/v1",
     )
     captured_body = {}
+    captured_url = {"value": ""}
 
     async def capture_post(url, headers=None, json=None):
+        captured_url["value"] = url
         captured_body.update(json or {})
         return _make_httpx_response("ok")
 
@@ -105,12 +121,17 @@ async def test_multimodal_client_image_in_request_body():
         mock_http.post = AsyncMock(side_effect=capture_post)
         req = VisionRequest(image_jpeg_b64="TESTB64", prompt="what is this")
         await client.analyze(req)
-    content = captured_body["messages"][0]["content"]
-    image_part = next((p for p in content if p.get("type") == "image_url"), None)
+    assert captured_url["value"].endswith(
+        "/services/aigc/multimodal-generation/generation"
+    )
+    content = captured_body["input"]["messages"][0]["content"]
+    image_part = next((p for p in content if "image" in p), None)
+    text_part = next((p for p in content if "text" in p), None)
     assert image_part is not None
-    url = image_part["image_url"]["url"]
-    assert url.startswith("data:image/jpeg;base64,")
-    assert "TESTB64" in url
+    assert text_part is not None
+    assert image_part["image"].startswith("data:image/jpeg;base64,")
+    assert "TESTB64" in image_part["image"]
+    assert text_part["text"] == "what is this"
 
 
 @pytest.mark.asyncio
