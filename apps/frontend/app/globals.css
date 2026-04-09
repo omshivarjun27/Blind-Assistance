@@ -1,3 +1,4 @@
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Kannada:wght@400;600&family=Noto+Sans+Devanagari:wght@400;600&family=Noto+Sans+Tamil:wght@400;600&family=Noto+Sans+Telugu:wght@400;600&display=swap');
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
@@ -54,6 +55,8 @@ html, body { background: #000; color: #fff; }
 :root {
   --background: oklch(0.145 0 0);
   --foreground: oklch(0.985 0 0);
+  --font-body: 'Inter', 'Noto Sans Kannada', 'Noto Sans Devanagari',
+    'Noto Sans Tamil', 'Noto Sans Telugu', sans-serif;
   --card: oklch(0.205 0 0);
   --card-foreground: oklch(0.985 0 0);
   --popover: oklch(0.205 0 0);
@@ -95,4 +98,12 @@ html, body { background: #000; color: #fff; }
   html {
     @apply font-sans;
   }
+}
+
+/* Ensure Indic scripts (Kannada, Devanagari) render with correct line height */
+.transcript-text, [data-transcript] {
+  line-height: 1.8;
+  font-family: var(--font-body, 'Inter', 'Noto Sans Kannada', sans-serif);
+  unicode-bidi: plaintext;
+  word-break: break-word;
 }
