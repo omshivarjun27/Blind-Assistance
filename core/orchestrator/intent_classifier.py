@@ -3,10 +3,10 @@ Ally Vision v2 — Intent classifier using qwen-turbo.
 
 Classifies user transcript into one of 8 intent categories.
 Uses DashScope compatible mode (text-only, fast, cheap).
-Falls back to GENERAL_CHAT on any error — never blocks a turn.
+Falls back to GENERAL_CHAT on any error — never blocks a turn forever.
 
-IMPORTANT: Classification uses the PREVIOUS turn's transcript.
-Current turn transcript arrives WITH the Qwen response, not before.
+Realtime routing currently classifies the current transcript after
+transcription is available, then routes the same turn.
 """
 
 from __future__ import annotations
@@ -86,6 +86,12 @@ class IntentClassifier:
         self._api_key = api_key
         self._model = model
         self._base_url = base_url.rstrip("/")
+        self._http: httpx.AsyncClient | None = None
+
+    def _get_http(self) -> httpx.AsyncClient:
+        if self._http is None:
+            self._http = httpx.AsyncClient(timeout=3.0)
+        return self._http
 
     @classmethod
     def from_settings(cls) -> "IntentClassifier":
@@ -112,41 +118,45 @@ class IntentClassifier:
         prompt = _CLASSIFICATION_PROMPT.format(transcript=transcript.strip())
 
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                resp = await client.post(
-                    f"{self._base_url}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self._api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": self._model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": 20,
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                raw = data["choices"][0]["message"]["content"].strip().upper()
-                raw_clean = raw.strip(".,!? ")
+            resp = await self._get_http().post(
+                f"{self._base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self._model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 20,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            raw = data["choices"][0]["message"]["content"].strip().upper()
+            raw_clean = raw.strip(".,!? ")
 
-                if raw_clean in _LABELS:
-                    return ClassificationResult(
-                        intent=IntentCategory(raw_clean),
-                        confidence="high",
-                        raw_label=raw,
-                    )
-
-                logger.debug(
-                    "Unexpected classifier label: %r → GENERAL_CHAT",
-                    raw,
-                )
+            if raw_clean in _LABELS:
                 return ClassificationResult(
-                    intent=IntentCategory.GENERAL_CHAT,
-                    confidence="low",
+                    intent=IntentCategory(raw_clean),
+                    confidence="high",
                     raw_label=raw,
                 )
+
+            logger.debug(
+                "Unexpected classifier label: %r → GENERAL_CHAT",
+                raw,
+            )
+            return ClassificationResult(
+                intent=IntentCategory.GENERAL_CHAT,
+                confidence="low",
+                raw_label=raw,
+            )
 
         except Exception as exc:
             logger.warning("Intent classification failed: %s", exc)
             return _fallback(error=str(exc))
+
+    async def close(self) -> None:
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None

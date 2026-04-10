@@ -54,6 +54,18 @@ class MultimodalClient:
         self._api_key = api_key
         self._model = model
         self._base_url = base_url.rstrip("/")
+        self._http: httpx.AsyncClient | None = None
+
+    def _get_http(self) -> httpx.AsyncClient:
+        if self._http is None:
+            self._http = httpx.AsyncClient(
+                timeout=60.0,
+                limits=httpx.Limits(
+                    max_keepalive_connections=5,
+                    max_connections=10,
+                ),
+            )
+        return self._http
 
     @classmethod
     def from_settings(cls) -> "MultimodalClient":
@@ -109,26 +121,23 @@ class MultimodalClient:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {self._api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                text = data["output"]["choices"][0]["message"]["content"][0][
-                    "text"
-                ].strip()
-                logger.info(
-                    "Vision analysis complete: %d chars, model=%s",
-                    len(text),
-                    model,
-                )
-                return VisionResponse(text=text)
+            resp = await self._get_http().post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            text = data["output"]["choices"][0]["message"]["content"][0]["text"].strip()
+            logger.info(
+                "Vision analysis complete: %d chars, model=%s",
+                len(text),
+                model,
+            )
+            return VisionResponse(text=text)
 
         except httpx.HTTPStatusError as exc:
             body = ""
@@ -146,3 +155,8 @@ class MultimodalClient:
         except Exception as exc:
             logger.error("MultimodalClient error: %s", exc)
             return VisionResponse(text="", error=str(exc))
+
+    async def close(self) -> None:
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None

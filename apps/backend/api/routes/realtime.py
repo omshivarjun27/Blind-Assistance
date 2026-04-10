@@ -768,6 +768,14 @@ async def realtime_endpoint(ws: WebSocket) -> None:
 
     finally:
         session_memory.clear()
+        try:
+            await classifier.close()
+        except Exception as exc:
+            logger.warning("Intent classifier close failed: %s", exc)
+        try:
+            await mm_client.close()
+        except Exception as exc:
+            logger.warning("Multimodal client close failed: %s", exc)
         client.close()
         _schedule_background_task(
             offline_replay.run_replay(session_id),

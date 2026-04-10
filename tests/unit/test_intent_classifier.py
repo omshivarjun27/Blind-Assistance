@@ -24,10 +24,9 @@ async def test_classify_returns_scene_describe():
 
     clf = IntentClassifier(api_key="test-key")
     with patch("httpx.AsyncClient") as mock_client_cls:
-        mock_client = AsyncMock()
-        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_client = MagicMock()
         mock_client.post = AsyncMock(return_value=_mock_response("SCENE_DESCRIBE"))
+        mock_client_cls.return_value = mock_client
         result = await clf.classify("what is in front of me")
     assert result.intent == IntentCategory.SCENE_DESCRIBE
     assert result.confidence == "high"
@@ -43,10 +42,9 @@ async def test_classify_returns_read_text():
 
     clf = IntentClassifier(api_key="test-key")
     with patch("httpx.AsyncClient") as mock_client_cls:
-        mock_client = AsyncMock()
-        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_client = MagicMock()
         mock_client.post = AsyncMock(return_value=_mock_response("READ_TEXT"))
+        mock_client_cls.return_value = mock_client
         result = await clf.classify("read this label")
     assert result.intent == IntentCategory.READ_TEXT
     assert result.confidence == "high"
@@ -61,10 +59,9 @@ async def test_classify_returns_translate():
 
     clf = IntentClassifier(api_key="test-key")
     with patch("httpx.AsyncClient") as mock_client_cls:
-        mock_client = AsyncMock()
-        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_client = MagicMock()
         mock_client.post = AsyncMock(return_value=_mock_response("TRANSLATE"))
+        mock_client_cls.return_value = mock_client
         result = await clf.classify("translate this to Hindi")
     assert result.intent == IntentCategory.TRANSLATE
     assert result.confidence == "high"
@@ -107,10 +104,9 @@ async def test_classify_returns_general_chat_on_unknown_label():
 
     clf = IntentClassifier(api_key="test-key")
     with patch("httpx.AsyncClient") as mock_client_cls:
-        mock_client = AsyncMock()
-        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_client = MagicMock()
         mock_client.post = AsyncMock(return_value=_mock_response("TOTALLY_UNKNOWN"))
+        mock_client_cls.return_value = mock_client
         result = await clf.classify("random request")
     assert result.intent == IntentCategory.GENERAL_CHAT
     assert result.confidence == "low"
@@ -125,10 +121,9 @@ async def test_classify_returns_general_chat_on_api_error():
 
     clf = IntentClassifier(api_key="test-key")
     with patch("httpx.AsyncClient") as mock_client_cls:
-        mock_client = AsyncMock()
-        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_client = MagicMock()
         mock_client.post = AsyncMock(side_effect=Exception("connection failed"))
+        mock_client_cls.return_value = mock_client
         result = await clf.classify("what is in front")
     assert result.intent == IntentCategory.GENERAL_CHAT
     assert result.confidence == "low"

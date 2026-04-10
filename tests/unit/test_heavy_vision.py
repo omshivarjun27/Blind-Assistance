@@ -42,10 +42,9 @@ async def test_multimodal_client_analyze_success():
         base_url="https://dashscope-intl.aliyuncs.com/api/v1",
     )
     with patch("httpx.AsyncClient") as mock_cls:
-        mock_http = AsyncMock()
-        mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
-        mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_http = MagicMock()
         mock_http.post = AsyncMock(return_value=_make_httpx_response("A red table"))
+        mock_cls.return_value = mock_http
         req = VisionRequest(image_jpeg_b64="abc123", prompt="describe")
         result = await client.analyze(req)
     assert result.text == "A red table"
@@ -66,10 +65,9 @@ async def test_multimodal_client_analyze_on_error():
         base_url="https://dashscope-intl.aliyuncs.com/api/v1",
     )
     with patch("httpx.AsyncClient") as mock_cls:
-        mock_http = AsyncMock()
-        mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
-        mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_http = MagicMock()
         mock_http.post = AsyncMock(side_effect=Exception("network error"))
+        mock_cls.return_value = mock_http
         req = VisionRequest(image_jpeg_b64="abc123", prompt="describe")
         result = await client.analyze(req)
     assert result.success is False
@@ -115,10 +113,9 @@ async def test_multimodal_client_image_in_request_body():
         return _make_httpx_response("ok")
 
     with patch("httpx.AsyncClient") as mock_cls:
-        mock_http = AsyncMock()
-        mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
-        mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_http = MagicMock()
         mock_http.post = AsyncMock(side_effect=capture_post)
+        mock_cls.return_value = mock_http
         req = VisionRequest(image_jpeg_b64="TESTB64", prompt="what is this")
         await client.analyze(req)
     assert captured_url["value"].endswith(
