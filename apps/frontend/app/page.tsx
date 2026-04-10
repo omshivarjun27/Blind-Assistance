@@ -23,7 +23,7 @@ export default function Home() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [session.transcript.length]);
+  }, [session.transcript]);
 
   return (
     <main className="flex flex-col h-screen w-screen bg-black overflow-hidden">
@@ -67,7 +67,7 @@ export default function Home() {
           </div>
         </div>
 
-        <div className="hidden md:flex flex-col w-1/2 bg-zinc-900">
+        <div className="hidden md:flex flex-col h-full min-h-0 w-1/2 bg-zinc-900">
           <div className="flex items-center justify-between px-4 py-3 border-b border-white/10 shrink-0">
             <span className="text-sm font-semibold text-white">Chat</span>
             <span
@@ -91,7 +91,7 @@ export default function Home() {
             </span>
           </div>
 
-          <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3 min-h-0">
+          <div className="flex-1 min-h-0 overflow-y-auto scroll-smooth px-4 py-3 space-y-3">
             {session.transcript.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-full text-center">
                 <svg
@@ -117,9 +117,14 @@ export default function Home() {
                     <div key={i} className="flex justify-end">
                       <div
                         data-transcript
-                        className="max-w-[80%] rounded-2xl rounded-tr-sm px-3 py-2 bg-zinc-700 text-white text-sm"
+                        className="ml-auto max-w-[85%] rounded-2xl rounded-tr-sm bg-blue-600 px-4 py-2 text-sm text-white"
                       >
-                        {entry.text}
+                        <p
+                          className="break-words whitespace-pre-wrap"
+                          style={{ lineHeight: '1.8' }}
+                        >
+                          {entry.text}
+                        </p>
                       </div>
                     </div>
                   ) : (
@@ -129,14 +134,19 @@ export default function Home() {
                       </div>
                       <div
                         data-transcript
-                        className="max-w-[80%] rounded-2xl rounded-tl-sm px-3 py-2 bg-zinc-800 text-white text-sm"
+                        className="mr-auto max-w-[85%] rounded-2xl rounded-tl-sm bg-zinc-800 px-4 py-2 text-sm text-zinc-100"
                       >
-                        {entry.text}
+                        <p
+                          className="break-words whitespace-pre-wrap"
+                          style={{ lineHeight: '1.8' }}
+                        >
+                          {entry.text}
+                        </p>
                       </div>
                     </div>
                   )
                 ))}
-                <div ref={messagesEndRef} />
+                <div ref={messagesEndRef} aria-hidden="true" />
               </>
             )}
           </div>
@@ -156,7 +166,7 @@ export default function Home() {
       </div>
 
       {showChat && (
-        <div className="md:hidden fixed inset-0 z-40 flex flex-col bg-zinc-900">
+        <div className="md:hidden fixed inset-0 z-40 flex flex-col min-h-0 bg-zinc-900">
           <div className="flex items-center justify-between px-4 py-3 border-b border-white/10 shrink-0">
             <span className="text-sm font-semibold text-white">Chat</span>
             <button
@@ -168,7 +178,7 @@ export default function Home() {
             </button>
           </div>
 
-          <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3 min-h-0">
+          <div className="flex-1 min-h-0 overflow-y-auto scroll-smooth px-4 py-3 space-y-3">
             {session.transcript.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-full text-center">
                 <svg
@@ -194,9 +204,14 @@ export default function Home() {
                     <div key={i} className="flex justify-end">
                       <div
                         data-transcript
-                        className="max-w-[80%] rounded-2xl rounded-tr-sm px-3 py-2 bg-zinc-700 text-white text-sm"
+                        className="ml-auto max-w-[85%] rounded-2xl rounded-tr-sm bg-blue-600 px-4 py-2 text-sm text-white"
                       >
-                        {entry.text}
+                        <p
+                          className="break-words whitespace-pre-wrap"
+                          style={{ lineHeight: '1.8' }}
+                        >
+                          {entry.text}
+                        </p>
                       </div>
                     </div>
                   ) : (
@@ -206,14 +221,19 @@ export default function Home() {
                       </div>
                       <div
                         data-transcript
-                        className="max-w-[80%] rounded-2xl rounded-tl-sm px-3 py-2 bg-zinc-800 text-white text-sm"
+                        className="mr-auto max-w-[85%] rounded-2xl rounded-tl-sm bg-zinc-800 px-4 py-2 text-sm text-zinc-100"
                       >
-                        {entry.text}
+                        <p
+                          className="break-words whitespace-pre-wrap"
+                          style={{ lineHeight: '1.8' }}
+                        >
+                          {entry.text}
+                        </p>
                       </div>
                     </div>
                   )
                 ))}
-                <div ref={messagesEndRef} />
+                <div ref={messagesEndRef} aria-hidden="true" />
               </>
             )}
           </div>

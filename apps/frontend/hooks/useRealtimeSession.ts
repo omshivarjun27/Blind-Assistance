@@ -105,7 +105,7 @@ export function useRealtimeSession(captureFrame: () => string | null) {
   const mic = useMicStream();
 
   const appendTranscript = useCallback((entry: TranscriptEntry) => {
-    setTranscript((prev) => [...prev.slice(-9), entry]);
+    setTranscript((prev) => [...prev, entry]);
   }, []);
 
   const flushTurn = useCallback(() => {
