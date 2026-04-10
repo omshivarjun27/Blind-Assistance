@@ -36,6 +36,55 @@ const PLAYBACK_INTERRUPT_ARM_MS = 1500;
 const PLAYBACK_BARGE_IN_CHUNKS = 3;
 const PLAYBACK_COOLDOWN_MS = 500;
 
+let _audioCtx: AudioContext | null = null;
+let _nextPlayTime = 0;
+let _currentSource: AudioBufferSourceNode | null = null;
+let _scheduledSources: AudioBufferSourceNode[] = [];
+
+function _getAudioCtx(): AudioContext {
+  if (!_audioCtx || _audioCtx.state === 'closed') {
+    _audioCtx = new AudioContext({ sampleRate: 24000 });
+  }
+  if (_audioCtx.state === 'suspended') {
+    void _audioCtx.resume();
+  }
+  return _audioCtx;
+}
+
+function _playPCMChunk(buffer: ArrayBuffer): AudioBufferSourceNode {
+  const ctx = _getAudioCtx();
+  const int16 = new Int16Array(buffer);
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) {
+    float32[i] = int16[i] / 32768.0;
+  }
+  const audioBuffer = ctx.createBuffer(1, float32.length, 24000);
+  audioBuffer.copyToChannel(float32, 0);
+  const source = ctx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(ctx.destination);
+  const startAt = Math.max(_nextPlayTime, ctx.currentTime + 0.005);
+  source.start(startAt);
+  _nextPlayTime = startAt + audioBuffer.duration;
+  _currentSource = source;
+  _scheduledSources.push(source);
+  return source;
+}
+
+function _stopPlayback(): void {
+  for (const source of _scheduledSources) {
+    try {
+      source.stop(0);
+    } catch {}
+    try {
+      source.disconnect();
+    } catch {}
+  }
+  _scheduledSources = [];
+  _currentSource = null;
+  _nextPlayTime = 0;
+}
+
 export function useRealtimeSession(captureFrame: () => string | null) {
   const [status, setStatus] = useState<SessionStatus>('idle');
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
@@ -50,10 +99,6 @@ export function useRealtimeSession(captureFrame: () => string | null) {
   const isPlayingRef = useRef(false);
   const isSendingRef = useRef(false);
   const hasSpeechRef = useRef(false);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const currentSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const scheduledSourcesRef = useRef<AudioBufferSourceNode[]>([]);
-  const nextPlayTimeRef = useRef(0);
   const interruptArmedAtRef = useRef(0);
   const micCooldownUntilRef = useRef(0);
   const playbackSpeechChunksRef = useRef(0);
@@ -92,34 +137,12 @@ export function useRealtimeSession(captureFrame: () => string | null) {
     return rms > 500;
   }
 
-  const ensureAudioContext = useCallback(async () => {
-    let ctx = audioContextRef.current;
-    if (!ctx || ctx.state === 'closed') {
-      ctx = new AudioContext({ sampleRate: 24000 });
-      audioContextRef.current = ctx;
-    }
-    if (ctx.state === 'suspended') {
-      await ctx.resume();
-    }
-    return ctx;
-  }, []);
-
   const stopAssistantPlayback = useCallback(() => {
     if (playbackEndTimerRef.current) {
       clearTimeout(playbackEndTimerRef.current);
       playbackEndTimerRef.current = null;
     }
-    for (const source of scheduledSourcesRef.current) {
-      try {
-        source.stop();
-      } catch {}
-      try {
-        source.disconnect();
-      } catch {}
-    }
-    scheduledSourcesRef.current = [];
-    currentSourceRef.current = null;
-    nextPlayTimeRef.current = 0;
+    _stopPlayback();
     interruptArmedAtRef.current = 0;
     playbackSpeechChunksRef.current = 0;
     micCooldownUntilRef.current = 0;
@@ -128,51 +151,33 @@ export function useRealtimeSession(captureFrame: () => string | null) {
   }, []);
 
   const playPCMChunk = useCallback(
-    async (pcmBytes: ArrayBuffer): Promise<void> => {
-      const int16 = new Int16Array(pcmBytes);
-      const float32 = new Float32Array(int16.length);
-      for (let i = 0; i < int16.length; i++) {
-        float32[i] = int16[i] / 32768.0;
-      }
-
-      const audioContext = await ensureAudioContext();
-      const audioBuffer = audioContext.createBuffer(1, float32.length, 24000);
-      audioBuffer.copyToChannel(float32, 0);
-
+    (pcmBytes: ArrayBuffer): void => {
       if (!isPlayingRef.current) {
         if (playbackEndTimerRef.current) {
           clearTimeout(playbackEndTimerRef.current);
           playbackEndTimerRef.current = null;
         }
+        _nextPlayTime = 0;
         isPlayingRef.current = true;
         interruptArmedAtRef.current = performance.now() + PLAYBACK_INTERRUPT_ARM_MS;
         playbackSpeechChunksRef.current = 0;
         micCooldownUntilRef.current = 0;
       }
 
-      const source = audioContext.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(audioContext.destination);
-      const nextPlayTime = Math.max(nextPlayTimeRef.current, audioContext.currentTime);
-      source.start(nextPlayTime);
-      nextPlayTimeRef.current = nextPlayTime + audioBuffer.duration;
-      currentSourceRef.current = source;
-      scheduledSourcesRef.current.push(source);
+      const source = _playPCMChunk(pcmBytes);
       isSpeakingRef.current = true;
       setStatus('speaking');
 
       source.onended = () => {
-        scheduledSourcesRef.current = scheduledSourcesRef.current.filter(
-          (item) => item !== source
-        );
-        if (currentSourceRef.current === source) {
-          currentSourceRef.current = null;
+        _scheduledSources = _scheduledSources.filter((item) => item !== source);
+        if (_currentSource === source) {
+          _currentSource = _scheduledSources[_scheduledSources.length - 1] ?? null;
         }
-        if (scheduledSourcesRef.current.length === 0) {
+        if (_scheduledSources.length === 0) {
           micCooldownUntilRef.current = performance.now() + PLAYBACK_COOLDOWN_MS;
           playbackEndTimerRef.current = setTimeout(() => {
             playbackEndTimerRef.current = null;
-            nextPlayTimeRef.current = 0;
+            _nextPlayTime = 0;
             const newFrame = captureFrameRef.current?.();
             if (newFrame) {
               wsRef.current?.sendImage(newFrame);
@@ -186,7 +191,7 @@ export function useRealtimeSession(captureFrame: () => string | null) {
         }
       };
     },
-    [ensureAudioContext]
+    []
   );
 
   const onPcmChunk = useCallback(
@@ -264,8 +269,8 @@ export function useRealtimeSession(captureFrame: () => string | null) {
       const ws = new RealtimeWSClient(wsUrl);
       wsRef.current = ws;
 
-      ws.onAudio = async (pcm) => {
-        await playPCMChunk(pcm);
+      ws.onAudio = (pcm) => {
+        playPCMChunk(pcm);
       };
 
       ws.onTranscript = (role, text) => {
@@ -290,11 +295,11 @@ export function useRealtimeSession(captureFrame: () => string | null) {
       setStatus('error');
       mic.stopListening();
       stopAssistantPlayback();
-      void audioContextRef.current?.close();
-      audioContextRef.current = null;
-      nextPlayTimeRef.current = 0;
-      currentSourceRef.current = null;
-      scheduledSourcesRef.current = [];
+      void _audioCtx?.close();
+      _audioCtx = null;
+      _nextPlayTime = 0;
+      _currentSource = null;
+      _scheduledSources = [];
       wsRef.current?.disconnect();
       wsRef.current = null;
     }
@@ -326,11 +331,11 @@ export function useRealtimeSession(captureFrame: () => string | null) {
       captureFrameRef.current = null;
       mic.stopListening();
       stopAssistantPlayback();
-      void audioContextRef.current?.close();
-      audioContextRef.current = null;
-      nextPlayTimeRef.current = 0;
-      currentSourceRef.current = null;
-      scheduledSourcesRef.current = [];
+      void _audioCtx?.close();
+      _audioCtx = null;
+      _nextPlayTime = 0;
+      _currentSource = null;
+      _scheduledSources = [];
       wsRef.current?.disconnect();
       wsRef.current = null;
       setStatus('idle');

@@ -57,6 +57,16 @@ def _make_mock_turn(
     return turn
 
 
+def _clone_mock_turn(turn: Any, audio: bytes | None = None):
+    cloned = MagicMock()
+    cloned.assistant_audio_pcm = turn.assistant_audio_pcm if audio is None else audio
+    cloned.assistant_transcript = turn.assistant_transcript
+    cloned.user_transcript = turn.user_transcript
+    cloned.success = turn.success
+    cloned.error = turn.error
+    return cloned
+
+
 def _mock_client(turn: Any):
     """Build a mock QwenRealtimeClient for prepare→update→create flow."""
     turns = turn if isinstance(turn, list) else [turn]
@@ -66,6 +76,9 @@ def _mock_client(turn: Any):
     )
     client.async_update_instructions = AsyncMock(return_value=None)
     client.async_create_response_for_prepared_turn = AsyncMock(side_effect=turns)
+    client.async_create_response_for_prepared_turn_streaming = AsyncMock(
+        side_effect=[_clone_mock_turn(t) for t in turns]
+    )
     client.close = MagicMock()
     return client
 
@@ -389,7 +402,7 @@ def test_websocket_current_turn_classifier_called_for_each_spoken_turn():
 
     assert mock_classifier.classify.await_count == 2
     mock_client.async_prepare_audio_turn.assert_awaited()
-    mock_client.async_create_response_for_prepared_turn.assert_awaited()
+    mock_client.async_create_response_for_prepared_turn_streaming.assert_awaited()
 
 
 def test_websocket_empty_user_transcript_skips_response_after_first_scene():

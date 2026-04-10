@@ -25,7 +25,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import websocket
 
@@ -322,9 +322,31 @@ class QwenRealtimeClient:
         self._collect_response(result)
         return result
 
+    def create_response_for_prepared_turn_streaming(
+        self,
+        on_audio_chunk: Callable[[bytes], None],
+    ) -> QwenRealtimeTurn:
+        """Create a response and forward audio deltas immediately."""
+        self.ensure_connected()
+        result = QwenRealtimeTurn()
+        self._send_event({"type": "response.create"})
+        self._response_active = True
+        self._collect_response(result, on_audio_chunk=on_audio_chunk)
+        return result
+
     async def async_create_response_for_prepared_turn(self) -> QwenRealtimeTurn:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.create_response_for_prepared_turn)
+
+    async def async_create_response_for_prepared_turn_streaming(
+        self,
+        on_audio_chunk: Callable[[bytes], None],
+    ) -> QwenRealtimeTurn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.create_response_for_prepared_turn_streaming(on_audio_chunk),
+        )
 
     # ── internal helpers ──────────────────────────────────────
 
@@ -494,7 +516,11 @@ class QwenRealtimeClient:
             "yes" if image_jpeg_b64 else "no",
         )
 
-    def _collect_response(self, result: QwenRealtimeTurn) -> None:
+    def _collect_response(
+        self,
+        result: QwenRealtimeTurn,
+        on_audio_chunk: Optional[Callable[[bytes], None]] = None,
+    ) -> None:
         """Collect server events until response.done."""
         audio_chunks = bytearray()
         text_deltas: list[str] = []
@@ -531,7 +557,11 @@ class QwenRealtimeClient:
             elif t == "response.audio.delta":
                 delta = event.get("delta")
                 if isinstance(delta, str):
-                    audio_chunks.extend(base64.b64decode(delta))
+                    delta_bytes = base64.b64decode(delta)
+                    if on_audio_chunk is not None:
+                        on_audio_chunk(delta_bytes)
+                    else:
+                        audio_chunks.extend(delta_bytes)
 
             elif t == "response.audio.done":
                 pass  # audio.delta already collected

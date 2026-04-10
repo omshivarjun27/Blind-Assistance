@@ -555,8 +555,36 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         await _send_upstream_error(ws, str(exc), config)
                         break
 
+                loop = _asyncio.get_running_loop()
+                streamed_audio = False
+
+                def _forward_audio_delta(delta_bytes: bytes) -> None:
+                    nonlocal streamed_audio
+                    streamed_audio = True
+                    try:
+                        running_loop = _asyncio.get_running_loop()
+                    except RuntimeError:
+                        running_loop = None
+
+                    if running_loop is loop:
+                        _schedule_background_task(
+                            ws.send_bytes(delta_bytes),
+                            "stream_audio_delta",
+                        )
+                        return
+
+                    future = _asyncio.run_coroutine_threadsafe(
+                        ws.send_bytes(delta_bytes),
+                        loop,
+                    )
+                    future.result()
+
                 try:
-                    result = await client.async_create_response_for_prepared_turn()
+                    result = (
+                        await client.async_create_response_for_prepared_turn_streaming(
+                            _forward_audio_delta
+                        )
+                    )
                 except Exception as exc:
                     await _send_upstream_error(ws, str(exc), config)
                     break
@@ -639,7 +667,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 pending_instructions = None
 
                 # Send spoken audio back
-                if result.assistant_audio_pcm:
+                if result.assistant_audio_pcm and not streamed_audio:
                     await ws.send_bytes(result.assistant_audio_pcm)
 
                 # Send assistant transcript
