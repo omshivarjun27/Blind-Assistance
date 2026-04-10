@@ -819,15 +819,15 @@ def test_silent_turn_after_first_scene_guard_present_in_source():
     assert "Silent turn after first scene — skipping response" in source
 
 
-def test_web_search_no_longer_calls_search_manager_in_source():
+def test_web_search_removed_from_realtime_source():
     import inspect
 
     import apps.backend.api.routes.realtime as realtime_module
 
     source = inspect.getsource(realtime_module)
     assert "SearchManager" not in source
-    assert "def _is_search_query" in source
-    assert "WEB_SEARCH: currently uses Qwen knowledge + disclaimer." in source
+    assert "def _is_search_query" not in source
+    assert "WEB_SEARCH" not in source
 
 
 def test_post_scene_default_uses_general_chat_instructions_in_source():

@@ -104,33 +104,6 @@ def _is_memory_query(transcript: str) -> bool:
     return any(trigger.lower() in t for trigger in _PAST_TENSE_TRIGGERS)
 
 
-_SEARCH_TRIGGERS = [
-    "search for",
-    "look up",
-    "find out",
-    "what is the latest",
-    "latest news",
-    "current price",
-    "today's",
-    "news about",
-    "who won",
-    "what happened",
-    "how much does",
-    "is it open",
-    "weather",
-    "score",
-    "trending",
-    "right now",
-    "currently",
-    "live score",
-]
-
-
-def _is_search_query(transcript: str) -> bool:
-    t = transcript.lower().strip()
-    return any(trigger in t for trigger in _SEARCH_TRIGGERS)
-
-
 def _is_effective_silence(transcript: str) -> bool:
     cleaned = transcript.strip().lower().strip(".?!,;:。！？،")
     return cleaned in {"", "uh", "um", "hmm", "mm", "mhm", "嗯", "嗯嗯"}
@@ -561,8 +534,6 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                             "capture button first, then ask again."
                         )
                     elif decision.system_instructions:
-                        # WEB_SEARCH: currently uses Qwen knowledge + disclaimer.
-                        # TODO Plan 08: wire DashScope search tool here for live results.
                         effective_instructions = build_system_prompt(
                             base_instructions=decision.system_instructions,
                             verbosity_mode=prompt_verbosity,

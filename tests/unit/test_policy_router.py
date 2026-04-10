@@ -42,19 +42,6 @@ def test_translate_routes_to_realtime_chat_with_instructions():
     assert "Translate" in decision.system_instructions
 
 
-def test_web_search_routes_to_realtime_chat_with_search_instructions():
-    """WEB_SEARCH now uses REALTIME_CHAT with time-sensitive disclaimer guidance."""
-    from core.orchestrator.intent_classifier import IntentCategory
-    from core.orchestrator.policy_router import RouteTarget, route
-
-    decision = route(IntentCategory.WEB_SEARCH)
-    assert decision.target == RouteTarget.REALTIME_CHAT
-    assert (
-        "For the latest update, please check a live app or website."
-        in decision.system_instructions
-    )
-
-
 def test_all_intents_have_routing():
     """Every IntentCategory must produce a RoutingDecision without error."""
     from core.orchestrator.intent_classifier import IntentCategory

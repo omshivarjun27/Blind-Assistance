@@ -1,7 +1,7 @@
 """
 Ally Vision v2 — Intent classifier using qwen-turbo.
 
-Classifies user transcript into one of 9 intent categories.
+Classifies user transcript into one of 8 intent categories.
 Uses DashScope compatible mode (text-only, fast, cheap).
 Falls back to GENERAL_CHAT on any error — never blocks a turn.
 
@@ -24,7 +24,6 @@ _LABELS = [
     "SCENE_DESCRIBE",
     "READ_TEXT",
     "SCAN_PAGE",
-    "WEB_SEARCH",
     "MEMORY_SAVE",
     "MEMORY_RECALL",
     "DOCUMENT_QA",
@@ -34,7 +33,7 @@ _LABELS = [
 
 _CLASSIFICATION_PROMPT = (
     "Classify this user request into exactly one of: "
-    "SCENE_DESCRIBE, READ_TEXT, SCAN_PAGE, WEB_SEARCH, "
+    "SCENE_DESCRIBE, READ_TEXT, SCAN_PAGE, "
     "MEMORY_SAVE, MEMORY_RECALL, DOCUMENT_QA, "
     "TRANSLATE, GENERAL_CHAT. "
     "TRANSLATE covers: translate this, what language is this, "
@@ -48,7 +47,6 @@ class IntentCategory(str, enum.Enum):
     SCENE_DESCRIBE = "SCENE_DESCRIBE"
     READ_TEXT = "READ_TEXT"
     SCAN_PAGE = "SCAN_PAGE"
-    WEB_SEARCH = "WEB_SEARCH"
     MEMORY_SAVE = "MEMORY_SAVE"
     MEMORY_RECALL = "MEMORY_RECALL"
     DOCUMENT_QA = "DOCUMENT_QA"

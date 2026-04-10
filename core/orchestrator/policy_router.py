@@ -23,7 +23,6 @@ class RouteTarget(str, enum.Enum):
     REALTIME_CHAT = "REALTIME_CHAT"
     HEAVY_VISION = "HEAVY_VISION"
     TRANSLATE = "TRANSLATE"
-    WEB_SEARCH = "WEB_SEARCH"
     MEMORY_WRITE = "MEMORY_WRITE"
     MEMORY_READ = "MEMORY_READ"
     DOCUMENT_QA = "DOCUMENT_QA"
@@ -62,19 +61,6 @@ _ROUTING_TABLE: dict[IntentCategory, tuple[RouteTarget, bool, str]] = {
         RouteTarget.HEAVY_VISION,
         True,
         "Capture and describe this document page for later reference.",
-    ),
-    IntentCategory.WEB_SEARCH: (
-        RouteTarget.REALTIME_CHAT,
-        False,
-        "You are Ally, a voice assistant for blind and visually impaired users. "
-        "The user is asking for real-world or time-sensitive information. "
-        "Answer their specific question directly. "
-        "Do NOT describe the camera scene under any circumstances. "
-        "Do NOT say you cannot access the internet. "
-        "For live or real-time information (cricket scores, IPL, weather, news, "
-        "stock prices): give the best available answer from your knowledge, "
-        'then add: "For the latest update, please check a live app or website." '
-        "Speak in the same language the user used. Be specific and concise.",
     ),
     IntentCategory.MEMORY_SAVE: (
         RouteTarget.MEMORY_WRITE,
