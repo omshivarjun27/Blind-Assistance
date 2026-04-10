@@ -35,10 +35,36 @@ logger = logging.getLogger("qwen-realtime-client")
 _SESSION_MAX_LIFETIME_S = 110 * 60
 
 
+def _default_realtime_model() -> str:
+    from shared.config.settings import QWEN_REALTIME_MODEL
+
+    return QWEN_REALTIME_MODEL
+
+
+def _default_realtime_endpoint() -> str:
+    from shared.config.settings import DASHSCOPE_REALTIME_URL
+
+    return DASHSCOPE_REALTIME_URL
+
+
+def _default_transcription_model() -> str:
+    return "qwen3-asr-flash-realtime"
+
+
+def _default_realtime_voice() -> str:
+    from shared.config.settings import QWEN_OMNI_VOICE, QWEN_REALTIME_MODEL
+
+    return QWEN_OMNI_VOICE or default_voice_for_model(QWEN_REALTIME_MODEL)
+
+
 def default_voice_for_model(model: str) -> str:
     """Return the safest default voice for a realtime model family."""
     model_lower = model.lower()
-    if "qwen3-omni-flash-realtime" in model_lower:
+    if "qwen3.5-omni-flash" in model_lower:
+        return "Tina"
+    if "qwen3.5-omni-plus" in model_lower:
+        return "Tina"
+    if "qwen3-omni-flash" in model_lower:
         return "Cherry"
     return "Cherry"
 
@@ -48,23 +74,19 @@ class QwenRealtimeConfig:
     """Configuration for QwenRealtimeClient."""
 
     api_key: str
-    model: str = "qwen3-omni-flash-realtime"
-    endpoint: str = "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime"
-    voice: str = "Cherry"
+    model: str = field(default_factory=_default_realtime_model)
+    endpoint: str = field(default_factory=_default_realtime_endpoint)
+    voice: str = field(default_factory=_default_realtime_voice)
     instructions: str = (
-        "You are Cherry, a helpful voice and vision assistant for blind and low-vision users. "
-        "You are warm, clear, and concise. "
-        "LANGUAGE RULE: Respond in whatever language the user speaks. "
-        "If the user speaks Kannada, reply in Kannada. "
-        "If the user speaks Hindi, reply in Hindi. "
-        "If the user speaks English, reply in English. "
-        "If the user speaks Tamil, reply in Tamil. "
-        "If the user speaks Telugu, reply in Telugu. "
-        "Mirror the user's language exactly. "
-        "Only switch languages if the user explicitly asks you to translate or respond in a different language. "
-        "Never reply in English if the user spoke in another language unless they asked for it."
+        "You are Ally, a real-time voice and vision assistant for blind users. "
+        "You support 113 spoken languages including English, Hindi, and Kannada. "
+        "Always detect the language the user is speaking and respond in the SAME language. "
+        "Never switch languages unless explicitly asked. "
+        "You have access to vision (camera frames), memory (stored facts), and function calling. "
+        "Respond concisely — blind users cannot see the screen. "
+        "For medicine safety questions, be extremely careful and always recommend consulting a doctor."
     )
-    transcription_model: str = "gummy-realtime-v1"
+    transcription_model: str = field(default_factory=_default_transcription_model)
     audio_in_rate: int = 16000
     audio_out_rate: int = 24000
     chunk_bytes: int = 3200
@@ -73,19 +95,17 @@ class QwenRealtimeConfig:
     @classmethod
     def from_settings(cls) -> "QwenRealtimeConfig":
         """Create config from environment / settings module."""
-        from shared.config.settings import (
-            DASHSCOPE_REALTIME_URL,
-            QWEN_REALTIME_MODEL,
-            QWEN_TRANSCRIPTION_MODEL,
-            get_api_key,
-        )
+        from shared.config import settings as settings_module
 
         return cls(
-            api_key=get_api_key(),
-            model=QWEN_REALTIME_MODEL,
-            endpoint=DASHSCOPE_REALTIME_URL,
-            voice=default_voice_for_model(QWEN_REALTIME_MODEL),
-            transcription_model=QWEN_TRANSCRIPTION_MODEL,
+            api_key=settings_module.get_api_key(),
+            model=settings_module.QWEN_REALTIME_MODEL,
+            endpoint=settings_module.DASHSCOPE_REALTIME_URL,
+            voice=(
+                settings_module.QWEN_OMNI_VOICE
+                or default_voice_for_model(settings_module.QWEN_REALTIME_MODEL)
+            ),
+            transcription_model="qwen3-asr-flash-realtime",
         )
 
 
@@ -379,15 +399,6 @@ class QwenRealtimeClient:
             )
         raise TimeoutError(f"Timed out waiting for event: {expected_type}")
 
-    # TODO Plan 07: Re-enable server_vad for barge-in/interruption support.
-    # Requires:
-    #   1. Frontend streams live mic chunks (not batched turns)
-    #   2. Backend calls response.cancel when new speech detected mid-response
-    #   3. Image must be sent BEFORE any audio chunks to avoid VAD race condition
-    # Currently using manual turn_detection (None) because the frontend
-    # batches one complete turn before sending. Switching back to server_vad
-    # without changing the frontend architecture will cause the COMMON_ERROR
-    # "invalid URL" regression — the image arrives after VAD auto-commits the turn.
     def _send_session_update(self, instructions: Optional[str] = None) -> None:
         self._send_event(
             {
@@ -401,11 +412,13 @@ class QwenRealtimeClient:
                     "input_audio_transcription": {
                         "model": self._config.transcription_model,
                     },
-                    # The frontend already batches one complete user turn per
-                    # binary frame, so manual mode keeps the realtime session
-                    # aligned with our explicit commit/create flow and avoids
-                    # provider errors on multimodal turns.
-                    "turn_detection": None,
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 500,
+                        "interrupt_response": True,
+                    },
                 },
             }
         )

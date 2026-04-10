@@ -46,11 +46,16 @@ DASHSCOPE_COMPAT_BASE: str = _get(
 # Model selection by profile
 QWEN_REALTIME_MODEL: str = _get(
     "QWEN_REALTIME_EXAM" if _is_exam else "QWEN_REALTIME_DEV",
-    "qwen3-omni-flash-realtime" if _is_exam else "qwen3-omni-flash-realtime",
+    "qwen3.5-omni-plus-realtime" if _is_exam else "qwen3.5-omni-flash-realtime",
 )
+QWEN_OMNI_VOICE: str = _get("QWEN_OMNI_VOICE", "")
+QWEN_HEAVY_VISION_MODEL: str = _get("QWEN_HEAVY_VISION_MODEL", "qwen3.5-plus")
 QWEN_VISION_MODEL: str = _get(
-    "QWEN_VISION_EXAM" if _is_exam else "QWEN_VISION_DEV",
-    "qwen3.6-plus" if _is_exam else "qwen3.6-plus",
+    "QWEN_HEAVY_VISION_MODEL",
+    _get(
+        "QWEN_VISION_EXAM" if _is_exam else "QWEN_VISION_DEV",
+        "qwen3.5-plus",
+    ),
 )
 QWEN_TRANSCRIPTION_MODEL: str = _get("QWEN_TRANSCRIPTION_MODEL", "gummy-realtime-v1")
 QWEN_TURBO_MODEL: str = _get("QWEN_TURBO_MODEL", "qwen-turbo")

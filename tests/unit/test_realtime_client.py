@@ -20,25 +20,75 @@ import websocket
 
 
 def test_config_defaults():
-    """QwenRealtimeConfig defaults match expected protocol values."""
+    """QwenRealtimeConfig defaults should match the upgraded runtime defaults."""
     from apps.backend.services.dashscope.realtime_client import QwenRealtimeConfig
 
     cfg = QwenRealtimeConfig(api_key="test-key")
+    assert cfg.model == "qwen3.5-omni-flash-realtime"
     assert "realtime" in cfg.model
+    assert cfg.endpoint == "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime"
     assert cfg.endpoint.startswith("wss://")
-    assert "dashscope-intl" in cfg.endpoint
     assert cfg.audio_in_rate == 16000
     assert cfg.audio_out_rate == 24000
     assert cfg.chunk_bytes == 3200
-    assert cfg.voice == "Cherry"
+    assert cfg.voice == "Tina"
+    assert cfg.transcription_model == "qwen3-asr-flash-realtime"
 
 
-def test_default_voice_for_model_prefers_cherry_for_qwen3_flash_realtime():
-    """Qwen 3 flash realtime models should default to Cherry."""
+def test_config_defaults_follow_reloaded_settings():
+    """from_settings() should follow reloaded settings and env overrides."""
+    import importlib
+
+    original_model = os.environ.get("QWEN_REALTIME_DEV")
+    original_endpoint = os.environ.get("DASHSCOPE_REALTIME_URL")
+    original_voice = os.environ.get("QWEN_OMNI_VOICE")
+
+    try:
+        os.environ["QWEN_REALTIME_DEV"] = "qwen3.5-omni-plus-realtime"
+        os.environ["DASHSCOPE_REALTIME_URL"] = "wss://example.com/realtime"
+        os.environ["QWEN_OMNI_VOICE"] = "Tina"
+
+        import shared.config.settings as settings_module
+        from apps.backend.services.dashscope import realtime_client as realtime_module
+
+        settings_module = importlib.reload(settings_module)
+        realtime_module = importlib.reload(realtime_module)
+
+        cfg = realtime_module.QwenRealtimeConfig.from_settings()
+
+        assert cfg.model == settings_module.QWEN_REALTIME_MODEL
+        assert cfg.endpoint == settings_module.DASHSCOPE_REALTIME_URL
+        assert cfg.voice == settings_module.QWEN_OMNI_VOICE
+        assert cfg.transcription_model == "qwen3-asr-flash-realtime"
+    finally:
+        if original_model is None:
+            os.environ.pop("QWEN_REALTIME_DEV", None)
+        else:
+            os.environ["QWEN_REALTIME_DEV"] = original_model
+
+        if original_endpoint is None:
+            os.environ.pop("DASHSCOPE_REALTIME_URL", None)
+        else:
+            os.environ["DASHSCOPE_REALTIME_URL"] = original_endpoint
+
+        if original_voice is None:
+            os.environ.pop("QWEN_OMNI_VOICE", None)
+        else:
+            os.environ["QWEN_OMNI_VOICE"] = original_voice
+
+        import shared.config.settings as settings_module
+        from apps.backend.services.dashscope import realtime_client as realtime_module
+
+        _ = importlib.reload(settings_module)
+        _ = importlib.reload(realtime_module)
+
+
+def test_default_voice_for_model_prefers_tina_for_qwen35_omni_models():
+    """Qwen 3.5 omni realtime models should default to Tina."""
     from apps.backend.services.dashscope.realtime_client import default_voice_for_model
 
-    assert default_voice_for_model("qwen3-omni-flash-realtime") == "Cherry"
-    assert default_voice_for_model("qwen3-omni-flash-realtime") == "Cherry"
+    assert default_voice_for_model("qwen3.5-omni-flash-realtime") == "Tina"
+    assert default_voice_for_model("qwen3.5-omni-plus-realtime") == "Tina"
 
 
 def test_default_voice_for_model_keeps_cherry_for_qwen3_flash():
@@ -56,28 +106,15 @@ def test_config_from_settings_reads_env():
     assert cfg.api_key == "test-key-for-unit-tests"
     assert "realtime" in cfg.model
     assert cfg.endpoint.startswith("wss://")
-    assert cfg.voice == "Cherry"
+    assert cfg.voice == "Tina"
 
 
-def test_config_from_settings_reads_transcription_model_env():
-    """from_settings() uses QWEN_TRANSCRIPTION_MODEL from settings."""
-    original = os.environ.get("QWEN_TRANSCRIPTION_MODEL")
-    try:
-        os.environ["QWEN_TRANSCRIPTION_MODEL"] = "test-transcription-model"
-        import importlib
-        import shared.config.settings as s
+def test_config_from_settings_uses_fixed_asr_model():
+    """Phase 1 pins the realtime transcription model to qwen3 ASR."""
+    from apps.backend.services.dashscope.realtime_client import QwenRealtimeConfig
 
-        _ = importlib.reload(s)
-        from apps.backend.services.dashscope import realtime_client as rc
-
-        _ = importlib.reload(rc)
-        cfg = rc.QwenRealtimeConfig.from_settings()
-        assert cfg.transcription_model == "test-transcription-model"
-    finally:
-        if original:
-            os.environ["QWEN_TRANSCRIPTION_MODEL"] = original
-        else:
-            os.environ.pop("QWEN_TRANSCRIPTION_MODEL", None)
+    cfg = QwenRealtimeConfig.from_settings()
+    assert cfg.transcription_model == "qwen3-asr-flash-realtime"
 
 
 def test_config_from_settings_raises_on_missing_key():
@@ -148,7 +185,7 @@ def test_session_update_payload_structure():
         QwenRealtimeConfig,
     )
 
-    cfg = QwenRealtimeConfig(api_key="test-key", voice="Cherry")
+    cfg = QwenRealtimeConfig(api_key="test-key", voice="Tina")
     client = QwenRealtimeClient(cfg)
     client._ws = MagicMock()
 
@@ -163,12 +200,19 @@ def test_session_update_payload_structure():
     session = cast(dict[str, Any], payload["session"])
     assert "text" in session["modalities"]
     assert "audio" in session["modalities"]
-    assert session["voice"] == "Cherry"
+    assert session["voice"] == "Tina"
     assert session["input_audio_format"] == "pcm"
     assert session["output_audio_format"] == "pcm"
-    assert "LANGUAGE RULE" in session.get("instructions", "")
-    assert session["turn_detection"] is None
-    assert session["input_audio_transcription"]["model"] == "gummy-realtime-v1"
+    assert isinstance(session.get("instructions"), str)
+    assert "You are Ally" in session["instructions"]
+    assert session["turn_detection"] == {
+        "type": "server_vad",
+        "threshold": 0.5,
+        "prefix_padding_ms": 300,
+        "silence_duration_ms": 500,
+        "interrupt_response": True,
+    }
+    assert session["input_audio_transcription"]["model"] == "qwen3-asr-flash-realtime"
 
 
 def test_connect_captures_session_id_and_marks_connected():
@@ -248,7 +292,7 @@ def test_connect_surfaces_session_update_failure_context():
     )
 
     cfg = QwenRealtimeConfig(
-        api_key="test-key", model="qwen3-omni-flash-realtime", voice="Cherry"
+        api_key="test-key", model="qwen3.5-omni-flash-realtime", voice="Tina"
     )
     client = QwenRealtimeClient(cfg)
     fake_ws = MagicMock()
@@ -268,7 +312,7 @@ def test_connect_surfaces_session_update_failure_context():
 
         with pytest.raises(
             RuntimeError,
-            match="qwen3-omni-flash-realtime.*Cherry.*api-ws/v1/realtime.*sess-created",
+            match="qwen3.5-omni-flash-realtime.*Tina.*api-ws/v1/realtime.*sess-created",
         ):
             client.connect()
 
@@ -322,7 +366,7 @@ def test_stream_audio_image_field_is_raw_base64():
 
     config = QwenRealtimeConfig(
         api_key="test",
-        model="qwen3-omni-flash-realtime",
+        model="qwen3.5-omni-flash-realtime",
     )
     client = QwenRealtimeClient(config)
     client._ws = MagicMock()
@@ -522,7 +566,7 @@ def test_cancel_response_sends_event():
         QwenRealtimeConfig,
     )
 
-    config = QwenRealtimeConfig(api_key="test", model="qwen3-omni-flash-realtime")
+    config = QwenRealtimeConfig(api_key="test", model="qwen3.5-omni-flash-realtime")
     client = QwenRealtimeClient(config)
     client._connected = True
     client._response_active = True
@@ -539,7 +583,7 @@ def test_cancel_response_noop_when_not_connected():
         QwenRealtimeConfig,
     )
 
-    config = QwenRealtimeConfig(api_key="test", model="qwen3-omni-flash-realtime")
+    config = QwenRealtimeConfig(api_key="test", model="qwen3.5-omni-flash-realtime")
     client = QwenRealtimeClient(config)
     client._connected = False
     client._ws = None
@@ -553,7 +597,7 @@ def test_cancel_response_noop_when_no_active_response():
         QwenRealtimeConfig,
     )
 
-    config = QwenRealtimeConfig(api_key="test", model="qwen3-omni-flash-realtime")
+    config = QwenRealtimeConfig(api_key="test", model="qwen3.5-omni-flash-realtime")
     client = QwenRealtimeClient(config)
     client._connected = True
     client._response_active = False
@@ -570,7 +614,7 @@ def test_collect_response_handles_response_cancelled():
         QwenRealtimeTurn,
     )
 
-    config = QwenRealtimeConfig(api_key="test", model="qwen3-omni-flash-realtime")
+    config = QwenRealtimeConfig(api_key="test", model="qwen3.5-omni-flash-realtime")
     client = QwenRealtimeClient(config)
     result = QwenRealtimeTurn()
     events = iter(
