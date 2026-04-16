@@ -375,11 +375,15 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 predicted_target = RouteTarget.REALTIME_CHAT
                 applied_target = RouteTarget.REALTIME_CHAT
                 predicted_intent: IntentCategory | None = None
+                resolved_intent: IntentCategory | None = None
                 routing_decision = route(IntentCategory.GENERAL_CHAT)
                 route_image_b64 = pending_image_b64
                 session_memory_recorded = False
                 scene_fallback_this_turn = False
                 current_user_transcript: str | None = ""
+                intent_task: _asyncio.Task[object] | None = None
+                intent_started_at: float | None = None
+                classification_deferred = False
 
                 turn_connect_started = time.monotonic()
                 if not client.is_connected():
@@ -428,14 +432,28 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     predicted_intent = IntentCategory.MEMORY_SAVE
                 elif _is_memory_recall:
                     predicted_intent = IntentCategory.MEMORY_RECALL
+                elif (
+                    route_image_b64
+                    and transcript_for_routing.strip()
+                    and not _silence_like
+                ):
+                    clf_result = await classifier.classify(transcript_for_routing)
+                    predicted_intent = clf_result.intent
                 elif transcript_missing:
                     logger.warning(
                         "Transcript unavailable before response start — routing as GENERAL_CHAT"
                     )
                     predicted_intent = IntentCategory.GENERAL_CHAT
+                    classification_deferred = True
                 elif transcript_for_routing.strip() and not _silence_like:
-                    clf_result = await classifier.classify(transcript_for_routing)
-                    predicted_intent = clf_result.intent
+                    intent_started_at = time.monotonic()
+                    logger.info("Intent classification started — background task fired")
+                    intent_task = _asyncio.create_task(
+                        classifier.classify(transcript_for_routing)
+                    )
+                    predicted_intent = IntentCategory.GENERAL_CHAT
+                    effective_instructions = default_instructions
+                    classification_deferred = True
                 elif route_image_b64 and not _scene_described_once:
                     predicted_intent = IntentCategory.SCENE_DESCRIBE
                     _scene_described_once = True
@@ -612,6 +630,13 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     )
                     future.result()
 
+                if classification_deferred and (
+                    intent_task is None or not intent_task.done()
+                ):
+                    logger.info(
+                        "Audio streaming started — intent not yet resolved (correct behavior)"
+                    )
+
                 try:
                     result = (
                         await client.async_create_response_for_prepared_turn_streaming(
@@ -629,6 +654,73 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 current_user_transcript = (
                     result.user_transcript or current_user_transcript or ""
                 )
+                resolved_intent = predicted_intent or IntentCategory.GENERAL_CHAT
+                if (
+                    intent_task is None
+                    and classification_deferred
+                    and current_user_transcript.strip()
+                ):
+                    intent_started_at = time.monotonic()
+                    logger.info("Intent classification started — background task fired")
+                    intent_task = _asyncio.create_task(
+                        classifier.classify(current_user_transcript)
+                    )
+                if intent_task is not None:
+                    try:
+                        clf_result = await _asyncio.wait_for(intent_task, timeout=2.0)
+                        resolved_intent = clf_result.intent
+                        elapsed_ms = (
+                            int((time.monotonic() - intent_started_at) * 1000)
+                            if intent_started_at is not None
+                            else 0
+                        )
+                        logger.info(
+                            "Intent classified: %s in %dms",
+                            resolved_intent.value,
+                            elapsed_ms,
+                        )
+                    except _asyncio.TimeoutError:
+                        resolved_intent = IntentCategory.GENERAL_CHAT
+                        logger.warning(
+                            "Intent classification timed out — defaulting to general_chat"
+                        )
+                    except Exception as exc:
+                        resolved_intent = IntentCategory.GENERAL_CHAT
+                        logger.warning(
+                            "Intent classification failed post-audio: %s",
+                            exc,
+                        )
+                if (
+                    resolved_intent == IntentCategory.MEMORY_SAVE
+                    and not _is_memory_save
+                    and current_user_transcript
+                ):
+                    try:
+                        await memory_manager.save(
+                            user_id="default",
+                            raw_utterance=current_user_transcript,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Post-turn MEMORY_SAVE failed: %s",
+                            exc,
+                        )
+                elif (
+                    resolved_intent == IntentCategory.MEMORY_RECALL
+                    and not _is_memory_recall
+                    and current_user_transcript
+                ):
+                    try:
+                        await memory_manager.recall(
+                            user_id="default",
+                            query=current_user_transcript,
+                            top_k=3,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Post-turn MEMORY_RECALL failed: %s",
+                            exc,
+                        )
                 if current_user_transcript and not _is_memory_query(
                     current_user_transcript
                 ):
@@ -650,8 +742,14 @@ async def realtime_endpoint(ws: WebSocket) -> None:
 
                 _turn_id = f"{session_id}:{uuid4().hex}"
                 _response_text = result.assistant_transcript or ""
-                _current_intent = str(predicted_intent)
-                _current_target = str(routing_decision.target)
+                _current_intent = str(resolved_intent or predicted_intent)
+                _current_target = str(
+                    route(
+                        resolved_intent
+                        or predicted_intent
+                        or IntentCategory.GENERAL_CHAT
+                    ).target
+                )
 
                 _schedule_background_task(
                     correction_store.log_turn(

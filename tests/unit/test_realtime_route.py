@@ -146,6 +146,117 @@ def test_first_audio_ms_not_null():
     assert len(response) > 0
 
 
+def test_audio_starts_before_intent_resolves(caplog):
+    """Audio bytes must reach the client before classifier resolution."""
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turn = _make_mock_turn(
+        audio=b"\x01\x02" * 40, assistant_text="hello", user_text="hello"
+    )
+    mock_client = _mock_client(turn)
+    audio_started = {"value": False}
+
+    async def streaming_side_effect(on_audio_chunk):
+        audio_started["value"] = True
+        on_audio_chunk(turn.assistant_audio_pcm)
+        return _clone_mock_turn(turn, audio=b"")
+
+    async def delayed_classify(_: str):
+        await asyncio.sleep(0.5)
+        assert audio_started["value"] is True
+        return ClassificationResult(
+            intent=IntentCategory.GENERAL_CHAT,
+            confidence="high",
+            raw_label="GENERAL_CHAT",
+        )
+
+    mock_client.async_create_response_for_prepared_turn_streaming = AsyncMock(
+        side_effect=streaming_side_effect
+    )
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock(side_effect=delayed_classify)
+    mock_classifier.close = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                started = time.monotonic()
+                ws.send_bytes(b"\x00" * 3200)
+                response = ws.receive_bytes()
+                first_audio_ms = int((time.monotonic() - started) * 1000)
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+    assert response == turn.assistant_audio_pcm
+    assert first_audio_ms < 500
+    assert "Audio streaming started — intent not yet resolved" in caplog.text
+
+
+def test_intent_timeout_defaults_to_general_chat(caplog):
+    """A stuck classifier must time out without blocking audio bytes."""
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turn = _make_mock_turn(
+        audio=b"\x03\x04" * 40, assistant_text="hello", user_text="hello"
+    )
+    mock_client = _mock_client(turn)
+
+    async def streaming_side_effect(on_audio_chunk):
+        on_audio_chunk(turn.assistant_audio_pcm)
+        return _clone_mock_turn(turn, audio=b"")
+
+    async def never_resolve(_: str):
+        await asyncio.sleep(10)
+        return MagicMock()
+
+    mock_client.async_create_response_for_prepared_turn_streaming = AsyncMock(
+        side_effect=streaming_side_effect
+    )
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock(side_effect=never_resolve)
+    mock_classifier.close = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                started = time.monotonic()
+                ws.send_bytes(b"\x00" * 3200)
+                response = ws.receive_bytes()
+                first_audio_ms = int((time.monotonic() - started) * 1000)
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+    assert response == turn.assistant_audio_pcm
+    assert first_audio_ms < 500
+    assert "Intent classification timed out — defaulting to general_chat" in caplog.text
+
+
 # ── audio turn tests ──────────────────────────────────────────────
 
 
