@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import deque
 import io
 import json
 import logging
@@ -33,6 +34,7 @@ logger = logging.getLogger("qwen-realtime-client")
 
 # Session safety margin: reconnect at 110 min (before 120 min expiry)
 _SESSION_MAX_LIFETIME_S = 110 * 60
+_SESSION_UPDATED_TIMEOUT_S = 5.0
 
 
 def _default_realtime_model() -> str:
@@ -146,6 +148,9 @@ class QwenRealtimeClient:
         self._session_start_time: Optional[float] = None
         self._session_id: Optional[str] = None
         self._response_active: bool = False
+        self._session_updated_confirmed: bool = False
+        self._session_update_sent_at: Optional[float] = None
+        self._buffered_events: deque[dict[str, Any]] = deque()
 
     # ── connection lifecycle ──────────────────────────────────
 
@@ -161,9 +166,11 @@ class QwenRealtimeClient:
         try:
             created_event = self._wait_for_event("session.created", timeout=15.0)
             self._session_id = self._extract_session_id(created_event)
+            self._session_updated_confirmed = False
+            self._session_update_sent_at = time.monotonic()
             self._send_session_update()
             try:
-                updated_event = self._wait_for_event("session.updated", timeout=15.0)
+                self._wait_for_session_updated(timeout=_SESSION_UPDATED_TIMEOUT_S)
             except Exception as exc:
                 session_context = (
                     f" session_id={self._session_id}" if self._session_id else ""
@@ -173,9 +180,6 @@ class QwenRealtimeClient:
                     f"model={self._config.model} voice={self._config.voice} "
                     f"endpoint={self._config.endpoint}{session_context}: {exc}"
                 ) from exc
-            self._session_id = (
-                self._extract_session_id(updated_event) or self._session_id
-            )
             self._connected = True
             self._session_start_time = time.monotonic()
             logger.info(
@@ -200,6 +204,9 @@ class QwenRealtimeClient:
             self._ws = None
         self._connected = False
         self._response_active = False
+        self._session_updated_confirmed = False
+        self._session_update_sent_at = None
+        self._buffered_events.clear()
         logger.info("Realtime session closed")
 
     def needs_reconnect(self) -> bool:
@@ -221,6 +228,8 @@ class QwenRealtimeClient:
             self.connect()
         elif self.needs_reconnect():
             self.reconnect()
+        elif not self._session_updated_confirmed:
+            self._wait_for_session_updated(timeout=_SESSION_UPDATED_TIMEOUT_S)
 
     # ── main turn ─────────────────────────────────────────────
 
@@ -304,8 +313,10 @@ class QwenRealtimeClient:
     def update_instructions(self, instructions: Optional[str] = None) -> None:
         """Apply session instructions and wait until DashScope acknowledges them."""
         self.ensure_connected()
+        self._session_updated_confirmed = False
+        self._session_update_sent_at = time.monotonic()
         self._send_session_update(instructions=instructions)
-        self._wait_for_event("session.updated", timeout=10.0)
+        self._wait_for_session_updated(timeout=_SESSION_UPDATED_TIMEOUT_S)
 
     async def async_update_instructions(
         self, instructions: Optional[str] = None
@@ -367,6 +378,9 @@ class QwenRealtimeClient:
             raise RuntimeError("Realtime WebSocket is not connected")
         return self._ws
 
+    def _buffer_event(self, event: dict[str, Any]) -> None:
+        self._buffered_events.append(event)
+
     def _send_event(self, payload: dict[str, Any]) -> None:
         payload = dict(payload)
         payload["event_id"] = "event_" + uuid.uuid4().hex
@@ -383,6 +397,11 @@ class QwenRealtimeClient:
             logger.warning("cancel_response failed: %s", exc)
 
     def _recv_event(self, timeout: Optional[float] = None) -> dict[str, Any]:
+        if self._buffered_events:
+            return self._buffered_events.popleft()
+        return self._recv_ws_event(timeout=timeout)
+
+    def _recv_ws_event(self, timeout: Optional[float] = None) -> dict[str, Any]:
         ws = self._require_ws()
         if timeout is not None:
             ws.settimeout(timeout)
@@ -397,6 +416,29 @@ class QwenRealtimeClient:
             self._session_id = session_id
         return event
 
+    def _wait_for_session_updated(
+        self, timeout: float = _SESSION_UPDATED_TIMEOUT_S
+    ) -> None:
+        if self._session_updated_confirmed:
+            return
+
+        started_at = self._session_update_sent_at or time.monotonic()
+        try:
+            updated_event = self._wait_for_event("session.updated", timeout=timeout)
+        except Exception as exc:
+            self.close()
+            raise RuntimeError(
+                f"Retryable session.updated timeout after {timeout:.1f}s: {exc}"
+            ) from exc
+
+        self._session_id = self._extract_session_id(updated_event) or self._session_id
+        self._session_updated_confirmed = True
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
+        logger.info(
+            "session.updated confirmed in %dms — safe to stream audio",
+            elapsed_ms,
+        )
+
     def _wait_for_event(
         self,
         expected_type: str,
@@ -406,7 +448,7 @@ class QwenRealtimeClient:
         while time.monotonic() < deadline:
             remaining = max(0.5, deadline - time.monotonic())
             try:
-                event = self._recv_event(timeout=remaining)
+                event = self._recv_ws_event(timeout=remaining)
             except websocket.WebSocketTimeoutException:
                 break
             t = event.get("type", "")
@@ -414,6 +456,14 @@ class QwenRealtimeClient:
                 return event
             if t == "error":
                 raise RuntimeError(f"Server error waiting for {expected_type}: {event}")
+            if expected_type == "session.updated" and t.startswith("response."):
+                self._buffer_event(event)
+                logger.debug(
+                    "Buffering event type=%s while waiting for %s",
+                    t,
+                    expected_type,
+                )
+                continue
             logger.debug(
                 "Skipping event type=%s while waiting for %s",
                 t,
@@ -464,6 +514,13 @@ class QwenRealtimeClient:
                 return transcript if isinstance(transcript, str) else ""
             if event_type == "error":
                 raise RuntimeError(f"Server error waiting for transcript: {event}")
+            if event_type.startswith("response."):
+                self._buffer_event(event)
+                logger.debug(
+                    "Buffering event type=%s while waiting for transcript",
+                    event_type,
+                )
+                continue
 
             logger.debug(
                 "Skipping event type=%s while waiting for transcript", event_type
@@ -478,6 +535,7 @@ class QwenRealtimeClient:
         auto_create_response: bool = True,
     ) -> None:
         """Stream PCM chunks and optional image, then commit."""
+        self.ensure_connected()
         chunk = self._config.chunk_bytes
         image_sent = False
 

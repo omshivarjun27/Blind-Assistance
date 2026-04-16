@@ -332,6 +332,9 @@ def _capture_stream_events(
     cfg = QwenRealtimeConfig(api_key="test-key", chunk_bytes=3200)
     client = QwenRealtimeClient(cfg)
     client._ws = MagicMock()
+    client._connected = True
+    client._session_start_time = time.monotonic()
+    client._session_updated_confirmed = True
 
     event_types: list[str] = []
     client._ws.send = lambda data: event_types.append(json.loads(data)["type"])
@@ -370,6 +373,9 @@ def test_stream_audio_image_field_is_raw_base64():
     )
     client = QwenRealtimeClient(config)
     client._ws = MagicMock()
+    client._connected = True
+    client._session_start_time = time.monotonic()
+    client._session_updated_confirmed = True
 
     sent_events: list[dict[str, Any]] = []
     client._ws.send = lambda data: sent_events.append(json.loads(data))

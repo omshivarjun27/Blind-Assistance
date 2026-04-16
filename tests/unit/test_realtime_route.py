@@ -83,6 +83,38 @@ def _mock_client(turn: Any):
     return client
 
 
+def test_session_updated_before_audio_stream():
+    """Client must wait for session.updated ack before appending audio."""
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+    )
+
+    client = QwenRealtimeClient(QwenRealtimeConfig(api_key="test-key"))
+    client._connected = True
+    client._ws = MagicMock()
+    client._session_updated_confirmed = False
+    client._session_start_time = time.monotonic()
+
+    sent_types: list[str] = []
+    wait_targets: list[tuple[str, float]] = []
+    client._ws.send = lambda data: sent_types.append(json.loads(data)["type"])
+
+    def fake_wait_for_event(expected_type: str, timeout: float = 20.0):
+        wait_targets.append((expected_type, timeout))
+        if expected_type == "session.updated":
+            client._session_updated_confirmed = True
+            return {"type": "session.updated", "session": {"id": "sess-ready"}}
+        return {"type": expected_type}
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "_wait_for_event", fake_wait_for_event)
+        client._stream_audio(b"\x00" * 3200, None, auto_create_response=False)
+
+    assert wait_targets[0] == ("session.updated", 5.0)
+    assert sent_types[0] == "input_audio_buffer.append"
+
+
 # ── audio turn tests ──────────────────────────────────────────────
 
 
