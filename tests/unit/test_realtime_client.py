@@ -317,6 +317,49 @@ def test_connect_surfaces_session_update_failure_context():
             client.connect()
 
 
+def test_session_reused_across_turns():
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+        QwenRealtimeTurn,
+        SessionState,
+    )
+
+    cfg = QwenRealtimeConfig(api_key="test-key")
+    client = QwenRealtimeClient(cfg)
+    connect_calls = {"count": 0}
+    fake_ws = MagicMock()
+    fake_ws.connected = True
+
+    def fake_connect() -> None:
+        connect_calls["count"] += 1
+        client._ws = fake_ws
+        client._connected = True
+        client._session_updated_confirmed = True
+        client._session_start_time = time.monotonic()
+        client._state = SessionState.IDLE
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "connect", fake_connect)
+        mp.setattr(client, "_stream_audio", lambda *args, **kwargs: None)
+        mp.setattr(client, "_wait_for_input_transcript", lambda timeout=10.0: "hello")
+        mp.setattr(
+            client,
+            "create_response_for_prepared_turn",
+            lambda: QwenRealtimeTurn(
+                user_transcript="hello",
+                assistant_transcript="hi",
+                assistant_audio_pcm=b"\x00",
+            ),
+        )
+
+        for _ in range(3):
+            result = client.send_audio_turn(b"\x00" * 3200)
+            assert result.success is True
+
+    assert connect_calls["count"] == 1
+
+
 # ── streaming order tests ─────────────────────────────────────────
 
 
@@ -327,6 +370,7 @@ def _capture_stream_events(
     from apps.backend.services.dashscope.realtime_client import (
         QwenRealtimeClient,
         QwenRealtimeConfig,
+        SessionState,
     )
 
     cfg = QwenRealtimeConfig(api_key="test-key", chunk_bytes=3200)
@@ -335,6 +379,7 @@ def _capture_stream_events(
     client._connected = True
     client._session_start_time = time.monotonic()
     client._session_updated_confirmed = True
+    client._state = SessionState.IDLE
 
     event_types: list[str] = []
     client._ws.send = lambda data: event_types.append(json.loads(data)["type"])
@@ -365,6 +410,7 @@ def test_stream_audio_image_field_is_raw_base64():
     from apps.backend.services.dashscope.realtime_client import (
         QwenRealtimeClient,
         QwenRealtimeConfig,
+        SessionState,
     )
 
     config = QwenRealtimeConfig(
@@ -376,6 +422,7 @@ def test_stream_audio_image_field_is_raw_base64():
     client._connected = True
     client._session_start_time = time.monotonic()
     client._session_updated_confirmed = True
+    client._state = SessionState.IDLE
 
     sent_events: list[dict[str, Any]] = []
     client._ws.send = lambda data: sent_events.append(json.loads(data))
@@ -399,6 +446,121 @@ def test_stream_audio_image_field_is_raw_base64():
     val = image_events[0]["image"]
     assert not val.startswith("data:"), f"Expected raw base64, got: {val[:60]}"
     assert val == fake_b64, "Base64 payload must be unchanged"
+
+
+def test_transcript_timeout_does_not_block_audio(caplog):
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+        SessionState,
+    )
+
+    audio_b64 = base64.b64encode(b"\x01\x02").decode("utf-8")
+    client = QwenRealtimeClient(QwenRealtimeConfig(api_key="test-key"))
+    client._ws = MagicMock()
+    client._connected = True
+    client._session_start_time = time.monotonic()
+    client._session_updated_confirmed = True
+    client._state = SessionState.IDLE
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "_stream_audio", lambda *args, **kwargs: None)
+        chunks: list[bytes] = []
+        ws_events = iter(
+            [
+                {"type": "response.audio.delta", "delta": audio_b64},
+                {
+                    "type": "response.done",
+                    "response": {"status": "completed", "usage": {}},
+                },
+            ]
+        )
+        mp.setattr(client, "_recv_ws_event", lambda timeout=None: next(ws_events))
+        transcript = client.prepare_audio_turn(b"\x00" * 3200, None)
+        result = client.create_response_for_prepared_turn_streaming(chunks.append)
+
+    assert transcript is None
+    assert "input_audio_transcription.completed not received in 3s" in caplog.text
+    assert chunks == [b"\x01\x02"]
+    assert result.success is True
+
+
+def test_transcript_received_before_audio():
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+        SessionState,
+    )
+
+    audio_b64 = base64.b64encode(b"\x03\x04").decode("utf-8")
+    client = QwenRealtimeClient(QwenRealtimeConfig(api_key="test-key"))
+    client._ws = MagicMock()
+    client._connected = True
+    client._session_start_time = time.monotonic()
+    client._session_updated_confirmed = True
+    client._state = SessionState.IDLE
+
+    transcript_events = iter(
+        [
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": "hello",
+            }
+        ]
+    )
+    response_events = iter(
+        [
+            {"type": "response.audio.delta", "delta": audio_b64},
+            {"type": "response.done", "response": {"status": "completed", "usage": {}}},
+        ]
+    )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "_stream_audio", lambda *args, **kwargs: None)
+        mp.setattr(
+            client, "_recv_ws_event", lambda timeout=None: next(transcript_events)
+        )
+        transcript = client.prepare_audio_turn(b"\x00" * 3200, None)
+        mp.setattr(client, "_recv_ws_event", lambda timeout=None: next(response_events))
+        chunks: list[bytes] = []
+        result = client.create_response_for_prepared_turn_streaming(chunks.append)
+
+    assert transcript == "hello"
+    assert chunks == [b"\x03\x04"]
+    assert result.success is True
+
+
+def test_buffered_events_drain_after_transcript_resolves():
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+        SessionState,
+    )
+
+    audio_bytes = b"\x05\x06"
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    client = QwenRealtimeClient(QwenRealtimeConfig(api_key="test-key"))
+    client._ws = MagicMock()
+    client._connected = True
+    client._session_start_time = time.monotonic()
+    client._session_updated_confirmed = True
+    client._state = SessionState.IDLE
+    client._buffered_events.append({"type": "response.audio.delta", "delta": audio_b64})
+
+    response_events = iter(
+        [
+            {"type": "response.done", "response": {"status": "completed", "usage": {}}},
+        ]
+    )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "_recv_ws_event", lambda timeout=None: next(response_events))
+        chunks: list[bytes] = []
+        result = client.create_response_for_prepared_turn_streaming(chunks.append)
+
+    assert chunks == [audio_bytes]
+    assert list(client._buffered_events) == []
+    assert result.success is True
 
 
 def test_commit_sent_after_all_audio():

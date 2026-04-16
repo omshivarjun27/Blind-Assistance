@@ -333,6 +333,11 @@ async def realtime_endpoint(ws: WebSocket) -> None:
             memory_context=startup_ctx,
         )
         config.instructions = default_instructions
+    try:
+        await client.async_connect()
+    except Exception as exc:
+        await _send_upstream_error(ws, str(exc), config)
+        return
     pending_image_b64: str | None = None
     pending_instructions: str | None = None
     _scene_described_once: bool = False
@@ -374,7 +379,28 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 route_image_b64 = pending_image_b64
                 session_memory_recorded = False
                 scene_fallback_this_turn = False
-                current_user_transcript = ""
+                current_user_transcript: str | None = ""
+
+                turn_connect_started = time.monotonic()
+                if not client.is_connected():
+                    logger.warning("DashScope session dropped — reconnecting")
+                    try:
+                        await client.async_connect()
+                    except Exception as exc:
+                        await _send_upstream_error(ws, str(exc), config)
+                        break
+                elif client.needs_reconnect():
+                    logger.info("DashScope session expiring — reconnecting")
+                    try:
+                        await client.async_reconnect()
+                    except Exception as exc:
+                        await _send_upstream_error(ws, str(exc), config)
+                        break
+                else:
+                    logger.info(
+                        "Reusing existing DashScope session — turn latency: %dms",
+                        int((time.monotonic() - turn_connect_started) * 1000),
+                    )
 
                 try:
                     current_user_transcript = await client.async_prepare_audio_turn(
@@ -385,23 +411,30 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     await _send_upstream_error(ws, str(exc), config)
                     break
 
-                _cleaned = build_memory_fact(current_user_transcript)
-                _silence_like = _is_effective_silence(current_user_transcript)
+                transcript_for_routing = current_user_transcript or ""
+                transcript_missing = current_user_transcript is None
+                _cleaned = build_memory_fact(transcript_for_routing)
+                _silence_like = _is_effective_silence(transcript_for_routing)
                 _is_memory_save = (
-                    bool(current_user_transcript.strip())
+                    bool(transcript_for_routing.strip())
                     and not _silence_like
-                    and (_cleaned != current_user_transcript.strip())
+                    and (_cleaned != transcript_for_routing.strip())
                 )
                 _is_memory_recall = bool(
-                    current_user_transcript.strip() and not _silence_like
-                ) and _is_memory_query(current_user_transcript)
+                    transcript_for_routing.strip() and not _silence_like
+                ) and _is_memory_query(transcript_for_routing)
 
                 if _is_memory_save:
                     predicted_intent = IntentCategory.MEMORY_SAVE
                 elif _is_memory_recall:
                     predicted_intent = IntentCategory.MEMORY_RECALL
-                elif current_user_transcript.strip() and not _silence_like:
-                    clf_result = await classifier.classify(current_user_transcript)
+                elif transcript_missing:
+                    logger.warning(
+                        "Transcript unavailable before response start — routing as GENERAL_CHAT"
+                    )
+                    predicted_intent = IntentCategory.GENERAL_CHAT
+                elif transcript_for_routing.strip() and not _silence_like:
+                    clf_result = await classifier.classify(transcript_for_routing)
                     predicted_intent = clf_result.intent
                 elif route_image_b64 and not _scene_described_once:
                     predicted_intent = IntentCategory.SCENE_DESCRIBE
@@ -500,7 +533,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                                     f"{vision_result.text}"
                                 )
                                 session_memory.add_turn(
-                                    user_transcript=current_user_transcript,
+                                    user_transcript=current_user_transcript or "",
                                     assistant_response=vision_result.text,
                                     vision_objects=[
                                         f"Object/text seen: {vision_result.text[:120]}"
@@ -591,10 +624,10 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 _last_response_complete_at = time.monotonic()
 
                 if not result.user_transcript:
-                    result.user_transcript = current_user_transcript
+                    result.user_transcript = current_user_transcript or ""
 
                 current_user_transcript = (
-                    result.user_transcript or current_user_transcript
+                    result.user_transcript or current_user_transcript or ""
                 )
                 if current_user_transcript and not _is_memory_query(
                     current_user_transcript

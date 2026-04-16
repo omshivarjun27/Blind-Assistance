@@ -26,6 +26,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable, Optional
 
 import websocket
@@ -35,6 +36,14 @@ logger = logging.getLogger("qwen-realtime-client")
 # Session safety margin: reconnect at 110 min (before 120 min expiry)
 _SESSION_MAX_LIFETIME_S = 110 * 60
 _SESSION_UPDATED_TIMEOUT_S = 5.0
+
+
+class SessionState(str, Enum):
+    DISCONNECTED = "disconnected"
+    CONNECTING = "connecting"
+    READY = "ready"
+    STREAMING = "streaming"
+    IDLE = "idle"
 
 
 def _default_realtime_model() -> str:
@@ -151,11 +160,14 @@ class QwenRealtimeClient:
         self._session_updated_confirmed: bool = False
         self._session_update_sent_at: Optional[float] = None
         self._buffered_events: deque[dict[str, Any]] = deque()
+        self._state: SessionState = SessionState.DISCONNECTED
+        self._turn_started_at: Optional[float] = None
 
     # ── connection lifecycle ──────────────────────────────────
 
     def connect(self) -> None:
         """Open WebSocket, configure session, wait until ready."""
+        self._state = SessionState.CONNECTING
         url = f"{self._config.endpoint}?model={self._config.model}"
         headers = [f"Authorization: Bearer {self._config.api_key}"]
         logger.info(
@@ -182,6 +194,7 @@ class QwenRealtimeClient:
                 ) from exc
             self._connected = True
             self._session_start_time = time.monotonic()
+            self._state = SessionState.IDLE
             logger.info(
                 "Realtime session ready: voice=%s model=%s session_id=%s",
                 self._config.voice,
@@ -207,7 +220,18 @@ class QwenRealtimeClient:
         self._session_updated_confirmed = False
         self._session_update_sent_at = None
         self._buffered_events.clear()
+        self._state = SessionState.DISCONNECTED
         logger.info("Realtime session closed")
+
+    def is_connected(self) -> bool:
+        """True when websocket transport is alive and session is usable."""
+        ws = self._ws
+        return bool(
+            self._connected
+            and ws is not None
+            and getattr(ws, "connected", False)
+            and self._state is not SessionState.DISCONNECTED
+        )
 
     def needs_reconnect(self) -> bool:
         """True when session is near the 120-minute lifetime limit."""
@@ -224,12 +248,20 @@ class QwenRealtimeClient:
 
     def ensure_connected(self) -> None:
         """Connect if not connected; reconnect if near expiry."""
-        if not self._connected or self._ws is None:
+        if not self.is_connected():
             self.connect()
         elif self.needs_reconnect():
             self.reconnect()
         elif not self._session_updated_confirmed:
             self._wait_for_session_updated(timeout=_SESSION_UPDATED_TIMEOUT_S)
+
+    async def async_connect(self) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.connect)
+
+    async def async_reconnect(self) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.reconnect)
 
     # ── main turn ─────────────────────────────────────────────
 
@@ -258,7 +290,7 @@ class QwenRealtimeClient:
             user_transcript = self.prepare_audio_turn(audio_pcm, image_jpeg_b64)
             response = self.create_response_for_prepared_turn()
             if not response.user_transcript:
-                response.user_transcript = user_transcript
+                response.user_transcript = user_transcript or ""
             result = response
         except Exception as exc:
             logger.error("Realtime turn failed: %s", exc)
@@ -293,17 +325,17 @@ class QwenRealtimeClient:
         self,
         audio_pcm: bytes,
         image_jpeg_b64: Optional[str] = None,
-    ) -> str:
+    ) -> str | None:
         """Stream a turn, commit it, and wait for the input transcript."""
         self.ensure_connected()
         self._stream_audio(audio_pcm, image_jpeg_b64, auto_create_response=False)
-        return self._wait_for_input_transcript(timeout=10.0)
+        return self._wait_for_input_transcript(timeout=3.0)
 
     async def async_prepare_audio_turn(
         self,
         audio_pcm: bytes,
         image_jpeg_b64: Optional[str] = None,
-    ) -> str:
+    ) -> str | None:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
@@ -328,7 +360,11 @@ class QwenRealtimeClient:
         """Create a response for already-committed input and collect output."""
         self.ensure_connected()
         result = QwenRealtimeTurn()
-        self._send_event({"type": "response.create"})
+        if not any(
+            (event.get("type", "")).startswith("response.")
+            for event in self._buffered_events
+        ):
+            self._send_event({"type": "response.create"})
         self._response_active = True
         self._collect_response(result)
         return result
@@ -340,7 +376,11 @@ class QwenRealtimeClient:
         """Create a response and forward audio deltas immediately."""
         self.ensure_connected()
         result = QwenRealtimeTurn()
-        self._send_event({"type": "response.create"})
+        if not any(
+            (event.get("type", "")).startswith("response.")
+            for event in self._buffered_events
+        ):
+            self._send_event({"type": "response.create"})
         self._response_active = True
         self._collect_response(result, on_audio_chunk=on_audio_chunk)
         return result
@@ -464,6 +504,14 @@ class QwenRealtimeClient:
                     expected_type,
                 )
                 continue
+            if expected_type == "input_audio_buffer.committed":
+                self._buffer_event(event)
+                logger.debug(
+                    "Buffering event type=%s while waiting for %s",
+                    t,
+                    expected_type,
+                )
+                continue
             logger.debug(
                 "Skipping event type=%s while waiting for %s",
                 t,
@@ -495,7 +543,7 @@ class QwenRealtimeClient:
             }
         )
 
-    def _wait_for_input_transcript(self, timeout: float = 10.0) -> str:
+    def _wait_for_input_transcript(self, timeout: float = 3.0) -> str | None:
         """Wait for current-turn transcription before creating a response."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -511,22 +559,29 @@ class QwenRealtimeClient:
             event_type = event.get("type", "")
             if event_type == "conversation.item.input_audio_transcription.completed":
                 transcript = event.get("transcript", "")
-                return transcript if isinstance(transcript, str) else ""
+                text = transcript if isinstance(transcript, str) else ""
+                logger.info(
+                    'input_audio_transcription.completed received — transcript: "%s"',
+                    text,
+                )
+                return text
             if event_type == "error":
                 raise RuntimeError(f"Server error waiting for transcript: {event}")
             if event_type.startswith("response."):
                 self._buffer_event(event)
-                logger.debug(
-                    "Buffering event type=%s while waiting for transcript",
-                    event_type,
+                logger.warning(
+                    "input_audio_transcription.completed not received in 3s — continuing without transcript"
                 )
-                continue
+                return None
 
             logger.debug(
                 "Skipping event type=%s while waiting for transcript", event_type
             )
 
-        return ""
+        logger.warning(
+            "input_audio_transcription.completed not received in 3s — continuing without transcript"
+        )
+        return None
 
     def _stream_audio(
         self,
@@ -536,6 +591,8 @@ class QwenRealtimeClient:
     ) -> None:
         """Stream PCM chunks and optional image, then commit."""
         self.ensure_connected()
+        self._state = SessionState.STREAMING
+        self._turn_started_at = time.monotonic()
         chunk = self._config.chunk_bytes
         image_sent = False
 
@@ -573,6 +630,7 @@ class QwenRealtimeClient:
             len(pcm_bytes),
             "yes" if image_jpeg_b64 else "no",
         )
+        self._state = SessionState.READY
 
     def _collect_response(
         self,
@@ -585,6 +643,7 @@ class QwenRealtimeClient:
         deadline = time.monotonic() + self._config.response_timeout_s
         saw_response_done = False
         saw_response_cancelled = False
+        first_audio_delta_logged = False
 
         while time.monotonic() < deadline:
             remaining = max(0.5, deadline - time.monotonic())
@@ -616,6 +675,15 @@ class QwenRealtimeClient:
                 delta = event.get("delta")
                 if isinstance(delta, str):
                     delta_bytes = base64.b64decode(delta)
+                    if (
+                        not first_audio_delta_logged
+                        and self._turn_started_at is not None
+                    ):
+                        logger.info(
+                            "first audio delta received — turn latency: %dms",
+                            int((time.monotonic() - self._turn_started_at) * 1000),
+                        )
+                        first_audio_delta_logged = True
                     if on_audio_chunk is not None:
                         on_audio_chunk(delta_bytes)
                     else:
@@ -628,12 +696,14 @@ class QwenRealtimeClient:
                 logger.info("Response cancelled by DashScope")
                 saw_response_cancelled = True
                 self._response_active = False
+                self._state = SessionState.IDLE
                 result.error = None
                 break
 
             elif t == "response.done":
                 saw_response_done = True
                 self._response_active = False
+                self._state = SessionState.IDLE
                 response = event.get("response", {})
                 if isinstance(response, dict):
                     usage = response.get("usage", {})
@@ -659,8 +729,10 @@ class QwenRealtimeClient:
         ):
             result.error = "Response ended before response.done"
             self._response_active = False
+            self._state = SessionState.IDLE
 
         result.assistant_audio_pcm = bytes(audio_chunks)
+        self._turn_started_at = None
         logger.info(
             "Turn complete: transcript=%d chars audio=%d bytes",
             len(result.assistant_transcript),

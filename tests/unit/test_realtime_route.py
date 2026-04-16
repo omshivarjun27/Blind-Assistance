@@ -79,6 +79,10 @@ def _mock_client(turn: Any):
     client.async_create_response_for_prepared_turn_streaming = AsyncMock(
         side_effect=[_clone_mock_turn(t) for t in turns]
     )
+    client.async_connect = AsyncMock(return_value=None)
+    client.async_reconnect = AsyncMock(return_value=None)
+    client.is_connected = MagicMock(return_value=True)
+    client.needs_reconnect = MagicMock(return_value=False)
     client.close = MagicMock()
     return client
 
@@ -88,6 +92,7 @@ def test_session_updated_before_audio_stream():
     from apps.backend.services.dashscope.realtime_client import (
         QwenRealtimeClient,
         QwenRealtimeConfig,
+        SessionState,
     )
 
     client = QwenRealtimeClient(QwenRealtimeConfig(api_key="test-key"))
@@ -95,6 +100,7 @@ def test_session_updated_before_audio_stream():
     client._ws = MagicMock()
     client._session_updated_confirmed = False
     client._session_start_time = time.monotonic()
+    client._state = SessionState.IDLE
 
     sent_types: list[str] = []
     wait_targets: list[tuple[str, float]] = []
@@ -113,6 +119,31 @@ def test_session_updated_before_audio_stream():
 
     assert wait_targets[0] == ("session.updated", 5.0)
     assert sent_types[0] == "input_audio_buffer.append"
+
+
+def test_first_audio_ms_not_null():
+    """A turn must still produce assistant audio even when transcript is unavailable."""
+    turn = _make_mock_turn(audio=b"\x01\x02" * 40, assistant_text="hello", user_text="")
+    mock_client = _mock_client(turn)
+    mock_client.async_prepare_audio_turn = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                response = ws.receive_bytes()
+
+    assert response == turn.assistant_audio_pcm
+    assert len(response) > 0
 
 
 # ── audio turn tests ──────────────────────────────────────────────
@@ -139,6 +170,40 @@ def test_websocket_audio_returns_binary_response():
                 response = ws.receive_bytes()
                 assert response == turn.assistant_audio_pcm
                 assert len(response) > 0
+
+
+def test_client_created_once_per_user_session():
+    """One user websocket session must construct one DashScope client."""
+    turns = [
+        _make_mock_turn(audio=b"\x01\x02" * 10, assistant_text="one", user_text="one"),
+        _make_mock_turn(audio=b"\x01\x02" * 10, assistant_text="two", user_text="two"),
+        _make_mock_turn(
+            audio=b"\x01\x02" * 10, assistant_text="three", user_text="three"
+        ),
+    ]
+    mock_client = _mock_client(turns)
+    mock_ctor = MagicMock(return_value=mock_client)
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            mock_ctor,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                for _ in range(3):
+                    ws.send_bytes(b"\x00" * 3200)
+                    _ = ws.receive_bytes()
+                    _ = ws.receive_text()
+                    _ = ws.receive_text()
+
+    assert mock_ctor.call_count == 1
+    mock_client.async_connect.assert_awaited_once()
 
 
 def test_websocket_returns_assistant_transcript_json():
@@ -280,9 +345,12 @@ def test_websocket_image_first_turn_defaults_to_scene_describe():
 
 def test_websocket_ping_returns_pong():
     """Ping control message must receive a pong response."""
+    mock_client = _mock_client(_make_mock_turn())
+
     with (
         patch(
             "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
         ),
         patch(
             "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
@@ -350,6 +418,10 @@ def test_websocket_upstream_exception_returns_structured_error():
             "session_id=sess_123: Access denied."
         )
     )
+    mock_client.async_connect = AsyncMock(return_value=None)
+    mock_client.async_reconnect = AsyncMock(return_value=None)
+    mock_client.is_connected = MagicMock(return_value=True)
+    mock_client.needs_reconnect = MagicMock(return_value=False)
     mock_client.async_update_instructions = AsyncMock()
     mock_client.async_create_response_for_prepared_turn = AsyncMock()
     mock_client.close = MagicMock()
@@ -510,6 +582,10 @@ def test_websocket_current_turn_read_text_routes_to_heavy_vision():
 def test_websocket_disconnect_closes_client():
     """Disconnect must call client.close() without raising."""
     mock_client = MagicMock()
+    mock_client.async_connect = AsyncMock(return_value=None)
+    mock_client.async_reconnect = AsyncMock(return_value=None)
+    mock_client.is_connected = MagicMock(return_value=True)
+    mock_client.needs_reconnect = MagicMock(return_value=False)
     mock_client.async_prepare_audio_turn = AsyncMock()
     mock_client.async_update_instructions = AsyncMock()
     mock_client.async_create_response_for_prepared_turn = AsyncMock()
