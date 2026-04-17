@@ -398,10 +398,14 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     except Exception as exc:
                         await _send_upstream_error(ws, str(exc), config)
                         break
-                elif client.needs_reconnect():
-                    logger.info("DashScope session expiring — reconnecting")
+                elif client.session_needs_reconnect():
+                    logger.info("DashScope session expiring — reconnecting before turn")
                     try:
                         await client.async_reconnect()
+                        logger.info(
+                            "DashScope session reconnected — session.updated confirmed in %dms",
+                            client._last_session_updated_elapsed_ms,
+                        )
                     except Exception as exc:
                         await _send_upstream_error(ws, str(exc), config)
                         break

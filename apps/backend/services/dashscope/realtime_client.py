@@ -155,6 +155,7 @@ class QwenRealtimeClient:
         self._ws: Optional[websocket.WebSocket] = None
         self._connected: bool = False
         self._session_start_time: Optional[float] = None
+        self._session_started_at: Optional[float] = None
         self._session_id: Optional[str] = None
         self._response_active: bool = False
         self._session_updated_confirmed: bool = False
@@ -162,6 +163,7 @@ class QwenRealtimeClient:
         self._buffered_events: deque[dict[str, Any]] = deque()
         self._state: SessionState = SessionState.DISCONNECTED
         self._turn_started_at: Optional[float] = None
+        self._last_session_updated_elapsed_ms: int = 0
 
     # ── connection lifecycle ──────────────────────────────────
 
@@ -194,6 +196,7 @@ class QwenRealtimeClient:
                 ) from exc
             self._connected = True
             self._session_start_time = time.monotonic()
+            self._session_started_at = self._session_start_time
             self._state = SessionState.IDLE
             logger.info(
                 "Realtime session ready: voice=%s model=%s session_id=%s",
@@ -217,6 +220,8 @@ class QwenRealtimeClient:
             self._ws = None
         self._connected = False
         self._response_active = False
+        self._session_start_time = None
+        self._session_started_at = None
         self._session_updated_confirmed = False
         self._session_update_sent_at = None
         self._buffered_events.clear()
@@ -233,16 +238,27 @@ class QwenRealtimeClient:
             and self._state is not SessionState.DISCONNECTED
         )
 
-    def needs_reconnect(self) -> bool:
+    def session_needs_reconnect(self) -> bool:
         """True when session is near the 120-minute lifetime limit."""
-        if self._session_start_time is None:
+        if self._session_started_at is None:
             return True
-        elapsed = time.monotonic() - self._session_start_time
+        elapsed = time.monotonic() - self._session_started_at
+        logger.info(
+            "DashScope session age: %.1fmin — reconnect threshold: 110min",
+            elapsed / 60.0,
+        )
         return elapsed >= _SESSION_MAX_LIFETIME_S
+
+    def needs_reconnect(self) -> bool:
+        """Backward-compatible alias for expiry checks."""
+        return self.session_needs_reconnect()
 
     def reconnect(self) -> None:
         """Full reconnect — new session, context NOT preserved."""
         logger.info("Reconnecting realtime session (new session)")
+        self._session_updated_confirmed = False
+        self._session_update_sent_at = None
+        self._buffered_events.clear()
         self.close()
         self.connect()
 
@@ -250,7 +266,7 @@ class QwenRealtimeClient:
         """Connect if not connected; reconnect if near expiry."""
         if not self.is_connected():
             self.connect()
-        elif self.needs_reconnect():
+        elif self.session_needs_reconnect():
             self.reconnect()
         elif not self._session_updated_confirmed:
             self._wait_for_session_updated(timeout=_SESSION_UPDATED_TIMEOUT_S)
@@ -474,6 +490,7 @@ class QwenRealtimeClient:
         self._session_id = self._extract_session_id(updated_event) or self._session_id
         self._session_updated_confirmed = True
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
+        self._last_session_updated_elapsed_ms = elapsed_ms
         logger.info(
             "session.updated confirmed in %dms — safe to stream audio",
             elapsed_ms,

@@ -6,6 +6,7 @@ All tests use mocks only — no real network calls.
 from __future__ import annotations
 
 import base64
+from collections import deque
 import json
 import os
 import time
@@ -337,6 +338,7 @@ def test_session_reused_across_turns():
         client._connected = True
         client._session_updated_confirmed = True
         client._session_start_time = time.monotonic()
+        client._session_started_at = client._session_start_time
         client._state = SessionState.IDLE
 
     with pytest.MonkeyPatch.context() as mp:
@@ -378,6 +380,7 @@ def _capture_stream_events(
     client._ws = MagicMock()
     client._connected = True
     client._session_start_time = time.monotonic()
+    client._session_started_at = client._session_start_time
     client._session_updated_confirmed = True
     client._state = SessionState.IDLE
 
@@ -421,6 +424,7 @@ def test_stream_audio_image_field_is_raw_base64():
     client._ws = MagicMock()
     client._connected = True
     client._session_start_time = time.monotonic()
+    client._session_started_at = client._session_start_time
     client._session_updated_confirmed = True
     client._state = SessionState.IDLE
 
@@ -460,6 +464,7 @@ def test_transcript_timeout_does_not_block_audio(caplog):
     client._ws = MagicMock()
     client._connected = True
     client._session_start_time = time.monotonic()
+    client._session_started_at = client._session_start_time
     client._session_updated_confirmed = True
     client._state = SessionState.IDLE
 
@@ -497,6 +502,7 @@ def test_transcript_received_before_audio():
     client._ws = MagicMock()
     client._connected = True
     client._session_start_time = time.monotonic()
+    client._session_started_at = client._session_start_time
     client._session_updated_confirmed = True
     client._state = SessionState.IDLE
 
@@ -543,6 +549,7 @@ def test_buffered_events_drain_after_transcript_resolves():
     client._ws = MagicMock()
     client._connected = True
     client._session_start_time = time.monotonic()
+    client._session_started_at = client._session_start_time
     client._session_updated_confirmed = True
     client._state = SessionState.IDLE
     client._buffered_events.append({"type": "response.audio.delta", "delta": audio_b64})
@@ -597,6 +604,7 @@ def test_needs_reconnect_false_on_fresh_session():
     client._connected = True
     client._ws = MagicMock()
     client._session_start_time = time.monotonic()
+    client._session_started_at = client._session_start_time
     assert client.needs_reconnect() is False
 
 
@@ -612,7 +620,63 @@ def test_needs_reconnect_true_after_110_minutes():
     client._connected = True
     client._ws = MagicMock()
     client._session_start_time = time.monotonic() - _SESSION_MAX_LIFETIME_S - 1
+    client._session_started_at = client._session_start_time
     assert client.needs_reconnect() is True
+
+
+def test_session_not_expired_before_threshold():
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+    )
+
+    cfg = QwenRealtimeConfig(api_key="test-key")
+    client = QwenRealtimeClient(cfg)
+    client._session_started_at = time.monotonic() - (109 * 60)
+    assert client.session_needs_reconnect() is False
+
+
+@pytest.mark.asyncio
+async def test_session_expiry_resets_state_and_reconnects():
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+        SessionState,
+    )
+
+    cfg = QwenRealtimeConfig(api_key="test-key")
+    client = QwenRealtimeClient(cfg)
+    client._connected = True
+    client._ws = MagicMock()
+    client._ws.connected = True
+    client._session_start_time = time.monotonic() - (111 * 60)
+    client._session_started_at = client._session_start_time
+    client._session_updated_confirmed = True
+    client._session_update_sent_at = 123.0
+    client._buffered_events.append({"type": "response.audio.delta", "delta": "AAAA"})
+    client._state = SessionState.IDLE
+
+    connect_calls = {"count": 0}
+
+    def fake_connect() -> None:
+        connect_calls["count"] += 1
+        client._session_updated_confirmed = True
+        client._session_update_sent_at = 456.0
+        client._connected = True
+        client._ws = MagicMock()
+        client._ws.connected = True
+        client._session_start_time = time.monotonic()
+        client._session_started_at = client._session_start_time
+        client._state = SessionState.IDLE
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "connect", fake_connect)
+        assert client.session_needs_reconnect() is True
+        await client.async_reconnect()
+
+    assert connect_calls["count"] == 1
+    assert client._session_updated_confirmed is True
+    assert client._buffered_events == deque()
 
 
 # ── response collection tests ─────────────────────────────────────

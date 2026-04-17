@@ -82,7 +82,9 @@ def _mock_client(turn: Any):
     client.async_connect = AsyncMock(return_value=None)
     client.async_reconnect = AsyncMock(return_value=None)
     client.is_connected = MagicMock(return_value=True)
+    client.session_needs_reconnect = MagicMock(return_value=False)
     client.needs_reconnect = MagicMock(return_value=False)
+    client._last_session_updated_elapsed_ms = 0
     client.close = MagicMock()
     return client
 
@@ -108,6 +110,7 @@ def test_session_updated_before_audio_stream():
     client._ws = MagicMock()
     client._session_updated_confirmed = False
     client._session_start_time = time.monotonic()
+    client._session_started_at = client._session_start_time
     client._state = SessionState.IDLE
 
     sent_types: list[str] = []
@@ -367,7 +370,7 @@ def test_turn2_classifies_normally(caplog):
         with TestClient(app) as client:
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(b"\x00" * 3200)
-                _ = ws.receive_bytes()
+                _ = _receive_until_bytes(ws)
                 _ = ws.receive_text()
                 _ = ws.receive_text()
 
@@ -442,6 +445,53 @@ def test_client_created_once_per_user_session():
 
     assert mock_ctor.call_count == 1
     mock_client.async_connect.assert_awaited_once()
+
+
+def test_reconnect_fires_before_turn_on_expiry(caplog):
+    """When session is expiring, reconnect must happen before audio starts."""
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turn = _make_mock_turn(
+        audio=b"\x01\x02" * 40, assistant_text="hello", user_text="hi"
+    )
+    mock_client = _mock_client(turn)
+    mock_client.session_needs_reconnect = MagicMock(return_value=True)
+    mock_client._last_session_updated_elapsed_ms = 123
+    order: list[str] = []
+
+    async def reconnect_side_effect():
+        order.append("reconnect")
+
+    async def streaming_side_effect(on_audio_chunk):
+        order.append("audio")
+        on_audio_chunk(turn.assistant_audio_pcm)
+        return _clone_mock_turn(turn, audio=b"")
+
+    mock_client.async_reconnect = AsyncMock(side_effect=reconnect_side_effect)
+    mock_client.async_create_response_for_prepared_turn_streaming = AsyncMock(
+        side_effect=streaming_side_effect
+    )
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+
+    assert order == ["reconnect", "audio"]
+    assert "DashScope session expiring — reconnecting before turn" in caplog.text
+    assert (
+        "DashScope session reconnected — session.updated confirmed in 123ms"
+        in caplog.text
+    )
 
 
 def test_websocket_returns_assistant_transcript_json():
