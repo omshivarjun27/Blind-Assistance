@@ -87,6 +87,14 @@ def _mock_client(turn: Any):
     return client
 
 
+def _receive_until_bytes(ws, max_messages: int = 6) -> bytes:
+    for _ in range(max_messages):
+        message = ws.receive()
+        if "bytes" in message and message["bytes"] is not None:
+            return message["bytes"]
+    raise AssertionError("Expected a binary websocket frame but none arrived")
+
+
 def test_session_updated_before_audio_stream():
     """Client must wait for session.updated ack before appending audio."""
     from apps.backend.services.dashscope.realtime_client import (
@@ -151,16 +159,24 @@ def test_audio_starts_before_intent_resolves(caplog):
     from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
 
     caplog.set_level("INFO", logger="ally-vision-realtime-route")
-    turn = _make_mock_turn(
-        audio=b"\x01\x02" * 40, assistant_text="hello", user_text="hello"
-    )
-    mock_client = _mock_client(turn)
+    turns = [
+        _make_mock_turn(
+            audio=b"\x01\x02" * 20, assistant_text="warmup", user_text="hello"
+        ),
+        _make_mock_turn(
+            audio=b"\x01\x02" * 40, assistant_text="hello", user_text="how are you"
+        ),
+    ]
+    mock_client = _mock_client(turns)
     audio_started = {"value": False}
+    stream_index = {"value": 0}
 
     async def streaming_side_effect(on_audio_chunk):
+        next_turn = turns[stream_index["value"]]
+        stream_index["value"] += 1
         audio_started["value"] = True
-        on_audio_chunk(turn.assistant_audio_pcm)
-        return _clone_mock_turn(turn, audio=b"")
+        on_audio_chunk(next_turn.assistant_audio_pcm)
+        return _clone_mock_turn(next_turn, audio=b"")
 
     async def delayed_classify(_: str):
         await asyncio.sleep(0.5)
@@ -194,14 +210,16 @@ def test_audio_starts_before_intent_resolves(caplog):
     ):
         with TestClient(app) as client:
             with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+
                 started = time.monotonic()
                 ws.send_bytes(b"\x00" * 3200)
-                response = ws.receive_bytes()
+                response = _receive_until_bytes(ws)
                 first_audio_ms = int((time.monotonic() - started) * 1000)
-                _ = ws.receive_text()
-                _ = ws.receive_text()
+                time.sleep(0.7)
 
-    assert response == turn.assistant_audio_pcm
+    assert response == turns[1].assistant_audio_pcm
     assert first_audio_ms < 500
     assert "Audio streaming started — intent not yet resolved" in caplog.text
 
@@ -209,14 +227,22 @@ def test_audio_starts_before_intent_resolves(caplog):
 def test_intent_timeout_defaults_to_general_chat(caplog):
     """A stuck classifier must time out without blocking audio bytes."""
     caplog.set_level("INFO", logger="ally-vision-realtime-route")
-    turn = _make_mock_turn(
-        audio=b"\x03\x04" * 40, assistant_text="hello", user_text="hello"
-    )
-    mock_client = _mock_client(turn)
+    turns = [
+        _make_mock_turn(
+            audio=b"\x03\x04" * 20, assistant_text="warmup", user_text="hello"
+        ),
+        _make_mock_turn(
+            audio=b"\x03\x04" * 40, assistant_text="hello", user_text="how are you"
+        ),
+    ]
+    mock_client = _mock_client(turns)
+    stream_index = {"value": 0}
 
     async def streaming_side_effect(on_audio_chunk):
-        on_audio_chunk(turn.assistant_audio_pcm)
-        return _clone_mock_turn(turn, audio=b"")
+        next_turn = turns[stream_index["value"]]
+        stream_index["value"] += 1
+        on_audio_chunk(next_turn.assistant_audio_pcm)
+        return _clone_mock_turn(next_turn, audio=b"")
 
     async def never_resolve(_: str):
         await asyncio.sleep(10)
@@ -245,16 +271,117 @@ def test_intent_timeout_defaults_to_general_chat(caplog):
     ):
         with TestClient(app) as client:
             with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+
                 started = time.monotonic()
                 ws.send_bytes(b"\x00" * 3200)
-                response = ws.receive_bytes()
+                response = _receive_until_bytes(ws)
                 first_audio_ms = int((time.monotonic() - started) * 1000)
+                time.sleep(2.3)
+
+    assert response == turns[1].assistant_audio_pcm
+    assert first_audio_ms < 500
+    assert "Intent classification timed out — defaulting to general_chat" in caplog.text
+
+
+def test_turn1_skips_classifier(caplog):
+    """Turn 1 cold start must skip classifier entirely."""
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turn = _make_mock_turn(
+        audio=b"\x05\x06" * 40, assistant_text="hello", user_text="hello"
+    )
+    mock_client = _mock_client(turn)
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock()
+    mock_classifier.close = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                response = ws.receive_bytes()
                 _ = ws.receive_text()
                 _ = ws.receive_text()
 
     assert response == turn.assistant_audio_pcm
-    assert first_audio_ms < 500
-    assert "Intent classification timed out — defaulting to general_chat" in caplog.text
+    mock_classifier.classify.assert_not_awaited()
+    assert (
+        "Intent classification skipped — no transcript (turn 0 cold start)"
+        in caplog.text
+    )
+    assert "Intent classification timed out" not in caplog.text
+
+
+def test_turn2_classifies_normally(caplog):
+    """Turn 2 should classify once after turn 1 cold-start skip."""
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turns = [
+        _make_mock_turn(
+            audio=b"\x01\x02" * 20, assistant_text="one", user_text="hello"
+        ),
+        _make_mock_turn(
+            audio=b"\x03\x04" * 20, assistant_text="two", user_text="how are you"
+        ),
+    ]
+    mock_client = _mock_client(turns)
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock(
+        return_value=ClassificationResult(
+            intent=IntentCategory.GENERAL_CHAT,
+            confidence="high",
+            raw_label="GENERAL_CHAT",
+        )
+    )
+    mock_classifier.close = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+                ws.send_bytes(b"\x00" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+    mock_classifier.classify.assert_awaited_once()
+    assert (
+        "Intent classification skipped — no transcript (turn 0 cold start)"
+        in caplog.text
+    )
+    assert "Intent classified: GENERAL_CHAT in" in caplog.text
 
 
 # ── audio turn tests ──────────────────────────────────────────────
@@ -566,7 +693,7 @@ def test_websocket_upstream_exception_returns_structured_error():
 
 
 def test_websocket_current_turn_classifier_called_for_each_spoken_turn():
-    """Current-turn routing must classify each non-memory spoken turn synchronously."""
+    """After turn 1 cold-start skip, subsequent spoken turns should classify normally."""
     from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
 
     first_turn = _make_mock_turn(assistant_text="first", user_text="describe this")
@@ -587,6 +714,7 @@ def test_websocket_current_turn_classifier_called_for_each_spoken_turn():
             ),
         ]
     )
+    mock_classifier.close = AsyncMock(return_value=None)
     mock_config = MagicMock()
 
     with (
@@ -615,7 +743,7 @@ def test_websocket_current_turn_classifier_called_for_each_spoken_turn():
                 _ = ws.receive_text()
                 _ = ws.receive_text()
 
-    assert mock_classifier.classify.await_count == 2
+    assert mock_classifier.classify.await_count == 1
     mock_client.async_prepare_audio_turn.assert_awaited()
     mock_client.async_create_response_for_prepared_turn_streaming.assert_awaited()
 
@@ -839,10 +967,13 @@ def test_classifier_memory_write_route_calls_memory_manager():
     """A current-turn MEMORY_WRITE prediction must call memory_manager.save."""
     from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
 
-    first_turn = _make_mock_turn(
-        assistant_text="first", user_text="keep in mind that my name is Om"
-    )
-    mock_client = _mock_client(first_turn)
+    turns = [
+        _make_mock_turn(assistant_text="warmup", user_text="hello"),
+        _make_mock_turn(
+            assistant_text="first", user_text="keep in mind that my name is Om"
+        ),
+    ]
+    mock_client = _mock_client(turns)
     mock_classifier = MagicMock()
     mock_classifier.classify = AsyncMock(
         return_value=ClassificationResult(
@@ -851,6 +982,7 @@ def test_classifier_memory_write_route_calls_memory_manager():
             raw_label="MEMORY_SAVE",
         )
     )
+    mock_classifier.close = AsyncMock(return_value=None)
     mock_memory_manager = MagicMock()
     mock_memory_manager.store.initialize = AsyncMock()
     mock_memory_manager.save = AsyncMock(return_value="my name is Om")
@@ -881,6 +1013,11 @@ def test_classifier_memory_write_route_calls_memory_manager():
                 _ = ws.receive_text()
                 _ = ws.receive_text()
 
+                ws.send_bytes(b"\x00" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
     mock_memory_manager.save.assert_called_once_with(
         user_id="default",
         raw_utterance="keep in mind that my name is Om",
@@ -891,10 +1028,13 @@ def test_classifier_memory_recall_route_calls_memory_manager():
     """A current-turn MEMORY_READ prediction must call memory_manager.recall."""
     from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
 
-    first_turn = _make_mock_turn(
-        assistant_text="first", user_text="can you tell me about my doctor"
-    )
-    mock_client = _mock_client(first_turn)
+    turns = [
+        _make_mock_turn(assistant_text="warmup", user_text="hello"),
+        _make_mock_turn(
+            assistant_text="first", user_text="can you tell me about my doctor"
+        ),
+    ]
+    mock_client = _mock_client(turns)
     mock_classifier = MagicMock()
     mock_classifier.classify = AsyncMock(
         return_value=ClassificationResult(
@@ -903,6 +1043,7 @@ def test_classifier_memory_recall_route_calls_memory_manager():
             raw_label="MEMORY_RECALL",
         )
     )
+    mock_classifier.close = AsyncMock(return_value=None)
     mock_memory_manager = MagicMock()
     mock_memory_manager.store.initialize = AsyncMock()
     mock_memory_manager.save = AsyncMock(return_value="")
@@ -928,6 +1069,11 @@ def test_classifier_memory_recall_route_calls_memory_manager():
     ):
         with TestClient(app) as client:
             with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = ws.receive_bytes()
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
                 ws.send_bytes(b"\x00" * 3200)
                 _ = ws.receive_bytes()
                 _ = ws.receive_text()

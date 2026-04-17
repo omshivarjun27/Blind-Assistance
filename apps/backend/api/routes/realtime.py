@@ -344,6 +344,8 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     _last_instructions: str = default_instructions
     _turns_since_corr: int = 0
     _last_response_complete_at: float = 0.0
+    _turn_index: int = 0
+    _last_transcript: str = ""
 
     try:
         while True:
@@ -372,6 +374,9 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     continue
 
                 effective_instructions = pending_instructions or _last_instructions
+                current_turn_index = _turn_index
+                _turn_index += 1
+                prior_transcript = _last_transcript.strip()
                 predicted_target = RouteTarget.REALTIME_CHAT
                 applied_target = RouteTarget.REALTIME_CHAT
                 predicted_intent: IntentCategory | None = None
@@ -416,7 +421,6 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     break
 
                 transcript_for_routing = current_user_transcript or ""
-                transcript_missing = current_user_transcript is None
                 _cleaned = build_memory_fact(transcript_for_routing)
                 _silence_like = _is_effective_silence(transcript_for_routing)
                 _is_memory_save = (
@@ -439,32 +443,31 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 ):
                     clf_result = await classifier.classify(transcript_for_routing)
                     predicted_intent = clf_result.intent
-                elif transcript_missing:
-                    logger.warning(
-                        "Transcript unavailable before response start — routing as GENERAL_CHAT"
+                elif not prior_transcript or len(prior_transcript) < 3:
+                    _last_transcript = ""
+                    logger.info(
+                        "Intent classification skipped — no transcript (turn %d cold start)",
+                        current_turn_index,
                     )
-                    predicted_intent = IntentCategory.GENERAL_CHAT
-                    classification_deferred = True
-                elif transcript_for_routing.strip() and not _silence_like:
+                    if route_image_b64 and not _scene_described_once:
+                        predicted_intent = IntentCategory.SCENE_DESCRIBE
+                        _scene_described_once = True
+                        scene_fallback_this_turn = True
+                        logger.debug(
+                            "No transcript yet, image present → SCENE_DESCRIBE"
+                        )
+                    else:
+                        predicted_intent = IntentCategory.GENERAL_CHAT
+                        effective_instructions = default_instructions
+                else:
                     intent_started_at = time.monotonic()
                     logger.info("Intent classification started — background task fired")
                     intent_task = _asyncio.create_task(
-                        classifier.classify(transcript_for_routing)
+                        classifier.classify(prior_transcript)
                     )
                     predicted_intent = IntentCategory.GENERAL_CHAT
                     effective_instructions = default_instructions
                     classification_deferred = True
-                elif route_image_b64 and not _scene_described_once:
-                    predicted_intent = IntentCategory.SCENE_DESCRIBE
-                    _scene_described_once = True
-                    scene_fallback_this_turn = True
-                    logger.debug("No transcript yet, image present → SCENE_DESCRIBE")
-                else:
-                    logger.debug("Silent turn after first scene — skipping response")
-                    pending_image_b64 = None
-                    pending_instructions = None
-                    last_user_transcript = ""
-                    continue
 
                 if predicted_intent is not None:
                     decision = route(predicted_intent)
@@ -654,17 +657,8 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 current_user_transcript = (
                     result.user_transcript or current_user_transcript or ""
                 )
+                _last_transcript = current_user_transcript or ""
                 resolved_intent = predicted_intent or IntentCategory.GENERAL_CHAT
-                if (
-                    intent_task is None
-                    and classification_deferred
-                    and current_user_transcript.strip()
-                ):
-                    intent_started_at = time.monotonic()
-                    logger.info("Intent classification started — background task fired")
-                    intent_task = _asyncio.create_task(
-                        classifier.classify(current_user_transcript)
-                    )
                 if intent_task is not None:
                     try:
                         clf_result = await _asyncio.wait_for(intent_task, timeout=2.0)
