@@ -353,6 +353,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
 
             # Handle disconnect signal
             if data["type"] == "websocket.disconnect":
+                logger.info("User WebSocket disconnected — closing DashScope session")
                 break
 
             # ── binary frame: audio turn ───────────────────
@@ -644,12 +645,21 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         "Audio streaming started — intent not yet resolved (correct behavior)"
                     )
 
-                try:
-                    result = (
-                        await client.async_create_response_for_prepared_turn_streaming(
-                            _forward_audio_delta
-                        )
+                turn_task = _asyncio.create_task(
+                    client.async_create_response_for_prepared_turn_streaming(
+                        _forward_audio_delta
                     )
+                )
+
+                try:
+                    result = await turn_task
+                except (WebSocketDisconnect, _asyncio.CancelledError):
+                    turn_task.cancel()
+                    await _asyncio.gather(turn_task, return_exceptions=True)
+                    logger.info(
+                        "User WebSocket disconnected — closing DashScope session"
+                    )
+                    break
                 except Exception as exc:
                     await _send_upstream_error(ws, str(exc), config)
                     break
@@ -890,10 +900,10 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     break
 
     except WebSocketDisconnect:
-        logger.info("WebSocket client disconnected")
+        logger.info("User WebSocket disconnected — closing DashScope session")
 
     except Exception as exc:
-        logger.error("WebSocket error: %s", exc)
+        logger.error("Unhandled error in realtime route: %s", exc)
 
     finally:
         session_memory.clear()
@@ -905,7 +915,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
             await mm_client.close()
         except Exception as exc:
             logger.warning("Multimodal client close failed: %s", exc)
-        client.close()
+        await client.async_close()
         _schedule_background_task(
             offline_replay.run_replay(session_id),
             "offline_replay.run_replay",
@@ -914,4 +924,4 @@ async def realtime_endpoint(ws: WebSocket) -> None:
             offline_replay.promote_priority_memories(session_id),
             "offline_replay.promote_priority_memories",
         )
-        logger.info("WebSocket session ended, client closed")
+        logger.info("DashScope session closed — no leak")

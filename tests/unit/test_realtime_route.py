@@ -11,6 +11,7 @@ import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 import pytest
 
@@ -81,6 +82,7 @@ def _mock_client(turn: Any):
     )
     client.async_connect = AsyncMock(return_value=None)
     client.async_reconnect = AsyncMock(return_value=None)
+    client.async_close = AsyncMock(return_value=None)
     client.is_connected = MagicMock(return_value=True)
     client.session_needs_reconnect = MagicMock(return_value=False)
     client.needs_reconnect = MagicMock(return_value=False)
@@ -709,7 +711,9 @@ def test_websocket_upstream_exception_returns_structured_error():
     mock_client.async_connect = AsyncMock(return_value=None)
     mock_client.async_reconnect = AsyncMock(return_value=None)
     mock_client.is_connected = MagicMock(return_value=True)
+    mock_client.session_needs_reconnect = MagicMock(return_value=False)
     mock_client.needs_reconnect = MagicMock(return_value=False)
+    mock_client.async_close = AsyncMock(return_value=None)
     mock_client.async_update_instructions = AsyncMock()
     mock_client.async_create_response_for_prepared_turn = AsyncMock()
     mock_client.close = MagicMock()
@@ -869,18 +873,14 @@ def test_websocket_current_turn_read_text_routes_to_heavy_vision():
 
 
 def test_websocket_disconnect_closes_client():
-    """Disconnect must call client.close() without raising."""
-    mock_client = MagicMock()
-    mock_client.async_connect = AsyncMock(return_value=None)
-    mock_client.async_reconnect = AsyncMock(return_value=None)
-    mock_client.is_connected = MagicMock(return_value=True)
-    mock_client.needs_reconnect = MagicMock(return_value=False)
-    mock_client.async_prepare_audio_turn = AsyncMock()
-    mock_client.async_update_instructions = AsyncMock()
-    mock_client.async_create_response_for_prepared_turn = AsyncMock()
-    mock_client.close = MagicMock()
+    """Disconnect must call client.async_close() and emit no-leak log."""
+    mock_client = _mock_client(_make_mock_turn())
     mock_memory_manager = MagicMock()
     mock_memory_manager.store.initialize = AsyncMock()
+    mock_classifier = MagicMock()
+    mock_classifier.close = AsyncMock(return_value=None)
+    mock_mm_client = MagicMock()
+    mock_mm_client.close = AsyncMock(return_value=None)
 
     with (
         patch(
@@ -895,6 +895,14 @@ def test_websocket_disconnect_closes_client():
             "apps.backend.api.routes.realtime.MemoryManager.from_settings",
             return_value=mock_memory_manager,
         ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MultimodalClient.from_settings",
+            return_value=mock_mm_client,
+        ),
     ):
         with TestClient(app) as client:
             with client.websocket_connect("/ws/realtime") as ws:
@@ -902,10 +910,97 @@ def test_websocket_disconnect_closes_client():
                 assert json.loads(ws.receive_text())["type"] == "pong"
 
     deadline = time.time() + 1.0
-    while mock_client.close.call_count == 0 and time.time() < deadline:
+    while mock_client.async_close.await_count == 0 and time.time() < deadline:
         time.sleep(0.01)
 
-    mock_client.close.assert_called_once()
+    mock_client.async_close.assert_awaited_once()
+
+
+def test_dashscope_closed_on_unhandled_exception(caplog):
+    """Unexpected route errors must still close DashScope in finally."""
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turn = _make_mock_turn(audio=b"\x00" * 10, assistant_text="", user_text="hi")
+    mock_client = _mock_client(turn)
+    mock_client.async_prepare_audio_turn = AsyncMock(side_effect=RuntimeError("boom"))
+    mock_classifier = MagicMock()
+    mock_classifier.close = AsyncMock(return_value=None)
+    mock_mm_client = MagicMock()
+    mock_mm_client.close = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MultimodalClient.from_settings",
+            return_value=mock_mm_client,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                time.sleep(0.1)
+
+    mock_client.async_close.assert_awaited_once()
+    assert "DashScope session closed — no leak" in caplog.text
+
+
+def test_mid_turn_disconnect_cancels_stream(caplog):
+    """Mid-stream disconnect must still close DashScope without uncaught cancellation."""
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turn = _make_mock_turn(audio=b"\x00" * 10, assistant_text="", user_text="hi")
+    mock_client = _mock_client(turn)
+    mock_classifier = MagicMock()
+    mock_classifier.close = AsyncMock(return_value=None)
+    mock_mm_client = MagicMock()
+    mock_mm_client.close = AsyncMock(return_value=None)
+
+    async def midstream_disconnect(on_audio_chunk):
+        raise WebSocketDisconnect()
+
+    mock_client.async_create_response_for_prepared_turn_streaming = AsyncMock(
+        side_effect=midstream_disconnect
+    )
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MultimodalClient.from_settings",
+            return_value=mock_mm_client,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                time.sleep(0.1)
+
+    deadline = time.time() + 1.0
+    while mock_client.async_close.await_count == 0 and time.time() < deadline:
+        time.sleep(0.01)
+
+    mock_client.async_close.assert_awaited_once()
+    assert "User WebSocket disconnected — closing DashScope session" in caplog.text
+    assert "DashScope session closed — no leak" in caplog.text
 
 
 def test_mm_client_created_once_per_session():

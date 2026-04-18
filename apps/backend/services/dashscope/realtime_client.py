@@ -212,11 +212,24 @@ class QwenRealtimeClient:
 
     def close(self) -> None:
         """Close WebSocket gracefully."""
-        if self._ws:
-            try:
-                self._ws.close()
-            except Exception:
-                pass
+        ws = self._ws
+        if ws is None or not getattr(ws, "connected", False):
+            self._ws = None
+            self._connected = False
+            self._response_active = False
+            self._session_start_time = None
+            self._session_started_at = None
+            self._session_updated_confirmed = False
+            self._session_update_sent_at = None
+            self._buffered_events.clear()
+            self._state = SessionState.DISCONNECTED
+            return
+
+        try:
+            ws.close()
+        except Exception:
+            pass
+        finally:
             self._ws = None
         self._connected = False
         self._response_active = False
@@ -227,6 +240,9 @@ class QwenRealtimeClient:
         self._buffered_events.clear()
         self._state = SessionState.DISCONNECTED
         logger.info("Realtime session closed")
+
+    async def async_close(self) -> None:
+        self.close()
 
     def is_connected(self) -> bool:
         """True when websocket transport is alive and session is usable."""

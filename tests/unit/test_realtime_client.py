@@ -679,6 +679,24 @@ async def test_session_expiry_resets_state_and_reconnects():
     assert client._buffered_events == deque()
 
 
+def test_close_is_idempotent():
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+    )
+
+    client = QwenRealtimeClient(QwenRealtimeConfig(api_key="test-key"))
+    client._ws = MagicMock()
+    client._ws.connected = True
+    client._connected = True
+
+    client.close()
+    client.close()
+
+    assert client._ws is None
+    assert client._connected is False
+
+
 # ── response collection tests ─────────────────────────────────────
 
 
