@@ -373,11 +373,10 @@ def test_turn2_classifies_normally(caplog):
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(b"\x00" * 3200)
                 _ = _receive_until_bytes(ws)
-                _ = ws.receive_text()
-                _ = ws.receive_text()
+                time.sleep(0.1)
 
                 ws.send_bytes(b"\x00" * 3200)
-                _ = ws.receive_bytes()
+                _ = _receive_until_bytes(ws)
                 _ = ws.receive_text()
                 _ = ws.receive_text()
 
@@ -387,6 +386,189 @@ def test_turn2_classifies_normally(caplog):
         in caplog.text
     )
     assert "Intent classified: GENERAL_CHAT in" in caplog.text
+
+
+def test_memory_extraction_fires_on_turn_1_skip(caplog):
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turn = _make_mock_turn(
+        audio=b"\x01\x02" * 40,
+        assistant_text="My name is Om. I need help reading documents.",
+        user_text="",
+    )
+    mock_client = _mock_client(turn)
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock()
+    mock_classifier.close = AsyncMock(return_value=None)
+    scheduled_calls: list[tuple[str, str]] = []
+
+    def capture_task(coro, label):
+        frame = getattr(coro, "cr_frame", None)
+        locals_dict = frame.f_locals if frame is not None else {}
+        scheduled_calls.append((label, locals_dict.get("user_transcript", "")))
+        coro.close()
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime._schedule_background_task",
+            side_effect=capture_task,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                time.sleep(0.1)
+
+    mock_classifier.classify.assert_not_awaited()
+    assert "Intent classification skipped — no transcript (turn 0 cold start)" in caplog.text
+    assert (
+        "Memory extraction task fired — turn 0 (source: assistant_text_fallback)"
+        in caplog.text
+    )
+    assert (
+        "defer_auto_extract",
+        "My name is Om. I need help reading documents.",
+    ) in scheduled_calls
+
+
+def test_memory_extraction_fires_on_turn_2_normal(caplog):
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turns = [
+        _make_mock_turn(audio=b"\x01\x02" * 20, assistant_text="warmup", user_text="Hello"),
+        _make_mock_turn(audio=b"\x01\x02" * 40, assistant_text="Got it", user_text="I need help reading documents"),
+    ]
+    mock_client = _mock_client(turns)
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock(
+        return_value=ClassificationResult(
+            intent=IntentCategory.GENERAL_CHAT,
+            confidence="high",
+            raw_label="GENERAL_CHAT",
+        )
+    )
+    mock_classifier.close = AsyncMock(return_value=None)
+    scheduled_turns: list[tuple[str, int]] = []
+
+    def capture_task(coro, label):
+        frame = getattr(coro, "cr_frame", None)
+        locals_dict = frame.f_locals if frame is not None else {}
+        scheduled_turns.append((label, locals_dict.get("turn_index", -1)))
+        coro.close()
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime._schedule_background_task",
+            side_effect=capture_task,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                time.sleep(0.1)
+
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                time.sleep(0.1)
+
+    assert mock_classifier.classify.await_count == 1
+    assert (
+        "Memory extraction task fired — turn 1 (source: user_transcript)"
+        in caplog.text
+    )
+    assert ("defer_auto_extract", 1) in scheduled_turns
+
+
+def test_memory_extraction_skipped_on_empty_transcript(caplog):
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turn = _make_mock_turn(audio=b"\x01\x02" * 20, assistant_text="", user_text="")
+    mock_client = _mock_client(turn)
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock()
+    mock_classifier.close = AsyncMock(return_value=None)
+    scheduled_labels: list[str] = []
+
+    def capture_task(coro, label):
+        scheduled_labels.append(label)
+        coro.close()
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime._schedule_background_task",
+            side_effect=capture_task,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+
+    assert "Memory extraction skipped — no usable text (turn 0)" in caplog.text
+    assert "defer_auto_extract" not in scheduled_labels
+
+
+@pytest.mark.asyncio
+async def test_memory_extraction_timeout_does_not_block_session(caplog):
+    import apps.backend.api.routes.realtime as realtime_module
+
+    caplog.set_level("WARNING", logger="ally-vision-realtime-route")
+    mock_memory_manager = MagicMock()
+
+    async def hang(*args, **kwargs):
+        await asyncio.sleep(10)
+
+    mock_memory_manager.auto_extract_and_store = AsyncMock(side_effect=hang)
+
+    started = time.monotonic()
+    await realtime_module._defer_auto_extract(
+        mock_memory_manager,
+        "default",
+        "My name is Om",
+        "Nice to meet you",
+        0,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 6.0
+    assert "Memory extraction timed out — turn 0 skipped" in caplog.text
 
 
 # ── audio turn tests ──────────────────────────────────────────────
@@ -983,6 +1165,153 @@ def test_capture_coach_rejection_blocks_vision_model(caplog):
 
 
 def test_heavy_vision_not_called_on_general_chat():
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+
+    turns = [
+        _make_mock_turn(audio=b"\x05\x06" * 20, assistant_text="warmup", user_text="hello"),
+        _make_mock_turn(audio=b"\x05\x06" * 40, assistant_text="hello", user_text="how are you"),
+    ]
+    mock_client = _mock_client(turns)
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock(
+        return_value=ClassificationResult(
+            intent=IntentCategory.GENERAL_CHAT,
+            confidence="high",
+            raw_label="GENERAL_CHAT",
+        )
+    )
+    mock_classifier.close = AsyncMock(return_value=None)
+    mock_mm_client = MagicMock()
+    mock_mm_client.close = AsyncMock(return_value=None)
+    mock_mm_client.analyze = AsyncMock()
+
+    with (
+        patch("apps.backend.api.routes.realtime.QwenRealtimeClient", return_value=mock_client),
+        patch("apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings", return_value=MagicMock()),
+        patch("apps.backend.api.routes.realtime.IntentClassifier.from_settings", return_value=mock_classifier),
+        patch("apps.backend.api.routes.realtime.MultimodalClient.from_settings", return_value=mock_mm_client),
+        patch("apps.backend.api.routes.realtime.assess_frame_quality", return_value=(True, "")),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+                ws.send_text(json.dumps({"type": "image", "data": "image-two"}))
+                ws.send_bytes(b"\x00" * 3200)
+                response = _receive_until_bytes(ws)
+
+    assert response == turns[1].assistant_audio_pcm
+    mock_mm_client.analyze.assert_not_awaited()
+
+
+def test_heavy_vision_dispatch_on_scene_intent_gate_path(caplog):
+    from apps.backend.services.dashscope.multimodal_client import VisionResponse
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turns = [
+        _make_mock_turn(audio=b"\x01\x02" * 20, assistant_text="warmup", user_text="hello"),
+        _make_mock_turn(audio=b"\x01\x02" * 40, assistant_text="scene", user_text="what do you see"),
+    ]
+    mock_client = _mock_client(turns)
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock(
+        return_value=ClassificationResult(
+            intent=IntentCategory.SCENE_DESCRIBE,
+            confidence="high",
+            raw_label="SCENE_DESCRIBE",
+        )
+    )
+    mock_classifier.close = AsyncMock(return_value=None)
+    mock_mm_client = MagicMock()
+    mock_mm_client.close = AsyncMock(return_value=None)
+    order: list[str] = []
+
+    def coach_ok(_: str | None):
+        order.append("coach")
+        return True, ""
+
+    async def analyze_ok(req):
+        order.append("vision")
+        return VisionResponse(text="A table and a chair")
+
+    mock_mm_client.analyze = AsyncMock(side_effect=analyze_ok)
+
+    with (
+        patch("apps.backend.api.routes.realtime.QwenRealtimeClient", return_value=mock_client),
+        patch("apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings", return_value=MagicMock()),
+        patch("apps.backend.api.routes.realtime.IntentClassifier.from_settings", return_value=mock_classifier),
+        patch("apps.backend.api.routes.realtime.MultimodalClient.from_settings", return_value=mock_mm_client),
+        patch("apps.backend.api.routes.realtime.assess_frame_quality", side_effect=coach_ok),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+                ws.send_text(json.dumps({"type": "image", "data": "image-two"}))
+                ws.send_bytes(b"\x00" * 3200)
+                response = _receive_until_bytes(ws)
+
+    assert response == turns[1].assistant_audio_pcm
+    assert order == ["coach", "vision"]
+    assert "Heavy vision dispatch — intent: SCENE_DESCRIPTION" in caplog.text
+    assert "CaptureCoach: frame accepted" in caplog.text
+    assert "Vision model response received" in caplog.text
+    assert "Heavy vision audio sent to user" in caplog.text
+
+
+def test_capture_coach_rejection_blocks_vision_model_gate_path(caplog):
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turns = [
+        _make_mock_turn(audio=b"\x03\x04" * 20, assistant_text="warmup", user_text="hello"),
+        _make_mock_turn(audio=b"\x03\x04" * 40, assistant_text="hold still", user_text="describe my surroundings"),
+    ]
+    mock_client = _mock_client(turns)
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock(
+        return_value=ClassificationResult(
+            intent=IntentCategory.SCENE_DESCRIBE,
+            confidence="high",
+            raw_label="SCENE_DESCRIBE",
+        )
+    )
+    mock_classifier.close = AsyncMock(return_value=None)
+    mock_mm_client = MagicMock()
+    mock_mm_client.close = AsyncMock(return_value=None)
+    mock_mm_client.analyze = AsyncMock()
+
+    with (
+        patch("apps.backend.api.routes.realtime.QwenRealtimeClient", return_value=mock_client),
+        patch("apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings", return_value=MagicMock()),
+        patch("apps.backend.api.routes.realtime.IntentClassifier.from_settings", return_value=mock_classifier),
+        patch("apps.backend.api.routes.realtime.MultimodalClient.from_settings", return_value=mock_mm_client),
+        patch("apps.backend.api.routes.realtime.assess_frame_quality", return_value=(False, "Hold the camera still.")),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+                ws.send_text(json.dumps({"type": "image", "data": "image-two"}))
+                ws.send_bytes(b"\x00" * 3200)
+                response = _receive_until_bytes(ws)
+
+    assert response == turns[1].assistant_audio_pcm
+    mock_mm_client.analyze.assert_not_awaited()
+    assert "CaptureCoach rejected frame — Hold the camera still." in caplog.text
+
+
+def test_heavy_vision_not_called_on_general_chat_gate_path():
     from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
 
     turns = [

@@ -228,13 +228,29 @@ async def _defer_auto_extract(
     user_id: str,
     user_transcript: str,
     assistant_transcript: str,
+    turn_index: int,
 ) -> None:
     await _asyncio.sleep(0.05)
-    await memory_manager.auto_extract_and_store(
-        user_id=user_id,
-        user_transcript=user_transcript,
-        assistant_transcript=assistant_transcript,
-    )
+    try:
+        await _asyncio.wait_for(
+            memory_manager.auto_extract_and_store(
+                user_id=user_id,
+                user_transcript=user_transcript,
+                assistant_transcript=assistant_transcript,
+            ),
+            timeout=5.0,
+        )
+    except _asyncio.TimeoutError:
+        logger.warning(
+            "Memory extraction timed out — turn %d skipped",
+            turn_index,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Memory extraction failed — turn %d: %s",
+            turn_index,
+            exc,
+        )
 
 
 def _schedule_background_task(
@@ -756,17 +772,36 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                             "Post-turn MEMORY_RECALL failed: %s",
                             exc,
                         )
-                if current_user_transcript and not _is_memory_query(
-                    current_user_transcript
-                ):
+                assistant_text = (result.assistant_transcript or "").strip()
+                transcript_for_memory = current_user_transcript.strip()
+                use_user_transcript = len(transcript_for_memory) >= 3
+                memory_text = (
+                    transcript_for_memory if use_user_transcript else assistant_text
+                )
+                if len(memory_text) >= 3:
+                    logger.info(
+                        "Memory extraction task fired — turn %d (source: %s)",
+                        current_turn_index,
+                        (
+                            "user_transcript"
+                            if use_user_transcript
+                            else "assistant_text_fallback"
+                        ),
+                    )
                     _schedule_background_task(
                         _defer_auto_extract(
                             memory_manager,
                             "default",
-                            current_user_transcript,
+                            memory_text,
                             result.assistant_transcript or "",
+                            current_turn_index,
                         ),
                         "defer_auto_extract",
+                    )
+                else:
+                    logger.info(
+                        "Memory extraction skipped — no usable text (turn %d)",
+                        current_turn_index,
                     )
 
                 if not session_memory_recorded:
