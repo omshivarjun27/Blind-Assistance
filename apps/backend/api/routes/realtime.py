@@ -133,6 +133,17 @@ _CORRECTION_SIGNALS: frozenset[str] = frozenset(
     }
 )
 
+_GREETING_PATTERNS: tuple[str, ...] = (
+    "how can i help",
+    "how may i help",
+    "what can i do for you",
+    "hello",
+    "hi there",
+    "good morning",
+    "good evening",
+    "good afternoon",
+)
+
 
 def _is_correction_signal(transcript: str) -> tuple[bool, str]:
     """Returns (is_correction, matched_signal). Never raises."""
@@ -141,6 +152,11 @@ def _is_correction_signal(transcript: str) -> tuple[bool, str]:
         if sig in t:
             return True, sig
     return False, ""
+
+
+def _is_greeting(text: str) -> bool:
+    cleaned = text.lower().strip()
+    return any(pattern in cleaned for pattern in _GREETING_PATTERNS) and len(cleaned) < 80
 
 
 def _normalize_memory_fact(fact: str) -> str:
@@ -237,6 +253,7 @@ async def _defer_auto_extract(
                 user_id=user_id,
                 user_transcript=user_transcript,
                 assistant_transcript=assistant_transcript,
+                turn_index=turn_index,
             ),
             timeout=5.0,
         )
@@ -778,15 +795,39 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 memory_text = (
                     transcript_for_memory if use_user_transcript else assistant_text
                 )
-                if len(memory_text) >= 3:
+                source = (
+                    "user_transcript" if use_user_transcript else "assistant_text_fallback"
+                )
+                if (
+                    source == "assistant_text_fallback"
+                    and _is_greeting(memory_text)
+                ):
+                    logger.info(
+                        "Memory extraction skipped — greeting detected, no facts (turn %d)",
+                        current_turn_index,
+                    )
+                elif len(memory_text) < 3:
+                    logger.info(
+                        "Memory extraction skipped — no usable text (turn %d)",
+                        current_turn_index,
+                    )
+                elif (
+                    source == "assistant_text_fallback"
+                    and len(memory_text.split()) < 8
+                ):
+                    logger.info(
+                        "Memory extraction skipped — text too sparse (turn %d)",
+                        current_turn_index,
+                    )
+                    logger.info(
+                        "Memory extraction: no facts found — nothing saved (turn %d)",
+                        current_turn_index,
+                    )
+                else:
                     logger.info(
                         "Memory extraction task fired — turn %d (source: %s)",
                         current_turn_index,
-                        (
-                            "user_transcript"
-                            if use_user_transcript
-                            else "assistant_text_fallback"
-                        ),
+                        source,
                     )
                     _schedule_background_task(
                         _defer_auto_extract(
@@ -798,12 +839,6 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         ),
                         "defer_auto_extract",
                     )
-                else:
-                    logger.info(
-                        "Memory extraction skipped — no usable text (turn %d)",
-                        current_turn_index,
-                    )
-
                 if not session_memory_recorded:
                     session_memory.add_turn(
                         current_user_transcript,

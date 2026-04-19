@@ -40,6 +40,8 @@ class Mem0Extractor:
             "Categories: IDENTITY, LOCATION, HEALTH, PREFERENCE, RELATIONSHIP, CONVERSATION, OBSERVATION. "
             "tier=long for persistent facts (name, address, preferences, relationships). "
             "tier=short for temporary observations and recent state. "
+            "Only extract concrete facts: names, preferences, locations, tasks, or specific requests. "
+            "Do NOT extract greetings, pleasantries, or meta-conversation. "
             "Never extract assistant statements as user facts. "
             "Return only [] if nothing is extractable."
         )

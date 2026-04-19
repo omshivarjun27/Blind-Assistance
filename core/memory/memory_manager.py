@@ -41,11 +41,20 @@ class MemoryManager:
         user_id: str,
         user_transcript: str,
         assistant_transcript: str,
+        turn_index: int | None = None,
     ) -> None:
         if self.extractor is None:
             return
         try:
             facts = await self.extractor.extract(user_transcript, assistant_transcript)
+            if not facts:
+                if turn_index is not None:
+                    logger.info(
+                        "Memory extraction: no facts found — nothing saved (turn %d)",
+                        turn_index,
+                    )
+                return
+            saved_count = 0
             for fact_data in facts:
                 fact_text = fact_data.get("fact", "").strip()
                 category = fact_data.get("category", "GENERAL").upper()
@@ -61,10 +70,17 @@ class MemoryManager:
                         tier=tier,
                         category=category,
                     )
+                    saved_count += 1
                 except Exception as exc:
                     logger.warning(
                         "auto_extract: save_fact failed for %r: %s", fact_text, exc
                     )
+            if turn_index is not None and saved_count > 0:
+                logger.info(
+                    "Memory saved: %d facts (turn %d)",
+                    saved_count,
+                    turn_index,
+                )
         except Exception as exc:
             logger.warning("auto_extract_and_store failed: %s", exc)
 

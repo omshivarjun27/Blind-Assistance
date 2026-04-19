@@ -369,6 +369,32 @@ async def test_memory_manager_auto_extract_stores_facts():
 
 
 @pytest.mark.asyncio
+async def test_no_facts_extracted_does_not_write_db(caplog):
+    caplog.set_level("INFO")
+    mock_embedder = AsyncMock()
+    mock_embedder.embed = AsyncMock(return_value=[0.2] * 1024)
+    mock_store = AsyncMock()
+    mock_store.save_fact = AsyncMock(return_value=1)
+    mock_extractor = MagicMock()
+    mock_extractor.extract = AsyncMock(return_value=[])
+
+    manager = MemoryManager(
+        embedder=mock_embedder,
+        store=mock_store,
+        extractor=mock_extractor,
+    )
+    await manager.auto_extract_and_store(
+        "default",
+        "Hello! How can I help you today?",
+        "Hello! How can I help you today?",
+        turn_index=0,
+    )
+
+    mock_store.save_fact.assert_not_called()
+    assert "Memory extraction: no facts found — nothing saved (turn 0)" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_recall_all_tiers_returns_combined_context():
     mock_embedder = AsyncMock()
     mock_embedder.embed = AsyncMock(return_value=[0.1] * 1024)

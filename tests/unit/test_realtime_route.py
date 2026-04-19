@@ -545,6 +545,178 @@ def test_memory_extraction_skipped_on_empty_transcript(caplog):
     assert "defer_auto_extract" not in scheduled_labels
 
 
+def test_greeting_skips_extraction(caplog):
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turn = _make_mock_turn(
+        audio=b"\x01\x02" * 20,
+        assistant_text="Hello! How can I help you today?",
+        user_text="",
+    )
+    mock_client = _mock_client(turn)
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock()
+    mock_classifier.close = AsyncMock(return_value=None)
+    scheduled_labels: list[str] = []
+
+    def capture_task(coro, label):
+        scheduled_labels.append(label)
+        coro.close()
+
+    with (
+        patch("apps.backend.api.routes.realtime.QwenRealtimeClient", return_value=mock_client),
+        patch("apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings", return_value=MagicMock()),
+        patch("apps.backend.api.routes.realtime.IntentClassifier.from_settings", return_value=mock_classifier),
+        patch("apps.backend.api.routes.realtime._schedule_background_task", side_effect=capture_task),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                time.sleep(0.1)
+
+    assert "Memory extraction skipped — greeting detected, no facts (turn 0)" in caplog.text
+    assert "defer_auto_extract" not in scheduled_labels
+
+
+def test_sparse_text_skips_extraction(caplog):
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turn = _make_mock_turn(
+        audio=b"\x01\x02" * 20,
+        assistant_text="Blue mug nearby",
+        user_text="",
+    )
+    mock_client = _mock_client(turn)
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock()
+    mock_classifier.close = AsyncMock(return_value=None)
+    scheduled_labels: list[str] = []
+
+    def capture_task(coro, label):
+        scheduled_labels.append(label)
+        coro.close()
+
+    with (
+        patch("apps.backend.api.routes.realtime.QwenRealtimeClient", return_value=mock_client),
+        patch("apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings", return_value=MagicMock()),
+        patch("apps.backend.api.routes.realtime.IntentClassifier.from_settings", return_value=mock_classifier),
+        patch("apps.backend.api.routes.realtime._schedule_background_task", side_effect=capture_task),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                time.sleep(0.1)
+
+    assert "Memory extraction skipped — text too sparse (turn 0)" in caplog.text
+    assert "defer_auto_extract" not in scheduled_labels
+
+
+def test_real_fact_passes_extraction(caplog):
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turns = [
+        _make_mock_turn(audio=b"\x01\x02" * 20, assistant_text="warmup", user_text="hello"),
+        _make_mock_turn(
+            audio=b"\x01\x02" * 40,
+            assistant_text="Got it",
+            user_text="My name is Sarah and I need help reading documents.",
+        ),
+    ]
+    mock_client = _mock_client(turns)
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock(
+        return_value=ClassificationResult(
+            intent=IntentCategory.GENERAL_CHAT,
+            confidence="high",
+            raw_label="GENERAL_CHAT",
+        )
+    )
+    mock_classifier.close = AsyncMock(return_value=None)
+    scheduled_calls: list[tuple[str, str]] = []
+
+    def capture_task(coro, label):
+        frame = getattr(coro, "cr_frame", None)
+        locals_dict = frame.f_locals if frame is not None else {}
+        scheduled_calls.append((label, locals_dict.get("user_transcript", "")))
+        coro.close()
+
+    with (
+        patch("apps.backend.api.routes.realtime.QwenRealtimeClient", return_value=mock_client),
+        patch("apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings", return_value=MagicMock()),
+        patch("apps.backend.api.routes.realtime.IntentClassifier.from_settings", return_value=mock_classifier),
+        patch("apps.backend.api.routes.realtime._schedule_background_task", side_effect=capture_task),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                time.sleep(0.1)
+
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                time.sleep(0.1)
+
+    assert (
+        "defer_auto_extract",
+        "My name is Sarah and I need help reading documents.",
+    ) in scheduled_calls
+    assert "Memory extraction task fired — turn 1 (source: user_transcript)" in caplog.text
+
+
+def test_greeting_guard_only_applies_to_fallback_source(caplog):
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turns = [
+        _make_mock_turn(audio=b"\x01\x02" * 20, assistant_text="warmup", user_text="hello"),
+        _make_mock_turn(
+            audio=b"\x01\x02" * 40,
+            assistant_text="I understand",
+            user_text="Hello there my name is Sarah and I need help reading documents.",
+        ),
+    ]
+    mock_client = _mock_client(turns)
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock(
+        return_value=ClassificationResult(
+            intent=IntentCategory.GENERAL_CHAT,
+            confidence="high",
+            raw_label="GENERAL_CHAT",
+        )
+    )
+    mock_classifier.close = AsyncMock(return_value=None)
+    scheduled_calls: list[tuple[str, str]] = []
+
+    def capture_task(coro, label):
+        frame = getattr(coro, "cr_frame", None)
+        locals_dict = frame.f_locals if frame is not None else {}
+        scheduled_calls.append((label, locals_dict.get("user_transcript", "")))
+        coro.close()
+
+    with (
+        patch("apps.backend.api.routes.realtime.QwenRealtimeClient", return_value=mock_client),
+        patch("apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings", return_value=MagicMock()),
+        patch("apps.backend.api.routes.realtime.IntentClassifier.from_settings", return_value=mock_classifier),
+        patch("apps.backend.api.routes.realtime._schedule_background_task", side_effect=capture_task),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                time.sleep(0.1)
+
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                time.sleep(0.1)
+
+    assert "greeting detected" not in caplog.text
+    assert (
+        "defer_auto_extract",
+        "Hello there my name is Sarah and I need help reading documents.",
+    ) in scheduled_calls
+
+
 @pytest.mark.asyncio
 async def test_memory_extraction_timeout_does_not_block_session(caplog):
     import apps.backend.api.routes.realtime as realtime_module
