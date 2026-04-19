@@ -1827,7 +1827,7 @@ def test_classifier_memory_write_route_calls_memory_manager():
 
 
 def test_classifier_memory_recall_route_calls_memory_manager():
-    """A current-turn MEMORY_READ prediction must call memory_manager.recall."""
+    """A current-turn MEMORY_READ prediction must retrieve top facts and update instructions."""
     from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
 
     turns = [
@@ -1849,7 +1849,10 @@ def test_classifier_memory_recall_route_calls_memory_manager():
     mock_memory_manager = MagicMock()
     mock_memory_manager.store.initialize = AsyncMock()
     mock_memory_manager.save = AsyncMock(return_value="")
-    mock_memory_manager.recall = AsyncMock(return_value="my doctor is Dr. Sharma")
+    mock_memory_manager.get_startup_memory_context = AsyncMock(return_value=None)
+    mock_memory_manager.retrieve_relevant_facts = AsyncMock(
+        return_value=["my doctor is Dr. Sharma"]
+    )
 
     with (
         patch(
@@ -1881,11 +1884,15 @@ def test_classifier_memory_recall_route_calls_memory_manager():
                 _ = ws.receive_text()
                 _ = ws.receive_text()
 
-    mock_memory_manager.recall.assert_called_once_with(
+    mock_memory_manager.retrieve_relevant_facts.assert_called_once_with(
         user_id="default",
         query="can you tell me about my doctor",
-        top_k=3,
+        top_k=5,
+        threshold=0.72,
     )
+    updated_prompt = mock_client.async_update_instructions.await_args.args[0]
+    assert "What I know about you:" in updated_prompt
+    assert "- my doctor is Dr. Sharma" in updated_prompt
 
 
 def test_interrupt_control_message_calls_cancel_response():
@@ -1915,6 +1922,58 @@ def test_interrupt_control_message_calls_cancel_response():
                 ws.send_text(json.dumps({"type": "interrupt"}))
                 ws.send_bytes(b"\x00" * 3200)
                 ws.receive_bytes()
+
+    mock_client.cancel_response.assert_called_once()
+
+
+def test_mid_response_interrupt_cancels_active_stream():
+    """Interrupts arriving during an active streamed response must cancel immediately."""
+
+    cancelled = asyncio.Event()
+    turn = _make_mock_turn(audio=b"", assistant_text="", user_text="tell me a long story")
+    turn.response_cancelled = True
+    mock_client = _mock_client(turn)
+    mock_client._response_active = False
+    mock_client.has_active_response = MagicMock(
+        side_effect=lambda: mock_client._response_active
+    )
+
+    async def fake_stream(_forward_audio_delta):
+        mock_client._response_active = True
+        await cancelled.wait()
+        return turn
+
+    def fake_cancel_response():
+        mock_client._response_active = False
+        cancelled.set()
+
+    mock_client.async_create_response_for_prepared_turn_streaming = AsyncMock(
+        side_effect=fake_stream
+    )
+    mock_client.cancel_response = MagicMock(side_effect=fake_cancel_response)
+    mock_memory_manager = MagicMock()
+    mock_memory_manager.store.initialize = AsyncMock()
+    mock_memory_manager.get_startup_memory_context = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MemoryManager.from_settings",
+            return_value=mock_memory_manager,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                ws.send_text(json.dumps({"type": "interrupt"}))
+                _ = ws.receive_text()
 
     mock_client.cancel_response.assert_called_once()
 

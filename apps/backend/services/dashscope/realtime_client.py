@@ -129,6 +129,7 @@ class QwenRealtimeTurn:
     assistant_audio_pcm: bytes = field(default_factory=bytes)
     usage: dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
+    response_cancelled: bool = False
 
     @property
     def success(self) -> bool:
@@ -164,6 +165,8 @@ class QwenRealtimeClient:
         self._state: SessionState = SessionState.DISCONNECTED
         self._turn_started_at: Optional[float] = None
         self._last_session_updated_elapsed_ms: int = 0
+        self._response_cancelled: bool = False
+        self._discarded_audio_chunks: int = 0
 
     # ── connection lifecycle ──────────────────────────────────
 
@@ -253,6 +256,9 @@ class QwenRealtimeClient:
             and getattr(ws, "connected", False)
             and self._state is not SessionState.DISCONNECTED
         )
+
+    def has_active_response(self) -> bool:
+        return self._response_active
 
     def session_needs_reconnect(self) -> bool:
         """True when session is near the 120-minute lifetime limit."""
@@ -392,6 +398,8 @@ class QwenRealtimeClient:
         """Create a response for already-committed input and collect output."""
         self.ensure_connected()
         result = QwenRealtimeTurn()
+        self._response_cancelled = False
+        self._discarded_audio_chunks = 0
         if not any(
             (event.get("type", "")).startswith("response.")
             for event in self._buffered_events
@@ -408,6 +416,8 @@ class QwenRealtimeClient:
         """Create a response and forward audio deltas immediately."""
         self.ensure_connected()
         result = QwenRealtimeTurn()
+        self._response_cancelled = False
+        self._discarded_audio_chunks = 0
         if not any(
             (event.get("type", "")).startswith("response.")
             for event in self._buffered_events
@@ -463,6 +473,7 @@ class QwenRealtimeClient:
         if not self._connected or self._ws is None or not self._response_active:
             return
         try:
+            self._response_cancelled = True
             self._send_event({"type": "response.cancel"})
             logger.info("response.cancel sent to DashScope")
         except Exception as exc:
@@ -708,6 +719,9 @@ class QwenRealtimeClient:
                 delta = event.get("delta")
                 if isinstance(delta, str):
                     delta_bytes = base64.b64decode(delta)
+                    if self._response_cancelled:
+                        self._discarded_audio_chunks += 1
+                        continue
                     if (
                         not first_audio_delta_logged
                         and self._turn_started_at is not None
@@ -725,12 +739,22 @@ class QwenRealtimeClient:
             elif t == "response.audio.done":
                 pass  # audio.delta already collected
 
+            elif t in {"input_audio_buffer.speech_started", "input_speech_started"}:
+                if self._response_active and not self._response_cancelled:
+                    self.cancel_response()
+                    logger.info("Barge-in detected — response cancelled")
+
             elif t == "response.cancelled":
                 logger.info("Response cancelled by DashScope")
                 saw_response_cancelled = True
+                result.response_cancelled = True
                 self._response_active = False
                 self._state = SessionState.IDLE
                 result.error = None
+                logger.info(
+                    "Audio stream cancelled — %d chunks discarded",
+                    self._discarded_audio_chunks,
+                )
                 break
 
             elif t == "response.done":
@@ -743,7 +767,19 @@ class QwenRealtimeClient:
                     if isinstance(usage, dict):
                         result.usage = usage
                     status = response.get("status")
-                    if isinstance(status, str) and status != "completed":
+                    if (
+                        isinstance(status, str)
+                        and self._response_cancelled
+                        and status in {"cancelled", "incomplete"}
+                    ):
+                        saw_response_cancelled = True
+                        result.response_cancelled = True
+                        result.error = None
+                        logger.info(
+                            "Audio stream cancelled — %d chunks discarded",
+                            self._discarded_audio_chunks,
+                        )
+                    elif isinstance(status, str) and status != "completed":
                         result.error = f"Response finished with status: {status}"
                 if not result.assistant_transcript:
                     result.assistant_transcript = "".join(text_deltas)

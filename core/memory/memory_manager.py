@@ -14,6 +14,9 @@ from core.orchestrator.prompt_builder import build_memory_fact
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_RECALL_TOP_K = 5
+DEFAULT_RECALL_THRESHOLD = 0.72
+
 
 class MemoryManager:
     def __init__(
@@ -121,21 +124,47 @@ class MemoryManager:
         self,
         user_id: str,
         query: str,
-        top_k: int = 3,
+        top_k: int = DEFAULT_RECALL_TOP_K,
+        threshold: float = DEFAULT_RECALL_THRESHOLD,
     ) -> str | None:
         """Embed query, retrieve top_k facts, return as context string.
 
         Returns None if no relevant facts are stored.
         """
+        facts = await self.retrieve_relevant_facts(
+            user_id=user_id,
+            query=query,
+            top_k=top_k,
+            threshold=threshold,
+        )
+        if not facts:
+            return None
+        return "\n".join(facts)
+
+    async def retrieve_relevant_facts(
+        self,
+        user_id: str,
+        query: str,
+        top_k: int = DEFAULT_RECALL_TOP_K,
+        threshold: float = DEFAULT_RECALL_THRESHOLD,
+    ) -> list[str]:
+        logger.info(
+            'Memory retrieval — query: "%s" top_k=%d threshold=%.2f',
+            query,
+            top_k,
+            threshold,
+        )
         try:
             embedding = await self.embedder.embed(query)
         except EmbeddingError as exc:
             logger.warning("Embedding failed for recall: %s", exc)
-            return None
-        facts = await self.store.recall_facts(user_id, embedding, top_k)
-        if not facts:
-            return None
-        return "\n".join(facts)
+            return []
+        return await self.store.recall_facts(
+            user_id,
+            embedding,
+            top_k,
+            threshold=threshold,
+        )
 
     async def get_startup_memory_context(
         self,

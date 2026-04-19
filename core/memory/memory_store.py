@@ -235,9 +235,20 @@ class MemoryStore:
         query_embedding: list[float],
         top_k: int = 3,
         tier: str = "long",
+        threshold: float | None = None,
     ) -> list[str]:
         """Return top_k facts most similar to query_embedding."""
         now = self._utcnow_iso()
+
+        def _select_facts(scored_rows: list[tuple[float, str]]) -> list[str]:
+            if threshold is not None:
+                scored_rows = [
+                    (score, fact)
+                    for score, fact in scored_rows
+                    if score >= threshold
+                ]
+            return [fact for _, fact in scored_rows[:top_k]]
+
         async with aiosqlite.connect(self._db_path) as db:
             if tier == "short":
                 cursor = await db.execute(
@@ -248,7 +259,7 @@ class MemoryStore:
                 raw_rows = await cursor.fetchall()
                 rows = [(str(row[0]), str(row[1])) for row in raw_rows]
                 scored = self._score_rows(rows, query_embedding)
-                return [fact for _, fact in scored[:top_k]]
+                return _select_facts(scored)
 
             if tier == "all":
                 long_cursor = await db.execute(
@@ -281,7 +292,7 @@ class MemoryStore:
                 key=lambda x: x[0],
                 reverse=True,
             )
-        return [fact for _, fact in scored[:top_k]]
+        return _select_facts(scored)
 
     async def purge_expired(self) -> int:
         now = self._utcnow_iso()

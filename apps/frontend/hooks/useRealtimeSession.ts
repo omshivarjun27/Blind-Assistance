@@ -102,6 +102,7 @@ export function useRealtimeSession(captureFrame: () => string | null) {
   const interruptArmedAtRef = useRef(0);
   const micCooldownUntilRef = useRef(0);
   const playbackSpeechChunksRef = useRef(0);
+  const responseCancelledRef = useRef(false);
   const mic = useMicStream();
 
   const appendTranscript = useCallback((entry: TranscriptEntry) => {
@@ -114,6 +115,7 @@ export function useRealtimeSession(captureFrame: () => string | null) {
     if (chunksRef.current.length === 0) return;
     isSendingRef.current = true;
     hasSpeechRef.current = false;
+    responseCancelledRef.current = false;
 
     const frame = captureFrameRef.current?.();
     console.log('[Session] Frame captured:', frame ? frame.length : 'none');
@@ -152,6 +154,10 @@ export function useRealtimeSession(captureFrame: () => string | null) {
 
   const playPCMChunk = useCallback(
     (pcmBytes: ArrayBuffer): void => {
+      if (responseCancelledRef.current) {
+        return;
+      }
+
       if (!isPlayingRef.current) {
         if (playbackEndTimerRef.current) {
           clearTimeout(playbackEndTimerRef.current);
@@ -208,6 +214,7 @@ export function useRealtimeSession(captureFrame: () => string | null) {
         if (hasSpeechEnergy) {
           playbackSpeechChunksRef.current += 1;
           if (playbackSpeechChunksRef.current >= PLAYBACK_BARGE_IN_CHUNKS) {
+            responseCancelledRef.current = true;
             wsRef.current?.sendInterrupt();
             stopAssistantPlayback();
             isSendingRef.current = false;
@@ -226,6 +233,7 @@ export function useRealtimeSession(captureFrame: () => string | null) {
       }
 
       if (isSendingRef.current && hasSpeechEnergy) {
+        responseCancelledRef.current = true;
         wsRef.current?.sendInterrupt();
         isSendingRef.current = false;
       }
@@ -268,6 +276,7 @@ export function useRealtimeSession(captureFrame: () => string | null) {
 
       const ws = new RealtimeWSClient(wsUrl);
       wsRef.current = ws;
+      responseCancelledRef.current = false;
 
       ws.onAudio = (pcm) => {
         playPCMChunk(pcm);
@@ -324,6 +333,7 @@ export function useRealtimeSession(captureFrame: () => string | null) {
       interruptArmedAtRef.current = 0;
       micCooldownUntilRef.current = 0;
       playbackSpeechChunksRef.current = 0;
+      responseCancelledRef.current = false;
       if (playbackEndTimerRef.current) {
         clearTimeout(playbackEndTimerRef.current);
         playbackEndTimerRef.current = null;

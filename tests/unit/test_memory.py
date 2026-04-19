@@ -1,4 +1,5 @@
 import json
+import math
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -102,6 +103,46 @@ async def test_recall_facts_returns_top_k():
 
 
 @pytest.mark.asyncio
+async def test_recall_threshold_returns_top5():
+    query = [1.0, 0.0] + [0.0] * 1022
+
+    def _unit_embedding(similarity: float) -> list[float]:
+        return [similarity, math.sqrt(max(0.0, 1.0 - similarity**2))] + [0.0] * 1022
+
+    rows = [
+        ("fact 0.99", json.dumps(_unit_embedding(0.99))),
+        ("fact 0.95", json.dumps(_unit_embedding(0.95))),
+        ("fact 0.90", json.dumps(_unit_embedding(0.90))),
+        ("fact 0.88", json.dumps(_unit_embedding(0.88))),
+        ("fact 0.80", json.dumps(_unit_embedding(0.80))),
+        ("fact 0.72", json.dumps(_unit_embedding(0.72))),
+        ("fact 0.71", json.dumps(_unit_embedding(0.71))),
+        ("fact 0.60", json.dumps(_unit_embedding(0.60))),
+        ("fact 0.30", json.dumps(_unit_embedding(0.30))),
+        ("fact 0.00", json.dumps(_unit_embedding(0.00))),
+    ]
+
+    mock_cursor = AsyncMock()
+    mock_cursor.fetchall = AsyncMock(return_value=rows)
+    mock_db = AsyncMock()
+    mock_db.execute = AsyncMock(return_value=mock_cursor)
+    mock_db.__aenter__ = AsyncMock(return_value=mock_db)
+    mock_db.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("aiosqlite.connect", return_value=mock_db):
+        store = MemoryStore(db_path=":memory:")
+        results = await store.recall_facts("u1", query, top_k=5, threshold=0.72)
+
+    assert results == [
+        "fact 0.99",
+        "fact 0.95",
+        "fact 0.90",
+        "fact 0.88",
+        "fact 0.80",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_recall_facts_returns_empty_when_no_facts():
     mock_cursor = AsyncMock()
     mock_cursor.fetchall = AsyncMock(return_value=[])
@@ -156,6 +197,66 @@ async def test_memory_manager_recall_returns_none_when_empty():
     manager = MemoryManager(embedder=mock_embedder, store=mock_store)
     result = await manager.recall("u1", "who is my doctor")
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_recall_injects_into_system_prompt():
+    from apps.backend.api.routes.realtime import _apply_memory_recall_instructions
+
+    client = MagicMock()
+    client.async_update_instructions = AsyncMock(return_value=None)
+    memory_manager = MagicMock()
+    memory_manager.retrieve_relevant_facts = AsyncMock(
+        return_value=[
+            "my name is Om",
+            "my doctor is Dr. Sharma",
+            "my city is Bengaluru",
+        ]
+    )
+
+    prompt = await _apply_memory_recall_instructions(
+        client=client,
+        memory_manager=memory_manager,
+        user_id="default",
+        query="what is my name",
+        base_prompt="BASE PROMPT",
+    )
+
+    client.async_update_instructions.assert_awaited_once()
+    sent_prompt = client.async_update_instructions.await_args.args[0]
+    assert prompt == sent_prompt
+    assert sent_prompt.startswith("BASE PROMPT")
+    assert "What I know about you:" in sent_prompt
+    assert "- my name is Om" in sent_prompt
+    assert "- my doctor is Dr. Sharma" in sent_prompt
+    assert "- my city is Bengaluru" in sent_prompt
+    memory_manager.retrieve_relevant_facts.assert_awaited_once_with(
+        user_id="default",
+        query="what is my name",
+        top_k=5,
+        threshold=0.72,
+    )
+
+
+@pytest.mark.asyncio
+async def test_recall_no_results_uses_base_prompt():
+    from apps.backend.api.routes.realtime import _apply_memory_recall_instructions
+
+    client = MagicMock()
+    client.async_update_instructions = AsyncMock(return_value=None)
+    memory_manager = MagicMock()
+    memory_manager.retrieve_relevant_facts = AsyncMock(return_value=[])
+
+    prompt = await _apply_memory_recall_instructions(
+        client=client,
+        memory_manager=memory_manager,
+        user_id="default",
+        query="what is my name",
+        base_prompt="BASE PROMPT",
+    )
+
+    assert prompt == "BASE PROMPT"
+    client.async_update_instructions.assert_awaited_once_with("BASE PROMPT")
 
 
 def test_session_memory_add_and_recall():

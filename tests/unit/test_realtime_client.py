@@ -763,6 +763,30 @@ def test_collect_response_marks_non_completed_status_as_error(status: str):
     assert result.error == f"Response finished with status: {status}"
 
 
+def test_collect_response_treats_cancelled_status_as_non_error_after_cancel():
+    """A cancelled response.done status should not surface as an upstream failure."""
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+        QwenRealtimeTurn,
+    )
+
+    client = QwenRealtimeClient(QwenRealtimeConfig(api_key="test-key"))
+    client._response_cancelled = True
+    result = QwenRealtimeTurn()
+    events = iter(
+        [{"type": "response.done", "response": {"status": "cancelled", "usage": {}}}]
+    )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "_recv_event", lambda timeout=None: next(events))
+        client._collect_response(result)
+
+    assert result.success is True
+    assert result.response_cancelled is True
+    assert result.error is None
+
+
 def test_collect_response_returns_error_event_as_terminal():
     """error events should terminate the turn with an error."""
     from apps.backend.services.dashscope.realtime_client import (
@@ -880,6 +904,92 @@ def test_collect_response_handles_response_cancelled():
 
     assert result.error is None
     assert result.assistant_audio_pcm is not None
+
+
+def test_barge_in_cancels_response():
+    """input_audio_buffer.speech_started must trigger response.cancel."""
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+        QwenRealtimeTurn,
+    )
+
+    client = QwenRealtimeClient(QwenRealtimeConfig(api_key="test-key"))
+    client._ws = MagicMock()
+    client._connected = True
+    client._response_active = True
+    client._session_updated_confirmed = True
+    result = QwenRealtimeTurn()
+    events = iter(
+        [
+            {"type": "input_audio_buffer.speech_started"},
+            {"type": "response.cancelled"},
+        ]
+    )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "_recv_event", lambda timeout=None: next(events))
+        client._collect_response(result)
+
+    sent = json.loads(client._ws.send.call_args[0][0])
+    assert sent["type"] == "response.cancel"
+    assert client._session_updated_confirmed is True
+    assert result.response_cancelled is True
+
+
+def test_cancelled_chunks_not_sent_to_browser():
+    """Cancelled turns must discard later audio deltas instead of forwarding them."""
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+        QwenRealtimeTurn,
+    )
+
+    client = QwenRealtimeClient(QwenRealtimeConfig(api_key="test-key"))
+    client._response_cancelled = True
+    result = QwenRealtimeTurn()
+    events = iter(
+        [
+            {"type": "response.audio.delta", "delta": base64.b64encode(b"a").decode()},
+            {"type": "response.audio.delta", "delta": base64.b64encode(b"b").decode()},
+            {"type": "response.audio.delta", "delta": base64.b64encode(b"c").decode()},
+            {"type": "response.cancelled"},
+        ]
+    )
+    delivered_chunks: list[bytes] = []
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "_recv_event", lambda timeout=None: next(events))
+        client._collect_response(result, on_audio_chunk=delivered_chunks.append)
+
+    assert delivered_chunks == []
+    assert result.response_cancelled is True
+
+
+def test_barge_in_flag_resets_on_new_turn():
+    """A new upstream response should clear the cancelled flag before collecting."""
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+    )
+
+    client = QwenRealtimeClient(QwenRealtimeConfig(api_key="test-key"))
+    client._connected = True
+    client._session_updated_confirmed = True
+    client._response_cancelled = True
+    client._ws = MagicMock()
+
+    observed: dict[str, bool] = {}
+
+    def fake_collect(result, on_audio_chunk=None):
+        observed["cancelled"] = client._response_cancelled
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "ensure_connected", lambda: None)
+        mp.setattr(client, "_collect_response", fake_collect)
+        client.create_response_for_prepared_turn_streaming(lambda chunk: None)
+
+    assert observed["cancelled"] is False
 
 
 # ── compress_image tests ──────────────────────────────────────────

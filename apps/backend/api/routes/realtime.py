@@ -20,7 +20,7 @@ import asyncio as _asyncio
 import struct
 import time
 from collections.abc import Coroutine
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -33,6 +33,7 @@ from apps.backend.services.dashscope.multimodal_client import (
 from apps.backend.services.dashscope.realtime_client import (
     QwenRealtimeClient,
     QwenRealtimeConfig,
+    QwenRealtimeTurn,
 )
 from core.learning import CorrectionStore, OfflineReplay, OnlineReflection, PatchStore
 from core.memory import MemoryManager, SessionMemory, compose_memory_context
@@ -77,6 +78,10 @@ _PAST_TENSE_TRIGGERS: tuple[str, ...] = (
     "मैं कौन हूं",
     "before",
     "previously",
+    "tell me about my",
+    "what do you know about me",
+    "what do you know about my",
+    "can you tell me about my",
     "nanna hesaru",
     "neevu",
     "hinde",
@@ -94,6 +99,9 @@ _PAST_TENSE_TRIGGERS: tuple[str, ...] = (
     "told ",
     "said ",
 )
+
+_MEMORY_RECALL_TOP_K = 5
+_MEMORY_RECALL_THRESHOLD = 0.72
 
 
 def _is_memory_query(transcript: str) -> bool:
@@ -166,6 +174,38 @@ def _normalize_memory_fact(fact: str) -> str:
     if cleaned.lower().startswith("object/text seen: "):
         cleaned = cleaned.split(":", 1)[1].strip()
     return cleaned.rstrip(".")
+
+
+def _build_memory_recall_system_prompt(base_prompt: str, facts: list[str]) -> str:
+    if not facts:
+        return base_prompt
+    context_block = "\n".join(f"- {fact}" for fact in facts)
+    return f"{base_prompt}\n\nWhat I know about you:\n{context_block}"
+
+
+async def _apply_memory_recall_instructions(
+    client: QwenRealtimeClient,
+    memory_manager: MemoryManager,
+    user_id: str,
+    query: str,
+    base_prompt: str,
+) -> str:
+    facts = await memory_manager.retrieve_relevant_facts(
+        user_id=user_id,
+        query=query,
+        top_k=_MEMORY_RECALL_TOP_K,
+        threshold=_MEMORY_RECALL_THRESHOLD,
+    )
+    if facts:
+        logger.info(
+            "Memory retrieved: %d facts — injected into system prompt",
+            len(facts),
+        )
+    else:
+        logger.info("Memory retrieval: no facts above threshold — using base prompt")
+    system_prompt = _build_memory_recall_system_prompt(base_prompt, facts)
+    await client.async_update_instructions(system_prompt)
+    return system_prompt
 
 
 def _build_memory_reply(
@@ -282,6 +322,161 @@ def _schedule_background_task(
         logger.warning("%s create_task failed: %s", label, exc)
 
 
+async def _handle_control_message(
+    ws: WebSocket,
+    client: QwenRealtimeClient,
+    raw_text: str,
+    pending_image_b64: str | None,
+    pending_instructions: str | None,
+    last_response_complete_at: float,
+) -> tuple[bool, str | None, str | None]:
+    try:
+        msg: dict[str, Any] = json.loads(raw_text)
+    except json.JSONDecodeError:
+        logger.warning("Invalid JSON in text frame: %r", raw_text[:100])
+        return False, pending_image_b64, pending_instructions
+
+    msg_type = msg.get("type", "")
+    if not isinstance(msg_type, str):
+        logger.warning("Invalid control message type: %r", msg_type)
+        return False, pending_image_b64, pending_instructions
+
+    if msg_type == "image":
+        image_data = msg.get("data")
+        pending_image_b64 = image_data if isinstance(image_data, str) else None
+        logger.debug("Image queued for next audio turn")
+        return True, pending_image_b64, pending_instructions
+
+    if msg_type == "instructions":
+        instruction_text = msg.get("text")
+        pending_instructions = instruction_text if isinstance(instruction_text, str) else None
+        logger.debug("Instructions queued for next audio turn")
+        return True, pending_image_b64, pending_instructions
+
+    if msg_type == "ping":
+        await ws.send_text(json.dumps({"type": "pong"}))
+        return True, pending_image_b64, pending_instructions
+
+    if msg_type == "interrupt":
+        if client.has_active_response():
+            client.cancel_response()
+            logger.info("Barge-in detected — response cancelled")
+            return True, pending_image_b64, pending_instructions
+
+        elapsed = (
+            time.monotonic() - last_response_complete_at
+            if last_response_complete_at > 0.0
+            else float("inf")
+        )
+        if elapsed < 1.5:
+            logger.debug(
+                "Interrupt BLOCKED (premature): %.2fs since last response",
+                elapsed,
+            )
+            return True, pending_image_b64, pending_instructions
+        client.cancel_response()
+        logger.info(
+            "Interrupt received from browser — response.cancel sent (%.2fs since last response complete)",
+            elapsed,
+        )
+        return True, pending_image_b64, pending_instructions
+
+    logger.warning("Unknown control message type: %r", msg_type)
+    return False, pending_image_b64, pending_instructions
+
+
+async def _await_turn_result_or_messages(
+    ws: WebSocket,
+    client: QwenRealtimeClient,
+    turn_task: _asyncio.Task[QwenRealtimeTurn],
+    config: QwenRealtimeConfig,
+    pending_image_b64: str | None,
+    pending_instructions: str | None,
+    last_response_complete_at: float,
+) -> tuple[QwenRealtimeTurn | None, dict[str, Any] | None, str | None, str | None, bool]:
+    receive_task: _asyncio.Task[Any] | None = None
+    queued_data: dict[str, Any] | None = None
+
+    while True:
+        if receive_task is None:
+            receive_task = _asyncio.create_task(ws.receive())
+
+        assert receive_task is not None
+
+        done, _ = await _asyncio.wait(
+            {turn_task, receive_task},
+            return_when=_asyncio.FIRST_COMPLETED,
+        )
+
+        if turn_task in done:
+            if receive_task is not None and receive_task.done():
+                try:
+                    queued_data = receive_task.result()
+                except WebSocketDisconnect:
+                    logger.info("User WebSocket disconnected — closing DashScope session")
+                    return None, queued_data, pending_image_b64, pending_instructions, True
+                receive_task = None
+            elif receive_task is not None:
+                receive_task.cancel()
+                await _asyncio.gather(receive_task, return_exceptions=True)
+                receive_task = None
+            try:
+                result = cast(QwenRealtimeTurn, turn_task.result())
+            except (WebSocketDisconnect, _asyncio.CancelledError):
+                turn_task.cancel()
+                await _asyncio.gather(turn_task, return_exceptions=True)
+                logger.info("User WebSocket disconnected — closing DashScope session")
+                return None, queued_data, pending_image_b64, pending_instructions, True
+            except Exception as exc:
+                await _send_upstream_error(ws, str(exc), config)
+                return None, queued_data, pending_image_b64, pending_instructions, True
+            return result, queued_data, pending_image_b64, pending_instructions, False
+
+        if receive_task in done:
+            try:
+                incoming = receive_task.result()
+            except WebSocketDisconnect:
+                turn_task.cancel()
+                await _asyncio.gather(turn_task, return_exceptions=True)
+                logger.info("User WebSocket disconnected — closing DashScope session")
+                return None, queued_data, pending_image_b64, pending_instructions, True
+            receive_task = None
+
+            if incoming["type"] == "websocket.disconnect":
+                turn_task.cancel()
+                await _asyncio.gather(turn_task, return_exceptions=True)
+                logger.info("User WebSocket disconnected — closing DashScope session")
+                return None, queued_data, pending_image_b64, pending_instructions, True
+
+            if incoming.get("text"):
+                raw_text = incoming["text"]
+                if not isinstance(raw_text, str):
+                    logger.warning("Ignoring non-text control payload")
+                    continue
+                handled, pending_image_b64, pending_instructions = (
+                    await _handle_control_message(
+                        ws,
+                        client,
+                        raw_text,
+                        pending_image_b64,
+                        pending_instructions,
+                        last_response_complete_at,
+                    )
+                )
+                if not handled:
+                    turn_task.cancel()
+                    await _asyncio.gather(turn_task, return_exceptions=True)
+                    return None, queued_data, pending_image_b64, pending_instructions, True
+                continue
+
+            if incoming.get("bytes"):
+                queued_data = incoming
+                if client.has_active_response():
+                    client.cancel_response()
+                    logger.info("Barge-in detected — response cancelled")
+                continue
+
+
 async def _send_upstream_error(
     ws: WebSocket,
     message: str,
@@ -381,10 +576,12 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     _last_response_complete_at: float = 0.0
     _turn_index: int = 0
     _last_transcript: str = ""
+    queued_data: dict[str, Any] | None = None
 
     try:
         while True:
-            data = await ws.receive()
+            data = queued_data if queued_data is not None else await ws.receive()
+            queued_data = None
 
             # Handle disconnect signal
             if data["type"] == "websocket.disconnect":
@@ -425,6 +622,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 intent_task: _asyncio.Task[object] | None = None
                 intent_started_at: float | None = None
                 classification_deferred = False
+                instructions_already_updated = False
 
                 turn_connect_started = time.monotonic()
                 if not client.is_connected():
@@ -541,24 +739,20 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     elif decision.target == RouteTarget.MEMORY_READ:
                         applied_target = RouteTarget.MEMORY_READ
                         try:
-                            memory_context = await memory_manager.recall(
+                            effective_instructions = await _apply_memory_recall_instructions(
+                                client=client,
+                                memory_manager=memory_manager,
                                 user_id="default",
-                                query=current_user_transcript,
-                                top_k=3,
+                                query=current_user_transcript or "",
+                                base_prompt=(
+                                    f"{default_instructions}\n\n"
+                                    f"The user asked: {current_user_transcript}\n"
+                                    "Answer using only the remembered facts that are relevant to the question. "
+                                    "If nothing relevant is stored, say so briefly."
+                                ),
                             )
-                            if memory_context:
-                                effective_instructions = build_system_prompt(
-                                    base_instructions=(
-                                        f"The user asked: {current_user_transcript}\n"
-                                        "Answer using only the relevant stored memory."
-                                        " Be brief and speak naturally."
-                                    ),
-                                    memory_context=memory_context,
-                                    verbosity_mode=prompt_verbosity,
-                                    intent_penalty=prompt_penalty,
-                                )
-                            else:
-                                effective_instructions = "Tell the user: I don't have anything stored about that yet."
+                            _last_instructions = effective_instructions
+                            instructions_already_updated = True
                         except Exception as exc:
                             logger.warning(
                                 "Classifier-routed memory recall failed: %s",
@@ -661,7 +855,9 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         applied_target.value,
                     )
 
-                if effective_instructions != _last_instructions:
+                if (not instructions_already_updated) and (
+                    effective_instructions != _last_instructions
+                ):
                     try:
                         await client.async_update_instructions(effective_instructions)
                         _last_instructions = effective_instructions
@@ -712,18 +908,17 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         _forward_audio_delta
                     )
                 )
+                result, queued_data, pending_image_b64, pending_instructions, should_close_session = await _await_turn_result_or_messages(
+                    ws=ws,
+                    client=client,
+                    turn_task=turn_task,
+                    config=config,
+                    pending_image_b64=pending_image_b64,
+                    pending_instructions=pending_instructions,
+                    last_response_complete_at=_last_response_complete_at,
+                )
 
-                try:
-                    result = await turn_task
-                except (WebSocketDisconnect, _asyncio.CancelledError):
-                    turn_task.cancel()
-                    await _asyncio.gather(turn_task, return_exceptions=True)
-                    logger.info(
-                        "User WebSocket disconnected — closing DashScope session"
-                    )
-                    break
-                except Exception as exc:
-                    await _send_upstream_error(ws, str(exc), config)
+                if should_close_session or result is None:
                     break
                 _last_response_complete_at = time.monotonic()
 
@@ -953,55 +1148,15 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 if not isinstance(raw_text, str):
                     logger.warning("Ignoring non-text control payload")
                     continue
-                try:
-                    msg: dict[str, Any] = json.loads(raw_text)
-                except json.JSONDecodeError:
-                    logger.warning("Invalid JSON in text frame: %r", raw_text[:100])
-                    break
-
-                msg_type = msg.get("type", "")
-                if not isinstance(msg_type, str):
-                    logger.warning("Invalid control message type: %r", msg_type)
-                    break
-
-                if msg_type == "image":
-                    image_data = msg.get("data")
-                    pending_image_b64 = (
-                        image_data if isinstance(image_data, str) else None
-                    )
-                    logger.debug("Image queued for next audio turn")
-
-                elif msg_type == "instructions":
-                    instruction_text = msg.get("text")
-                    pending_instructions = (
-                        instruction_text if isinstance(instruction_text, str) else None
-                    )
-                    logger.debug("Instructions queued for next audio turn")
-
-                elif msg_type == "ping":
-                    await ws.send_text(json.dumps({"type": "pong"}))
-
-                elif msg_type == "interrupt":
-                    # User started speaking — cancel any in-progress response
-                    elapsed = (
-                        time.monotonic() - _last_response_complete_at
-                        if _last_response_complete_at > 0.0
-                        else float("inf")
-                    )
-                    if elapsed < 1.5:
-                        logger.debug(
-                            "Interrupt BLOCKED (premature): %.2fs since last response",
-                            elapsed,
-                        )
-                        continue
-                    client.cancel_response()
-                    logger.info(
-                        "Interrupt received from browser — response.cancel sent (%.2fs since last response complete)",
-                        elapsed,
-                    )
-
-                else:
-                    logger.warning("Unknown control message type: %r", msg_type)
+                handled, pending_image_b64, pending_instructions = await _handle_control_message(
+                    ws,
+                    client,
+                    raw_text,
+                    pending_image_b64,
+                    pending_instructions,
+                    _last_response_complete_at,
+                )
+                if not handled:
                     break
 
     except WebSocketDisconnect:
