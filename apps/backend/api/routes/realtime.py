@@ -139,6 +139,8 @@ _GREETING_PATTERNS: tuple[str, ...] = (
     "what can i do for you",
     "hello",
     "hi there",
+    "nice to",
+    "nice to meet",
     "good morning",
     "good evening",
     "good afternoon",
