@@ -530,10 +530,23 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                                 exc,
                             )
                     elif decision.target == RouteTarget.HEAVY_VISION:
+                        intent_log_value = (
+                            "SCENE_DESCRIPTION"
+                            if predicted_intent == IntentCategory.SCENE_DESCRIBE
+                            else predicted_intent.value
+                        )
+                        logger.info(
+                            "Heavy vision dispatch — intent: %s",
+                            intent_log_value,
+                        )
                         applied_target = RouteTarget.HEAVY_VISION
                         vision_image_b64 = route_image_b64
                         is_usable, guidance = assess_frame_quality(vision_image_b64)
                         if not is_usable:
+                            logger.warning(
+                                "CaptureCoach rejected frame — %s",
+                                guidance,
+                            )
                             effective_instructions = (
                                 f"Tell the user this guidance: {guidance}"
                             )
@@ -542,6 +555,9 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                                 guidance,
                             )
                         elif vision_image_b64:
+                            logger.info(
+                                "CaptureCoach: frame accepted — quality: pass"
+                            )
                             logger.debug(
                                 "HEAVY_VISION: calling multimodal model=%s",
                                 mm_client._model,
@@ -554,6 +570,10 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                                 )
                             )
                             if vision_result.success:
+                                logger.info(
+                                    "Vision model response received — %d chars",
+                                    len(vision_result.text),
+                                )
                                 effective_instructions = (
                                     "Say exactly this to the user: "
                                     f"{vision_result.text}"
@@ -616,10 +636,17 @@ async def realtime_endpoint(ws: WebSocket) -> None:
 
                 loop = _asyncio.get_running_loop()
                 streamed_audio = False
+                heavy_vision_audio_logged = False
 
                 def _forward_audio_delta(delta_bytes: bytes) -> None:
-                    nonlocal streamed_audio
+                    nonlocal streamed_audio, heavy_vision_audio_logged
                     streamed_audio = True
+                    if (
+                        applied_target == RouteTarget.HEAVY_VISION
+                        and not heavy_vision_audio_logged
+                    ):
+                        logger.info("Heavy vision audio sent to user")
+                        heavy_vision_audio_logged = True
                     try:
                         running_loop = _asyncio.get_running_loop()
                     except RuntimeError:
@@ -808,6 +835,12 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 # Send spoken audio back
                 if result.assistant_audio_pcm and not streamed_audio:
                     await ws.send_bytes(result.assistant_audio_pcm)
+                    if (
+                        applied_target == RouteTarget.HEAVY_VISION
+                        and not heavy_vision_audio_logged
+                    ):
+                        logger.info("Heavy vision audio sent to user")
+                        heavy_vision_audio_logged = True
 
                 # Send assistant transcript
                 if result.assistant_transcript:

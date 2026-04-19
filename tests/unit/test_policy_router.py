@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 
-def test_scene_describe_routes_to_realtime_with_frame():
+def test_scene_describe_routes_to_heavy_vision_with_frame():
     from core.orchestrator.intent_classifier import IntentCategory
     from core.orchestrator.policy_router import RouteTarget, route
 
     decision = route(IntentCategory.SCENE_DESCRIBE)
-    assert decision.target == RouteTarget.REALTIME_CHAT
+    assert decision.target == RouteTarget.HEAVY_VISION
     assert decision.requires_frame is True
     assert decision.system_instructions != ""
 

@@ -42,7 +42,7 @@ _UNIMPLEMENTED = {
 
 _ROUTING_TABLE: dict[IntentCategory, tuple[RouteTarget, bool, str]] = {
     IntentCategory.SCENE_DESCRIBE: (
-        RouteTarget.REALTIME_CHAT,
+        RouteTarget.HEAVY_VISION,
         True,
         "You are Ally, a voice assistant for blind and visually impaired users. "
         "The user has just opened the app or pointed their camera at a scene. "

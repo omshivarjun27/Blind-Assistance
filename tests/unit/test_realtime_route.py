@@ -595,10 +595,18 @@ def test_websocket_image_message_queued_for_next_turn():
 
 def test_websocket_image_first_turn_defaults_to_scene_describe():
     """If no prior transcript exists but image is present, default to visual intent."""
+    from apps.backend.services.dashscope.multimodal_client import VisionResponse
+
     turn = _make_mock_turn(assistant_text="I see a desk", user_text="")
     mock_client = _mock_client(turn)
     mock_config = MagicMock()
     mock_classifier = MagicMock()
+    mock_classifier.close = AsyncMock(return_value=None)
+    mock_mm_client = MagicMock()
+    mock_mm_client.close = AsyncMock(return_value=None)
+    mock_mm_client.analyze = AsyncMock(
+        return_value=VisionResponse(text="A desk and a chair")
+    )
 
     with (
         patch(
@@ -613,6 +621,14 @@ def test_websocket_image_first_turn_defaults_to_scene_describe():
             "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
             return_value=mock_classifier,
         ),
+        patch(
+            "apps.backend.api.routes.realtime.MultimodalClient.from_settings",
+            return_value=mock_mm_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.assess_frame_quality",
+            return_value=(True, ""),
+        ),
     ):
         with TestClient(app) as client:
             with client.websocket_connect("/ws/realtime") as ws:
@@ -620,14 +636,7 @@ def test_websocket_image_first_turn_defaults_to_scene_describe():
                 ws.send_bytes(b"\x00" * 3200)
                 _ = ws.receive_bytes()
 
-    update_call = mock_client.async_update_instructions.call_args
-    update_instructions = (
-        update_call[1].get("instructions")
-        if update_call and update_call[1]
-        else (update_call[0][0] if update_call and update_call[0] else "")
-    )
-    assert update_instructions is not None
-    assert "Describe what you see" in update_instructions
+    mock_mm_client.analyze.assert_awaited_once()
 
 
 # ── ping/pong ─────────────────────────────────────────────────────
@@ -867,6 +876,153 @@ def test_websocket_current_turn_read_text_routes_to_heavy_vision():
     vision_request = mock_mm_client.analyze.await_args.args[0]
     assert vision_request.image_jpeg_b64 == "image-one"
     assert mock_classifier.classify.await_count == 1
+
+
+def test_heavy_vision_dispatch_on_scene_intent(caplog):
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+    from apps.backend.services.dashscope.multimodal_client import VisionResponse
+
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turns = [
+        _make_mock_turn(audio=b"\x01\x02" * 20, assistant_text="warmup", user_text="hello"),
+        _make_mock_turn(audio=b"\x01\x02" * 40, assistant_text="scene", user_text="what do you see"),
+    ]
+    mock_client = _mock_client(turns)
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock(
+        return_value=ClassificationResult(
+            intent=IntentCategory.SCENE_DESCRIBE,
+            confidence="high",
+            raw_label="SCENE_DESCRIBE",
+        )
+    )
+    mock_classifier.close = AsyncMock(return_value=None)
+    mock_mm_client = MagicMock()
+    mock_mm_client.close = AsyncMock(return_value=None)
+    order: list[str] = []
+
+    def coach_ok(_: str | None):
+        order.append("coach")
+        return True, ""
+
+    async def analyze_ok(req):
+        order.append("vision")
+        return VisionResponse(text="A table and a chair")
+
+    mock_mm_client.analyze = AsyncMock(side_effect=analyze_ok)
+
+    with (
+        patch("apps.backend.api.routes.realtime.QwenRealtimeClient", return_value=mock_client),
+        patch("apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings", return_value=MagicMock()),
+        patch("apps.backend.api.routes.realtime.IntentClassifier.from_settings", return_value=mock_classifier),
+        patch("apps.backend.api.routes.realtime.MultimodalClient.from_settings", return_value=mock_mm_client),
+        patch("apps.backend.api.routes.realtime.assess_frame_quality", side_effect=coach_ok),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+                ws.send_text(json.dumps({"type": "image", "data": "image-two"}))
+                ws.send_bytes(b"\x00" * 3200)
+                response = _receive_until_bytes(ws)
+
+    assert response == turns[1].assistant_audio_pcm
+    assert order == ["coach", "vision"]
+    assert "Heavy vision dispatch — intent: SCENE_DESCRIPTION" in caplog.text
+    assert "CaptureCoach: frame accepted" in caplog.text
+    assert "Vision model response received" in caplog.text
+    assert "Heavy vision audio sent to user" in caplog.text
+
+
+def test_capture_coach_rejection_blocks_vision_model(caplog):
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turns = [
+        _make_mock_turn(audio=b"\x03\x04" * 20, assistant_text="warmup", user_text="hello"),
+        _make_mock_turn(audio=b"\x03\x04" * 40, assistant_text="hold still", user_text="describe my surroundings"),
+    ]
+    mock_client = _mock_client(turns)
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock(
+        return_value=ClassificationResult(
+            intent=IntentCategory.SCENE_DESCRIBE,
+            confidence="high",
+            raw_label="SCENE_DESCRIBE",
+        )
+    )
+    mock_classifier.close = AsyncMock(return_value=None)
+    mock_mm_client = MagicMock()
+    mock_mm_client.close = AsyncMock(return_value=None)
+    mock_mm_client.analyze = AsyncMock()
+
+    with (
+        patch("apps.backend.api.routes.realtime.QwenRealtimeClient", return_value=mock_client),
+        patch("apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings", return_value=MagicMock()),
+        patch("apps.backend.api.routes.realtime.IntentClassifier.from_settings", return_value=mock_classifier),
+        patch("apps.backend.api.routes.realtime.MultimodalClient.from_settings", return_value=mock_mm_client),
+        patch("apps.backend.api.routes.realtime.assess_frame_quality", return_value=(False, "Hold the camera still.")),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+                ws.send_text(json.dumps({"type": "image", "data": "image-two"}))
+                ws.send_bytes(b"\x00" * 3200)
+                response = _receive_until_bytes(ws)
+
+    assert response == turns[1].assistant_audio_pcm
+    mock_mm_client.analyze.assert_not_awaited()
+    assert "CaptureCoach rejected frame — Hold the camera still." in caplog.text
+
+
+def test_heavy_vision_not_called_on_general_chat():
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+
+    turns = [
+        _make_mock_turn(audio=b"\x05\x06" * 20, assistant_text="warmup", user_text="hello"),
+        _make_mock_turn(audio=b"\x05\x06" * 40, assistant_text="hello", user_text="how are you"),
+    ]
+    mock_client = _mock_client(turns)
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock(
+        return_value=ClassificationResult(
+            intent=IntentCategory.GENERAL_CHAT,
+            confidence="high",
+            raw_label="GENERAL_CHAT",
+        )
+    )
+    mock_classifier.close = AsyncMock(return_value=None)
+    mock_mm_client = MagicMock()
+    mock_mm_client.close = AsyncMock(return_value=None)
+    mock_mm_client.analyze = AsyncMock()
+
+    with (
+        patch("apps.backend.api.routes.realtime.QwenRealtimeClient", return_value=mock_client),
+        patch("apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings", return_value=MagicMock()),
+        patch("apps.backend.api.routes.realtime.IntentClassifier.from_settings", return_value=mock_classifier),
+        patch("apps.backend.api.routes.realtime.MultimodalClient.from_settings", return_value=mock_mm_client),
+        patch("apps.backend.api.routes.realtime.assess_frame_quality", return_value=(True, "")),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                _ = ws.receive_text()
+                _ = ws.receive_text()
+
+                ws.send_text(json.dumps({"type": "image", "data": "image-two"}))
+                ws.send_bytes(b"\x00" * 3200)
+                response = _receive_until_bytes(ws)
+
+    assert response == turns[1].assistant_audio_pcm
+    mock_mm_client.analyze.assert_not_awaited()
 
 
 # ── disconnect ────────────────────────────────────────────────────
