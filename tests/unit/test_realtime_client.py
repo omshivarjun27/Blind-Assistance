@@ -590,6 +590,33 @@ def test_response_create_after_commit():
     assert commit_idx < create_idx
 
 
+def test_streaming_response_create_supports_per_response_instructions():
+    """Per-response instructions should be sent on response.create, not session.update."""
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+    )
+
+    client = QwenRealtimeClient(QwenRealtimeConfig(api_key="test-key"))
+    client._connected = True
+    client._ws = MagicMock()
+    sent: list[dict[str, Any]] = []
+    client._ws.send = lambda data: sent.append(json.loads(data))
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "ensure_connected", lambda: None)
+        mp.setattr(client, "_collect_response", lambda result, on_audio_chunk=None: None)
+        client.create_response_for_prepared_turn_streaming(
+            lambda _chunk: None,
+            instructions="Say exactly this to the user: A table and a chair",
+        )
+
+    assert sent[-1]["type"] == "response.create"
+    assert sent[-1]["response"]["instructions"] == (
+        "Say exactly this to the user: A table and a chair"
+    )
+
+
 # ── reconnect tests ───────────────────────────────────────────────
 
 
@@ -848,6 +875,7 @@ def test_cancel_response_sends_event():
     client.cancel_response()
     sent = json.loads(client._ws.send.call_args[0][0])
     assert sent["type"] == "response.cancel"
+    assert client._response_active is False
 
 
 def test_cancel_response_noop_when_not_connected():
@@ -864,7 +892,7 @@ def test_cancel_response_noop_when_not_connected():
     client.cancel_response()
 
 
-def test_cancel_response_noop_when_no_active_response():
+def test_cancel_ignored_when_no_active_response():
     """cancel_response() must not send when no upstream response is active."""
     from apps.backend.services.dashscope.realtime_client import (
         QwenRealtimeClient,
@@ -990,6 +1018,58 @@ def test_barge_in_flag_resets_on_new_turn():
         client.create_response_for_prepared_turn_streaming(lambda chunk: None)
 
     assert observed["cancelled"] is False
+
+
+@pytest.mark.asyncio
+async def test_error_event_triggers_reconnect():
+    """Recoverable none-active-response errors should reconnect and retry the turn."""
+    import apps.backend.services.dashscope.realtime_client as rc
+
+    client = rc.QwenRealtimeClient(rc.QwenRealtimeConfig(api_key="test-key"))
+    reconnect_calls = {"count": 0}
+    prepare_calls = {"count": 0}
+
+    async def fake_async_reconnect() -> None:
+        reconnect_calls["count"] += 1
+
+    def fake_prepare_audio_turn(audio_pcm: bytes, image_jpeg_b64=None):
+        prepare_calls["count"] += 1
+        if prepare_calls["count"] == 1:
+            raise rc.RecoverableRealtimeError("Conversation has none active response")
+        return "hello"
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "prepare_audio_turn", fake_prepare_audio_turn)
+        mp.setattr(client, "async_reconnect", fake_async_reconnect)
+        transcript = await client.async_prepare_audio_turn(b"\x00" * 3200, None)
+
+    assert transcript == "hello"
+    assert reconnect_calls["count"] == 1
+    assert prepare_calls["count"] == 2
+
+
+def test_wait_for_event_marks_recoverable_none_active_response():
+    """Recoverable DashScope errors should reset session state and raise a recoverable error."""
+    import apps.backend.services.dashscope.realtime_client as rc
+
+    client = rc.QwenRealtimeClient(rc.QwenRealtimeConfig(api_key="test-key"))
+    client._session_updated_confirmed = True
+    client._response_active = True
+    error_event = {
+        "type": "error",
+        "error": {
+            "message": "Conversation has none active response",
+            "type": "invalid_request_error",
+        },
+    }
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "_recv_ws_event", lambda timeout=None: error_event)
+        with pytest.raises(rc.RecoverableRealtimeError, match="none active response"):
+            client._wait_for_event("input_audio_buffer.committed", timeout=1.0)
+
+    assert client._session_updated_confirmed is False
+    assert client._response_active is False
 
 
 # ── compress_image tests ──────────────────────────────────────────

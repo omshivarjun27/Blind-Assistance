@@ -358,27 +358,12 @@ async def _handle_control_message(
         return True, pending_image_b64, pending_instructions
 
     if msg_type == "interrupt":
-        if client.has_active_response():
-            client.cancel_response()
-            logger.info("Barge-in detected — response cancelled")
+        if not client.has_active_response():
+            logger.debug("Cancel request ignored — no active response")
             return True, pending_image_b64, pending_instructions
 
-        elapsed = (
-            time.monotonic() - last_response_complete_at
-            if last_response_complete_at > 0.0
-            else float("inf")
-        )
-        if elapsed < 1.5:
-            logger.debug(
-                "Interrupt BLOCKED (premature): %.2fs since last response",
-                elapsed,
-            )
-            return True, pending_image_b64, pending_instructions
         client.cancel_response()
-        logger.info(
-            "Interrupt received from browser — response.cancel sent (%.2fs since last response complete)",
-            elapsed,
-        )
+        logger.info("Barge-in detected — response cancelled")
         return True, pending_image_b64, pending_instructions
 
     logger.warning("Unknown control message type: %r", msg_type)
@@ -855,7 +840,11 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         applied_target.value,
                     )
 
-                if (not instructions_already_updated) and (
+                should_update_session_instructions = (
+                    applied_target != RouteTarget.HEAVY_VISION
+                )
+
+                if should_update_session_instructions and (not instructions_already_updated) and (
                     effective_instructions != _last_instructions
                 ):
                     try:
@@ -868,6 +857,10 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 loop = _asyncio.get_running_loop()
                 streamed_audio = False
                 heavy_vision_audio_logged = False
+                response_instructions: str | None = None
+
+                if applied_target == RouteTarget.HEAVY_VISION:
+                    response_instructions = effective_instructions
 
                 def _forward_audio_delta(delta_bytes: bytes) -> None:
                     nonlocal streamed_audio, heavy_vision_audio_logged
@@ -903,9 +896,14 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         "Audio streaming started — intent not yet resolved (correct behavior)"
                     )
 
+                create_response_kwargs: dict[str, Any] = {}
+                if response_instructions is not None:
+                    create_response_kwargs["instructions"] = response_instructions
+
                 turn_task = _asyncio.create_task(
                     client.async_create_response_for_prepared_turn_streaming(
-                        _forward_audio_delta
+                        _forward_audio_delta,
+                        **create_response_kwargs,
                     )
                 )
                 result, queued_data, pending_image_b64, pending_instructions, should_close_session = await _await_turn_result_or_messages(
@@ -920,6 +918,15 @@ async def realtime_endpoint(ws: WebSocket) -> None:
 
                 if should_close_session or result is None:
                     break
+
+                if queued_data is not None and (
+                    result.response_cancelled or client.was_response_cancelled()
+                ):
+                    logger.info(
+                        "DashScope response cancelled — reconnecting before queued turn"
+                    )
+                    await client.async_reconnect()
+
                 _last_response_complete_at = time.monotonic()
 
                 if not result.user_transcript:

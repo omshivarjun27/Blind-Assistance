@@ -46,6 +46,10 @@ class SessionState(str, Enum):
     IDLE = "idle"
 
 
+class RecoverableRealtimeError(RuntimeError):
+    """Raised when the current realtime session is recoverable via reconnect."""
+
+
 def _default_realtime_model() -> str:
     from shared.config.settings import QWEN_REALTIME_MODEL
 
@@ -220,6 +224,8 @@ class QwenRealtimeClient:
             self._ws = None
             self._connected = False
             self._response_active = False
+            self._response_cancelled = False
+            self._discarded_audio_chunks = 0
             self._session_start_time = None
             self._session_started_at = None
             self._session_updated_confirmed = False
@@ -234,14 +240,16 @@ class QwenRealtimeClient:
             pass
         finally:
             self._ws = None
-        self._connected = False
-        self._response_active = False
-        self._session_start_time = None
-        self._session_started_at = None
-        self._session_updated_confirmed = False
-        self._session_update_sent_at = None
-        self._buffered_events.clear()
-        self._state = SessionState.DISCONNECTED
+            self._connected = False
+            self._response_active = False
+            self._response_cancelled = False
+            self._discarded_audio_chunks = 0
+            self._session_start_time = None
+            self._session_started_at = None
+            self._session_updated_confirmed = False
+            self._session_update_sent_at = None
+            self._buffered_events.clear()
+            self._state = SessionState.DISCONNECTED
         logger.info("Realtime session closed")
 
     async def async_close(self) -> None:
@@ -259,6 +267,9 @@ class QwenRealtimeClient:
 
     def has_active_response(self) -> bool:
         return self._response_active
+
+    def was_response_cancelled(self) -> bool:
+        return self._response_cancelled
 
     def session_needs_reconnect(self) -> bool:
         """True when session is near the 120-minute lifetime limit."""
@@ -375,10 +386,17 @@ class QwenRealtimeClient:
         image_jpeg_b64: Optional[str] = None,
     ) -> str | None:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: self.prepare_audio_turn(audio_pcm, image_jpeg_b64),
-        )
+        try:
+            return await loop.run_in_executor(
+                None,
+                lambda: self.prepare_audio_turn(audio_pcm, image_jpeg_b64),
+            )
+        except RecoverableRealtimeError:
+            await self.async_reconnect()
+            return await loop.run_in_executor(
+                None,
+                lambda: self.prepare_audio_turn(audio_pcm, image_jpeg_b64),
+            )
 
     def update_instructions(self, instructions: Optional[str] = None) -> None:
         """Apply session instructions and wait until DashScope acknowledges them."""
@@ -388,13 +406,25 @@ class QwenRealtimeClient:
         self._send_session_update(instructions=instructions)
         self._wait_for_session_updated(timeout=_SESSION_UPDATED_TIMEOUT_S)
 
+    @staticmethod
+    def _build_response_create_payload(
+        instructions: Optional[str] = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"type": "response.create"}
+        if instructions:
+            payload["response"] = {"instructions": instructions}
+        return payload
+
     async def async_update_instructions(
         self, instructions: Optional[str] = None
     ) -> None:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: self.update_instructions(instructions))
 
-    def create_response_for_prepared_turn(self) -> QwenRealtimeTurn:
+    def create_response_for_prepared_turn(
+        self,
+        instructions: Optional[str] = None,
+    ) -> QwenRealtimeTurn:
         """Create a response for already-committed input and collect output."""
         self.ensure_connected()
         result = QwenRealtimeTurn()
@@ -404,14 +434,14 @@ class QwenRealtimeClient:
             (event.get("type", "")).startswith("response.")
             for event in self._buffered_events
         ):
-            self._send_event({"type": "response.create"})
-        self._response_active = True
+            self._send_event(self._build_response_create_payload(instructions))
         self._collect_response(result)
         return result
 
     def create_response_for_prepared_turn_streaming(
         self,
         on_audio_chunk: Callable[[bytes], None],
+        instructions: Optional[str] = None,
     ) -> QwenRealtimeTurn:
         """Create a response and forward audio deltas immediately."""
         self.ensure_connected()
@@ -422,23 +452,32 @@ class QwenRealtimeClient:
             (event.get("type", "")).startswith("response.")
             for event in self._buffered_events
         ):
-            self._send_event({"type": "response.create"})
-        self._response_active = True
+            self._send_event(self._build_response_create_payload(instructions))
         self._collect_response(result, on_audio_chunk=on_audio_chunk)
         return result
 
-    async def async_create_response_for_prepared_turn(self) -> QwenRealtimeTurn:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.create_response_for_prepared_turn)
-
-    async def async_create_response_for_prepared_turn_streaming(
+    async def async_create_response_for_prepared_turn(
         self,
-        on_audio_chunk: Callable[[bytes], None],
+        instructions: Optional[str] = None,
     ) -> QwenRealtimeTurn:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
-            lambda: self.create_response_for_prepared_turn_streaming(on_audio_chunk),
+            lambda: self.create_response_for_prepared_turn(instructions),
+        )
+
+    async def async_create_response_for_prepared_turn_streaming(
+        self,
+        on_audio_chunk: Callable[[bytes], None],
+        instructions: Optional[str] = None,
+    ) -> QwenRealtimeTurn:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.create_response_for_prepared_turn_streaming(
+                on_audio_chunk,
+                instructions,
+            ),
         )
 
     # ── internal helpers ──────────────────────────────────────
@@ -470,14 +509,41 @@ class QwenRealtimeClient:
 
     def cancel_response(self) -> None:
         """Send response.cancel to DashScope to stop current output."""
-        if not self._connected or self._ws is None or not self._response_active:
+        if not self._response_active:
+            logger.debug("Cancel request ignored — no active response")
+            return
+        if not self._connected or self._ws is None:
             return
         try:
             self._response_cancelled = True
             self._send_event({"type": "response.cancel"})
+            self._response_active = False
             logger.info("response.cancel sent to DashScope")
         except Exception as exc:
             logger.warning("cancel_response failed: %s", exc)
+
+    @staticmethod
+    def _extract_error_message(event: dict[str, Any]) -> str:
+        error = event.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str) and message.strip():
+                return message
+            error_type = error.get("type")
+            if isinstance(error_type, str) and error_type.strip():
+                return error_type
+        message = event.get("message")
+        if isinstance(message, str) and message.strip():
+            return message
+        return str(event)
+
+    @classmethod
+    def _is_recoverable_session_error(cls, message: str) -> bool:
+        lowered = message.lower()
+        return (
+            "none active response" in lowered
+            or "invalid_request_error" in lowered
+        )
 
     def _recv_event(self, timeout: Optional[float] = None) -> dict[str, Any]:
         if self._buffered_events:
@@ -539,7 +605,19 @@ class QwenRealtimeClient:
             if t == expected_type:
                 return event
             if t == "error":
-                raise RuntimeError(f"Server error waiting for {expected_type}: {event}")
+                message = self._extract_error_message(event)
+                if expected_type == "input_audio_buffer.committed" and self._is_recoverable_session_error(message):
+                    logger.error(
+                        "DashScope session error: %s — triggering reconnect",
+                        message,
+                    )
+                    self._session_updated_confirmed = False
+                    self._response_active = False
+                    self._response_cancelled = False
+                    raise RecoverableRealtimeError(message)
+                raise RuntimeError(
+                    f"Server error waiting for {expected_type}: {event}"
+                )
             if expected_type == "session.updated" and t.startswith("response."):
                 self._buffer_event(event)
                 logger.debug(
@@ -668,7 +746,6 @@ class QwenRealtimeClient:
         self._wait_for_event("input_audio_buffer.committed", timeout=10.0)
         if auto_create_response:
             self._send_event({"type": "response.create"})
-            self._response_active = True
         logger.debug(
             "Streamed %d bytes audio, image=%s",
             len(pcm_bytes),
@@ -706,6 +783,9 @@ class QwenRealtimeClient:
 
             if t == "conversation.item.input_audio_transcription.completed":
                 result.user_transcript = event.get("transcript", "")
+
+            elif t == "response.created":
+                self._response_active = True
 
             elif t == "response.audio_transcript.delta":
                 text_deltas.append(event.get("delta", ""))

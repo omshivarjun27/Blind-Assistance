@@ -86,6 +86,7 @@ def _mock_client(turn: Any):
     client.is_connected = MagicMock(return_value=True)
     client.session_needs_reconnect = MagicMock(return_value=False)
     client.needs_reconnect = MagicMock(return_value=False)
+    client.was_response_cancelled = MagicMock(return_value=False)
     client._last_session_updated_elapsed_ms = 0
     client.close = MagicMock()
     return client
@@ -1278,6 +1279,8 @@ def test_heavy_vision_dispatch_on_scene_intent(caplog):
                 _ = _receive_until_bytes(ws)
                 _ = ws.receive_text()
                 _ = ws.receive_text()
+                mock_client.async_update_instructions.reset_mock()
+                mock_client.async_create_response_for_prepared_turn_streaming.reset_mock()
 
                 ws.send_text(json.dumps({"type": "image", "data": "image-two"}))
                 ws.send_bytes(b"\x00" * 3200)
@@ -1289,6 +1292,13 @@ def test_heavy_vision_dispatch_on_scene_intent(caplog):
     assert "CaptureCoach: frame accepted" in caplog.text
     assert "Vision model response received" in caplog.text
     assert "Heavy vision audio sent to user" in caplog.text
+    mock_client.async_update_instructions.assert_not_awaited()
+    assert (
+        mock_client.async_create_response_for_prepared_turn_streaming.await_args.kwargs[
+            "instructions"
+        ]
+        == "Say exactly this to the user: A table and a chair"
+    )
 
 
 def test_capture_coach_rejection_blocks_vision_model(caplog):
@@ -1926,6 +1936,41 @@ def test_interrupt_control_message_calls_cancel_response():
     mock_client.cancel_response.assert_called_once()
 
 
+def test_interrupt_ignored_when_no_active_response(caplog):
+    """Idle interrupt messages must not trigger cancel or inf elapsed logs."""
+    caplog.set_level("DEBUG", logger="ally-vision-realtime-route")
+    turn = _make_mock_turn()
+    mock_client = _mock_client(turn)
+    mock_client.has_active_response = MagicMock(return_value=False)
+    mock_client.cancel_response = MagicMock()
+    mock_memory_manager = MagicMock()
+    mock_memory_manager.store.initialize = AsyncMock()
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MemoryManager.from_settings",
+            return_value=mock_memory_manager,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_text(json.dumps({"type": "interrupt"}))
+                ws.send_text(json.dumps({"type": "ping"}))
+                assert json.loads(ws.receive_text())["type"] == "pong"
+
+    mock_client.cancel_response.assert_not_called()
+    assert "Cancel request ignored — no active response" in caplog.text
+    assert "response.cancel sent (inf" not in caplog.text
+
+
 def test_mid_response_interrupt_cancels_active_stream():
     """Interrupts arriving during an active streamed response must cancel immediately."""
 
@@ -1976,6 +2021,68 @@ def test_mid_response_interrupt_cancels_active_stream():
                 _ = ws.receive_text()
 
     mock_client.cancel_response.assert_called_once()
+
+
+def test_cancelled_turn_reconnects_before_processing_queued_audio():
+    """A cancelled streamed turn should reconnect before consuming queued next-turn audio."""
+
+    cancelled = asyncio.Event()
+    first_turn = _make_mock_turn(audio=b"", assistant_text="", user_text="describe this")
+    first_turn.response_cancelled = True
+    second_turn = _make_mock_turn(
+        audio=b"\x01\x02" * 20,
+        assistant_text="hello again",
+        user_text="hello again",
+    )
+    mock_client = _mock_client([first_turn, second_turn])
+    mock_client._response_active = False
+    mock_client.has_active_response = MagicMock(
+        side_effect=lambda: mock_client._response_active
+    )
+    mock_client.was_response_cancelled = MagicMock(side_effect=lambda: cancelled.is_set())
+
+    async def fake_stream(_forward_audio_delta, instructions=None):
+        if not cancelled.is_set():
+            mock_client._response_active = True
+            await cancelled.wait()
+            return first_turn
+        _forward_audio_delta(second_turn.assistant_audio_pcm)
+        return _clone_mock_turn(second_turn, audio=b"")
+
+    def fake_cancel_response():
+        mock_client._response_active = False
+        cancelled.set()
+
+    mock_client.async_create_response_for_prepared_turn_streaming = AsyncMock(
+        side_effect=fake_stream
+    )
+    mock_client.cancel_response = MagicMock(side_effect=fake_cancel_response)
+    mock_memory_manager = MagicMock()
+    mock_memory_manager.store.initialize = AsyncMock()
+    mock_memory_manager.get_startup_memory_context = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MemoryManager.from_settings",
+            return_value=mock_memory_manager,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                ws.send_bytes(b"\x01" * 3200)
+                response = _receive_until_bytes(ws)
+
+    assert response == second_turn.assistant_audio_pcm
+    mock_client.async_reconnect.assert_awaited_once()
 
 
 # ── _is_memory_query tests (Plan 05 patch) ──────────────────────────────────
