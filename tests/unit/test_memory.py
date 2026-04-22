@@ -168,7 +168,33 @@ async def test_memory_manager_save_strips_prefix():
     result = await manager.save("u1", "remember that my doctor is Dr. Sharma")
     assert result == "my doctor is Dr. Sharma"
     mock_store.save_fact.assert_called_once_with(
-        "u1", "my doctor is Dr. Sharma", [0.1] * 1024
+        "u1",
+        "my doctor is Dr. Sharma",
+        [0.1] * 1024,
+        category="MEDICAL",
+        priority=2,
+        dedupe_by_category=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_memory_manager_save_strips_keep_in_mind_prefix():
+    mock_embedder = AsyncMock()
+    mock_embedder.embed = AsyncMock(return_value=[0.1] * 1024)
+    mock_store = AsyncMock()
+    mock_store.save_fact = AsyncMock(return_value=1)
+
+    manager = MemoryManager(embedder=mock_embedder, store=mock_store)
+    result = await manager.save("u1", "keep in mind that my name is Om")
+
+    assert result == "my name is Om"
+    mock_store.save_fact.assert_called_once_with(
+        "u1",
+        "my name is Om",
+        [0.1] * 1024,
+        category="NAME",
+        priority=2,
+        dedupe_by_category=True,
     )
 
 
@@ -308,8 +334,7 @@ async def test_mem0_extractor_returns_facts():
         }
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(return_value=mock_response)
-        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_client_cls.return_value = mock_client
 
         extractor = Mem0Extractor(
             api_key="test",
@@ -331,8 +356,7 @@ async def test_mem0_extractor_returns_empty_on_no_facts():
         mock_response.json.return_value = {"choices": [{"message": {"content": "[]"}}]}
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(return_value=mock_response)
-        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_client_cls.return_value = mock_client
 
         extractor = Mem0Extractor(
             api_key="test",
@@ -349,8 +373,7 @@ async def test_mem0_extractor_returns_empty_on_failure():
     with patch("httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(side_effect=Exception("boom"))
-        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_client_cls.return_value = mock_client
 
         extractor = Mem0Extractor(
             api_key="test",
@@ -450,7 +473,7 @@ async def test_memory_manager_auto_extract_stores_facts():
     mock_store.save_fact = AsyncMock(return_value=1)
     mock_extractor = MagicMock()
     mock_extractor.extract = AsyncMock(
-        return_value=[{"fact": "Om", "category": "IDENTITY", "tier": "long"}]
+        return_value=[{"fact": "User's name is Om", "category": "NAME", "tier": "long"}]
     )
 
     manager = MemoryManager(
@@ -462,10 +485,12 @@ async def test_memory_manager_auto_extract_stores_facts():
 
     mock_store.save_fact.assert_called_once_with(
         "default",
-        "Om",
+        "User's name is Om",
         [0.2] * 1024,
         tier="long",
-        category="IDENTITY",
+        category="NAME",
+        priority=1,
+        dedupe_by_category=True,
     )
 
 

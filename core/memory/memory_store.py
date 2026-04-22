@@ -137,6 +137,8 @@ class MemoryStore:
         embedding: list[float],
         tier: str = "long",
         category: str = "GENERAL",
+        priority: int = 0,
+        dedupe_by_category: bool = False,
     ) -> int:
         """Store a fact + its embedding. Returns the new row id."""
         embedding_json = json.dumps(embedding)
@@ -209,19 +211,33 @@ class MemoryStore:
 
         updated_at = created_at
         async with aiosqlite.connect(self._db_path) as db:
+            if dedupe_by_category and category.upper() != "GENERAL":
+                latest_cursor = await db.execute(
+                    "SELECT id FROM long_term_memories WHERE user_id=? AND category=? ORDER BY created_at DESC LIMIT 1",
+                    (user_id, category),
+                )
+                latest_row = await latest_cursor.fetchone()
+                if latest_row is not None:
+                    existing_id = int(latest_row[0])
+                    await db.execute(
+                        "UPDATE long_term_memories SET fact=?, embedding_json=?, category=?, priority=?, updated_at=? WHERE id=?",
+                        (fact, embedding_json, category, priority, updated_at, existing_id),
+                    )
+                    await db.commit()
+                    return existing_id
             if best_id is not None and best_sim > 0.92:
                 await db.execute(
-                    "UPDATE long_term_memories SET fact=?, embedding_json=?, category=?, updated_at=? WHERE id=?",
-                    (fact, embedding_json, category, updated_at, best_id),
+                    "UPDATE long_term_memories SET fact=?, embedding_json=?, category=?, priority=?, updated_at=? WHERE id=?",
+                    (fact, embedding_json, category, priority, updated_at, best_id),
                 )
                 await db.commit()
                 return best_id
 
             cursor = await db.execute(
                 "INSERT INTO long_term_memories "
-                "(user_id, fact, embedding_json, category, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, fact, embedding_json, category, created_at, updated_at),
+                "(user_id, fact, embedding_json, category, priority, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user_id, fact, embedding_json, category, priority, created_at, updated_at),
             )
             await db.commit()
             row_id = cursor.lastrowid
@@ -340,8 +356,8 @@ class MemoryStore:
                     """
                     SELECT fact
                     FROM long_term_memories
-                    WHERE user_id = ? AND priority = 1
-                    ORDER BY created_at DESC
+                    WHERE user_id = ? AND priority >= 1
+                    ORDER BY priority DESC, created_at DESC
                     LIMIT ?
                     """,
                     (user_id, top_k),

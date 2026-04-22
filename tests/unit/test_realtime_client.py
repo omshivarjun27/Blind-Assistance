@@ -25,7 +25,7 @@ def test_config_defaults():
     from apps.backend.services.dashscope.realtime_client import QwenRealtimeConfig
 
     cfg = QwenRealtimeConfig(api_key="test-key")
-    assert cfg.model == "qwen3.5-omni-flash-realtime"
+    assert cfg.model == "qwen3.5-omni-plus-realtime"
     assert "realtime" in cfg.model
     assert cfg.endpoint == "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime"
     assert cfg.endpoint.startswith("wss://")
@@ -33,7 +33,7 @@ def test_config_defaults():
     assert cfg.audio_out_rate == 24000
     assert cfg.chunk_bytes == 3200
     assert cfg.voice == "Tina"
-    assert cfg.transcription_model == "qwen3-asr-flash-realtime"
+    assert cfg.transcription_model == "gummy-realtime-v1"
 
 
 def test_config_defaults_follow_reloaded_settings():
@@ -60,7 +60,7 @@ def test_config_defaults_follow_reloaded_settings():
         assert cfg.model == settings_module.QWEN_REALTIME_MODEL
         assert cfg.endpoint == settings_module.DASHSCOPE_REALTIME_URL
         assert cfg.voice == settings_module.QWEN_OMNI_VOICE
-        assert cfg.transcription_model == "qwen3-asr-flash-realtime"
+        assert cfg.transcription_model == settings_module.QWEN_TRANSCRIPTION_MODEL
     finally:
         if original_model is None:
             os.environ.pop("QWEN_REALTIME_DEV", None)
@@ -92,11 +92,11 @@ def test_default_voice_for_model_prefers_tina_for_qwen35_omni_models():
     assert default_voice_for_model("qwen3.5-omni-plus-realtime") == "Tina"
 
 
-def test_default_voice_for_model_keeps_cherry_for_qwen3_flash():
-    """Legacy qwen3 flash realtime model should keep Cherry."""
+def test_default_voice_for_model_prefers_tina_for_legacy_models_too():
+    """The env-driven runtime voice should stay Tina for legacy model strings too."""
     from apps.backend.services.dashscope.realtime_client import default_voice_for_model
 
-    assert default_voice_for_model("flash-realtime") == "Cherry"
+    assert default_voice_for_model("flash-realtime") == "Tina"
 
 
 def test_config_from_settings_reads_env():
@@ -111,11 +111,11 @@ def test_config_from_settings_reads_env():
 
 
 def test_config_from_settings_uses_fixed_asr_model():
-    """Phase 1 pins the realtime transcription model to qwen3 ASR."""
+    """Runtime transcription model comes from settings."""
     from apps.backend.services.dashscope.realtime_client import QwenRealtimeConfig
 
     cfg = QwenRealtimeConfig.from_settings()
-    assert cfg.transcription_model == "qwen3-asr-flash-realtime"
+    assert cfg.transcription_model == "gummy-realtime-v1"
 
 
 def test_config_from_settings_raises_on_missing_key():
@@ -206,13 +206,7 @@ def test_session_update_payload_structure():
     assert session["output_audio_format"] == "pcm"
     assert isinstance(session.get("instructions"), str)
     assert "You are Ally" in session["instructions"]
-    assert session["turn_detection"] == {
-        "type": "server_vad",
-        "threshold": 0.5,
-        "prefix_padding_ms": 300,
-        "silence_duration_ms": 500,
-        "interrupt_response": True,
-    }
+    assert session["turn_detection"] is None
     assert session["input_audio_transcription"]["model"] == "qwen3-asr-flash-realtime"
 
 
@@ -293,7 +287,7 @@ def test_connect_surfaces_session_update_failure_context():
     )
 
     cfg = QwenRealtimeConfig(
-        api_key="test-key", model="qwen3.5-omni-flash-realtime", voice="Tina"
+        api_key="test-key", model="qwen3.5-omni-plus-realtime", voice="Tina"
     )
     client = QwenRealtimeClient(cfg)
     fake_ws = MagicMock()
@@ -313,7 +307,7 @@ def test_connect_surfaces_session_update_failure_context():
 
         with pytest.raises(
             RuntimeError,
-            match="qwen3.5-omni-flash-realtime.*Tina.*api-ws/v1/realtime.*sess-created",
+            match="qwen3.5-omni-plus-realtime.*Tina.*api-ws/v1/realtime.*sess-created",
         ):
             client.connect()
 
@@ -480,14 +474,43 @@ def test_transcript_timeout_does_not_block_audio(caplog):
                 },
             ]
         )
-        mp.setattr(client, "_recv_ws_event", lambda timeout=None: next(ws_events))
+
+        def fake_recv_ws_event(timeout=None):
+            try:
+                return next(ws_events)
+            except StopIteration as exc:
+                raise websocket.WebSocketTimeoutException() from exc
+
+        mp.setattr(client, "_recv_ws_event", fake_recv_ws_event)
         transcript = client.prepare_audio_turn(b"\x00" * 3200, None)
         result = client.create_response_for_prepared_turn_streaming(chunks.append)
 
     assert transcript is None
-    assert "input_audio_transcription.completed not received in 3s" in caplog.text
+    assert "input_audio_transcription.completed not received in 6s" in caplog.text
     assert chunks == [b"\x01\x02"]
     assert result.success is True
+
+
+def test_prepare_audio_turn_uses_6_second_transcript_timeout():
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+    )
+
+    client = QwenRealtimeClient(QwenRealtimeConfig(api_key="test-key"))
+    observed: dict[str, float] = {}
+
+    def fake_wait_for_input_transcript(timeout: float = 0.0):
+        observed["timeout"] = timeout
+        return None
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "ensure_connected", lambda: None)
+        mp.setattr(client, "_stream_audio", lambda *args, **kwargs: None)
+        mp.setattr(client, "_wait_for_input_transcript", fake_wait_for_input_transcript)
+        client.prepare_audio_turn(b"\x00" * 3200, None)
+
+    assert observed["timeout"] == 6.0
 
 
 def test_transcript_received_before_audio():
@@ -615,6 +638,69 @@ def test_streaming_response_create_supports_per_response_instructions():
     assert sent[-1]["response"]["instructions"] == (
         "Say exactly this to the user: A table and a chair"
     )
+
+
+def test_streaming_response_create_sends_user_input_text_before_response():
+    """Context text should be injected as conversation.item.create before response.create."""
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+    )
+
+    client = QwenRealtimeClient(QwenRealtimeConfig(api_key="test-key"))
+    client._connected = True
+    client._ws = MagicMock()
+    sent: list[dict[str, Any]] = []
+    client._ws.send = lambda data: sent.append(json.loads(data))
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "ensure_connected", lambda: None)
+        mp.setattr(client, "_collect_response", lambda result, on_audio_chunk=None: None)
+        client.create_response_for_prepared_turn_streaming(
+            lambda _chunk: None,
+            user_input_text="[Camera sees]: A table and a chair",
+        )
+
+    assert sent[-2]["type"] == "conversation.item.create"
+    assert sent[-2]["item"] == {
+        "type": "message",
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": "[Camera sees]: A table and a chair",
+            }
+        ],
+    }
+    assert sent[-1]["type"] == "response.create"
+
+
+def test_streamed_audio_bytes_are_counted_even_with_callback():
+    from apps.backend.services.dashscope.realtime_client import (
+        QwenRealtimeClient,
+        QwenRealtimeConfig,
+        QwenRealtimeTurn,
+    )
+
+    audio_bytes = b"\x05\x06\x07\x08"
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    client = QwenRealtimeClient(QwenRealtimeConfig(api_key="test-key"))
+    result = QwenRealtimeTurn()
+    delivered: list[bytes] = []
+    events = iter(
+        [
+            {"type": "response.audio.delta", "delta": audio_b64},
+            {"type": "response.done", "response": {"status": "completed", "usage": {}}},
+        ]
+    )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(client, "_recv_event", lambda timeout=None: next(events))
+        client._collect_response(result, on_audio_chunk=delivered.append)
+
+    assert delivered == [audio_bytes]
+    assert result.assistant_audio_bytes == len(audio_bytes)
+    assert result.assistant_audio_pcm == audio_bytes
 
 
 # ── reconnect tests ───────────────────────────────────────────────
@@ -1048,8 +1134,8 @@ async def test_error_event_triggers_reconnect():
     assert prepare_calls["count"] == 2
 
 
-def test_wait_for_event_marks_recoverable_none_active_response():
-    """Recoverable DashScope errors should reset session state and raise a recoverable error."""
+def test_wait_for_event_marks_commit_failure_on_none_active_response():
+    """Commit-time DashScope errors should mark the turn failed and request reconnect."""
     import apps.backend.services.dashscope.realtime_client as rc
 
     client = rc.QwenRealtimeClient(rc.QwenRealtimeConfig(api_key="test-key"))
@@ -1065,9 +1151,11 @@ def test_wait_for_event_marks_recoverable_none_active_response():
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(client, "_recv_ws_event", lambda timeout=None: error_event)
-        with pytest.raises(rc.RecoverableRealtimeError, match="none active response"):
+        with pytest.raises(rc.TurnCommitFailedError, match="none active response"):
             client._wait_for_event("input_audio_buffer.committed", timeout=1.0)
 
+    assert client._last_commit_failed is True
+    assert client._last_commit_error_message == "Conversation has none active response"
     assert client._session_updated_confirmed is False
     assert client._response_active is False
 

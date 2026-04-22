@@ -15,6 +15,8 @@ from typing import Optional
 
 import httpx
 
+from apps.backend.services.shared_http import get_vision_http_client
+
 logger = logging.getLogger("ally-multimodal-client")
 
 _MAX_B64_BYTES = 10 * 1024 * 1024  # 10MB
@@ -57,6 +59,9 @@ class MultimodalClient:
         self._http: httpx.AsyncClient | None = None
 
     def _get_http(self) -> httpx.AsyncClient:
+        shared = get_vision_http_client()
+        if shared is not None:
+            return shared
         if self._http is None:
             self._http = httpx.AsyncClient(
                 timeout=60.0,

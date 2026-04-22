@@ -83,6 +83,22 @@ async def test_classify_returns_general_chat_on_empty():
 
 
 @pytest.mark.asyncio
+async def test_classify_visual_scene_phrase_short_circuits_without_api_call():
+    from core.orchestrator.intent_classifier import (
+        IntentCategory,
+        IntentClassifier,
+    )
+
+    clf = IntentClassifier(api_key="test-key")
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        result = await clf.classify("What object do you see in my hand?")
+
+    mock_client_cls.assert_not_called()
+    assert result.intent == IntentCategory.SCENE_DESCRIBE
+    assert result.confidence == "high"
+
+
+@pytest.mark.asyncio
 async def test_classify_returns_general_chat_on_whitespace():
     from core.orchestrator.intent_classifier import (
         IntentCategory,

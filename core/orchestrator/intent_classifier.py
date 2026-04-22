@@ -18,7 +18,21 @@ from typing import Optional
 
 import httpx
 
+from apps.backend.services.shared_http import get_compat_http_client
+
 logger = logging.getLogger("ally-intent-classifier")
+
+
+def _default_classifier_model() -> str:
+    from shared.config.settings import QWEN_TURBO_MODEL
+
+    return QWEN_TURBO_MODEL
+
+
+def _default_compat_base() -> str:
+    from shared.config.settings import DASHSCOPE_COMPAT_BASE
+
+    return DASHSCOPE_COMPAT_BASE
 
 _LABELS = [
     "SCENE_DESCRIBE",
@@ -40,6 +54,16 @@ _CLASSIFICATION_PROMPT = (
     "translate to Hindi, translate to English, etc. "
     "Reply with ONLY the category name, nothing else.\n"
     "Request: {transcript}"
+)
+
+_SCENE_DESCRIBE_PHRASES = (
+    "what object",
+    "what do you see",
+    "what is in my hand",
+    "can you see",
+    "what is this",
+    "look at this",
+    "describe this",
 )
 
 
@@ -71,6 +95,11 @@ def _fallback(error: Optional[str] = None) -> ClassificationResult:
     )
 
 
+def _matches_scene_describe_phrase(transcript: str) -> bool:
+    normalized = transcript.lower().strip()
+    return any(phrase in normalized for phrase in _SCENE_DESCRIBE_PHRASES)
+
+
 class IntentClassifier:
     """
     Classifies user speech transcript using qwen-turbo.
@@ -80,8 +109,8 @@ class IntentClassifier:
     def __init__(
         self,
         api_key: str,
-        model: str = "qwen-turbo",
-        base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        model: str = _default_classifier_model(),
+        base_url: str = _default_compat_base(),
     ) -> None:
         self._api_key = api_key
         self._model = model
@@ -89,6 +118,9 @@ class IntentClassifier:
         self._http: httpx.AsyncClient | None = None
 
     def _get_http(self) -> httpx.AsyncClient:
+        shared = get_compat_http_client()
+        if shared is not None:
+            return shared
         if self._http is None:
             self._http = httpx.AsyncClient(timeout=3.0)
         return self._http
@@ -113,6 +145,13 @@ class IntentClassifier:
                 intent=IntentCategory.GENERAL_CHAT,
                 confidence="high",
                 raw_label="",
+            )
+
+        if _matches_scene_describe_phrase(transcript):
+            return ClassificationResult(
+                intent=IntentCategory.SCENE_DESCRIBE,
+                confidence="high",
+                raw_label="SCENE_DESCRIBE_RULE",
             )
 
         prompt = _CLASSIFICATION_PROMPT.format(transcript=transcript.strip())

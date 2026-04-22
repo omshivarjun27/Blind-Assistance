@@ -3,6 +3,7 @@
 const STATUS_CONFIG: Record<string, { label: string; dot: string }> = {
   idle:       { label: 'Ready',      dot: 'bg-zinc-400' },
   connecting: { label: 'Connecting', dot: 'bg-yellow-400 animate-pulse' },
+  reconnecting: { label: 'Reconnecting', dot: 'bg-amber-400 animate-pulse' },
   listening:  { label: 'Listening',  dot: 'bg-green-400 animate-pulse' },
   thinking:   { label: 'Thinking',   dot: 'bg-blue-400 animate-pulse' },
   speaking:   { label: 'Speaking',   dot: 'bg-purple-400 animate-pulse' },

@@ -36,6 +36,44 @@ logger = logging.getLogger("qwen-realtime-client")
 # Session safety margin: reconnect at 110 min (before 120 min expiry)
 _SESSION_MAX_LIFETIME_S = 110 * 60
 _SESSION_UPDATED_TIMEOUT_S = 5.0
+_INPUT_TRANSCRIPT_TIMEOUT_S = 6.0
+
+
+def detect_and_clean_transcript(text: str) -> tuple[str, str]:
+    """Return (cleaned_text, detected_language_code)."""
+    if not text or not text.strip():
+        return text, "unknown"
+
+    for ch in text:
+        cp = ord(ch)
+        if 0x0C80 <= cp <= 0x0CFF:
+            return text, "kn"
+        if 0x0900 <= cp <= 0x097F:
+            return text, "hi"
+        if 0x0B80 <= cp <= 0x0BFF:
+            return text, "ta"
+
+    suspicious = False
+    for ch in text:
+        cp = ord(ch)
+        if 0x4E00 <= cp <= 0x9FFF:
+            suspicious = True
+            break
+        if 0x0E00 <= cp <= 0x0E7F:
+            suspicious = True
+            break
+        if 0x0102 <= cp <= 0x01B0:
+            suspicious = True
+            break
+
+    if suspicious:
+        logger.warning(
+            "Transcript appears to be wrong language: %r — likely mis-transcription of Kannada/Hindi",
+            text[:50],
+        )
+        return "", "wrong_lang"
+
+    return text, "en"
 
 
 class SessionState(str, Enum):
@@ -48,6 +86,10 @@ class SessionState(str, Enum):
 
 class RecoverableRealtimeError(RuntimeError):
     """Raised when the current realtime session is recoverable via reconnect."""
+
+
+class TurnCommitFailedError(RuntimeError):
+    """Raised when the current turn failed before a response could be created."""
 
 
 def _default_realtime_model() -> str:
@@ -63,7 +105,9 @@ def _default_realtime_endpoint() -> str:
 
 
 def _default_transcription_model() -> str:
-    return "qwen3-asr-flash-realtime"
+    from shared.config.settings import QWEN_TRANSCRIPTION_MODEL
+
+    return QWEN_TRANSCRIPTION_MODEL
 
 
 def _default_realtime_voice() -> str:
@@ -74,14 +118,19 @@ def _default_realtime_voice() -> str:
 
 def default_voice_for_model(model: str) -> str:
     """Return the safest default voice for a realtime model family."""
-    model_lower = model.lower()
-    if "qwen3.5-omni-flash" in model_lower:
-        return "Tina"
-    if "qwen3.5-omni-plus" in model_lower:
-        return "Tina"
-    if "qwen3-omni-flash" in model_lower:
-        return "Cherry"
-    return "Cherry"
+    from shared.config.settings import QWEN_OMNI_VOICE
+
+    return QWEN_OMNI_VOICE or "Tina"
+
+
+def _wire_transcription_model(model: str) -> str:
+    if model == "gummy-realtime-v1":
+        logger.warning(
+            "Transcription model %s is not compatible with DashScope realtime session.update — using qwen3-asr-flash-realtime on the wire",
+            model,
+        )
+        return "qwen3-asr-flash-realtime"
+    return model
 
 
 @dataclass
@@ -93,9 +142,18 @@ class QwenRealtimeConfig:
     endpoint: str = field(default_factory=_default_realtime_endpoint)
     voice: str = field(default_factory=_default_realtime_voice)
     instructions: str = (
-        "You are Ally, a real-time voice and vision assistant for blind users. "
+        "You are Ally, an AI assistant for visually impaired users. "
+        "You have a live camera feed. "
+        "When a message contains [Camera sees], it contains a real-time description of what the camera currently sees. "
+        "Use it to answer visual questions. Never say you cannot see — always use the camera context provided to you. "
+        "If no [Camera sees] context is provided, do not invent visual details. "
         "You support 113 spoken languages including English, Hindi, and Kannada. "
-        "Always detect the language the user is speaking and respond in the SAME language. "
+        "The user is from Karnataka, India. They speak Kannada (ಕನ್ನಡ), Hindi (हिंदी), and English. "
+        "They do NOT speak Chinese, Vietnamese, Thai, Japanese, or other East/Southeast Asian languages. "
+        "Always detect the user's actual spoken language and respond in the SAME language. "
+        "If the user's speech is transcribed in Chinese, Vietnamese, Thai, or any other unexpected script, ignore that transcription and ask the user to repeat in Kannada, Hindi, or English. "
+        "Never respond in Chinese, Thai, Vietnamese, or Japanese. "
+        "If language is unclear, default to Kannada. "
         "Never switch languages unless explicitly asked. "
         "You have access to vision (camera frames), memory (stored facts), and function calling. "
         "Respond concisely — blind users cannot see the screen. "
@@ -120,7 +178,7 @@ class QwenRealtimeConfig:
                 settings_module.QWEN_OMNI_VOICE
                 or default_voice_for_model(settings_module.QWEN_REALTIME_MODEL)
             ),
-            transcription_model="qwen3-asr-flash-realtime",
+            transcription_model=settings_module.QWEN_TRANSCRIPTION_MODEL,
         )
 
 
@@ -134,6 +192,7 @@ class QwenRealtimeTurn:
     usage: dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
     response_cancelled: bool = False
+    assistant_audio_bytes: int = 0
 
     @property
     def success(self) -> bool:
@@ -171,6 +230,9 @@ class QwenRealtimeClient:
         self._last_session_updated_elapsed_ms: int = 0
         self._response_cancelled: bool = False
         self._discarded_audio_chunks: int = 0
+        self._last_commit_failed: bool = False
+        self._last_commit_error_message: str = ""
+        self._total_audio_bytes_appended: int = 0
 
     # ── connection lifecycle ──────────────────────────────────
 
@@ -270,6 +332,21 @@ class QwenRealtimeClient:
 
     def was_response_cancelled(self) -> bool:
         return self._response_cancelled
+
+    def has_buffered_response_events(self) -> bool:
+        return any(
+            isinstance(event, dict)
+            and str(event.get("type", "")).startswith("response.")
+            for event in self._buffered_events
+        )
+
+    def consume_last_commit_failure(self) -> str | None:
+        if not self._last_commit_failed:
+            return None
+        message = self._last_commit_error_message or "Voice turn failed"
+        self._last_commit_failed = False
+        self._last_commit_error_message = ""
+        return message
 
     def session_needs_reconnect(self) -> bool:
         """True when session is near the 120-minute lifetime limit."""
@@ -377,8 +454,10 @@ class QwenRealtimeClient:
     ) -> str | None:
         """Stream a turn, commit it, and wait for the input transcript."""
         self.ensure_connected()
+        self._last_commit_failed = False
+        self._last_commit_error_message = ""
         self._stream_audio(audio_pcm, image_jpeg_b64, auto_create_response=False)
-        return self._wait_for_input_transcript(timeout=3.0)
+        return self._wait_for_input_transcript(timeout=_INPUT_TRANSCRIPT_TIMEOUT_S)
 
     async def async_prepare_audio_turn(
         self,
@@ -391,6 +470,9 @@ class QwenRealtimeClient:
                 None,
                 lambda: self.prepare_audio_turn(audio_pcm, image_jpeg_b64),
             )
+        except TurnCommitFailedError:
+            await self.async_reconnect()
+            return None
         except RecoverableRealtimeError:
             await self.async_reconnect()
             return await loop.run_in_executor(
@@ -415,6 +497,22 @@ class QwenRealtimeClient:
             payload["response"] = {"instructions": instructions}
         return payload
 
+    @staticmethod
+    def _build_user_message_item_payload(text: str) -> dict[str, Any]:
+        return {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": text,
+                    }
+                ],
+            },
+        }
+
     async def async_update_instructions(
         self, instructions: Optional[str] = None
     ) -> None:
@@ -424,6 +522,7 @@ class QwenRealtimeClient:
     def create_response_for_prepared_turn(
         self,
         instructions: Optional[str] = None,
+        user_input_text: Optional[str] = None,
     ) -> QwenRealtimeTurn:
         """Create a response for already-committed input and collect output."""
         self.ensure_connected()
@@ -434,6 +533,8 @@ class QwenRealtimeClient:
             (event.get("type", "")).startswith("response.")
             for event in self._buffered_events
         ):
+            if user_input_text:
+                self._send_event(self._build_user_message_item_payload(user_input_text))
             self._send_event(self._build_response_create_payload(instructions))
         self._collect_response(result)
         return result
@@ -442,6 +543,7 @@ class QwenRealtimeClient:
         self,
         on_audio_chunk: Callable[[bytes], None],
         instructions: Optional[str] = None,
+        user_input_text: Optional[str] = None,
     ) -> QwenRealtimeTurn:
         """Create a response and forward audio deltas immediately."""
         self.ensure_connected()
@@ -452,6 +554,8 @@ class QwenRealtimeClient:
             (event.get("type", "")).startswith("response.")
             for event in self._buffered_events
         ):
+            if user_input_text:
+                self._send_event(self._build_user_message_item_payload(user_input_text))
             self._send_event(self._build_response_create_payload(instructions))
         self._collect_response(result, on_audio_chunk=on_audio_chunk)
         return result
@@ -459,17 +563,22 @@ class QwenRealtimeClient:
     async def async_create_response_for_prepared_turn(
         self,
         instructions: Optional[str] = None,
+        user_input_text: Optional[str] = None,
     ) -> QwenRealtimeTurn:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
-            lambda: self.create_response_for_prepared_turn(instructions),
+            lambda: self.create_response_for_prepared_turn(
+                instructions,
+                user_input_text,
+            ),
         )
 
     async def async_create_response_for_prepared_turn_streaming(
         self,
         on_audio_chunk: Callable[[bytes], None],
         instructions: Optional[str] = None,
+        user_input_text: Optional[str] = None,
     ) -> QwenRealtimeTurn:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -477,6 +586,7 @@ class QwenRealtimeClient:
             lambda: self.create_response_for_prepared_turn_streaming(
                 on_audio_chunk,
                 instructions,
+                user_input_text,
             ),
         )
 
@@ -606,7 +716,21 @@ class QwenRealtimeClient:
                 return event
             if t == "error":
                 message = self._extract_error_message(event)
-                if expected_type == "input_audio_buffer.committed" and self._is_recoverable_session_error(message):
+                if expected_type == "input_audio_buffer.committed":
+                    error = event.get("error")
+                    code = error.get("code") if isinstance(error, dict) else "unknown"
+                    logger.error(
+                        "DashScope InternalError on buffer commit: %s — %s",
+                        code,
+                        message,
+                    )
+                    self._last_commit_failed = True
+                    self._last_commit_error_message = message
+                    self._session_updated_confirmed = False
+                    self._response_active = False
+                    self._response_cancelled = False
+                    raise TurnCommitFailedError(message)
+                if self._is_recoverable_session_error(message):
                     logger.error(
                         "DashScope session error: %s — triggering reconnect",
                         message,
@@ -652,22 +776,27 @@ class QwenRealtimeClient:
                     "input_audio_format": "pcm",
                     "output_audio_format": "pcm",
                     "input_audio_transcription": {
-                        "model": self._config.transcription_model,
+                        "model": _wire_transcription_model(
+                            self._config.transcription_model
+                        ),
                     },
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": 0.5,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 500,
-                        "interrupt_response": True,
-                    },
+                    "turn_detection": None,
                 },
             }
         )
 
-    def _wait_for_input_transcript(self, timeout: float = 3.0) -> str | None:
+    def _wait_for_input_transcript(
+        self,
+        timeout: float = _INPUT_TRANSCRIPT_TIMEOUT_S,
+    ) -> str | None:
         """Wait for current-turn transcription before creating a response."""
         deadline = time.monotonic() + timeout
+        deferred_events: list[dict[str, Any]] = []
+
+        def _restore_deferred_events() -> None:
+            while deferred_events:
+                self._buffered_events.appendleft(deferred_events.pop())
+
         while time.monotonic() < deadline:
             remaining = max(0.5, deadline - time.monotonic())
             try:
@@ -682,26 +811,33 @@ class QwenRealtimeClient:
             if event_type == "conversation.item.input_audio_transcription.completed":
                 transcript = event.get("transcript", "")
                 text = transcript if isinstance(transcript, str) else ""
+                cleaned_text, detected_lang = detect_and_clean_transcript(text)
                 logger.info(
-                    'input_audio_transcription.completed received — transcript: "%s"',
+                    'input_audio_transcription.completed received — transcript: "%s" cleaned: "%s" lang=%s',
                     text,
+                    cleaned_text,
+                    detected_lang,
                 )
-                return text
+                _restore_deferred_events()
+                return cleaned_text
             if event_type == "error":
+                _restore_deferred_events()
                 raise RuntimeError(f"Server error waiting for transcript: {event}")
             if event_type.startswith("response."):
-                self._buffer_event(event)
-                logger.warning(
-                    "input_audio_transcription.completed not received in 3s — continuing without transcript"
+                deferred_events.append(event)
+                logger.debug(
+                    "Buffering event type=%s while waiting for transcript",
+                    event_type,
                 )
-                return None
+                continue
 
             logger.debug(
                 "Skipping event type=%s while waiting for transcript", event_type
             )
 
+        _restore_deferred_events()
         logger.warning(
-            "input_audio_transcription.completed not received in 3s — continuing without transcript"
+            "input_audio_transcription.completed not received in 6s — continuing without transcript"
         )
         return None
 
@@ -716,10 +852,12 @@ class QwenRealtimeClient:
         self._state = SessionState.STREAMING
         self._turn_started_at = time.monotonic()
         chunk = self._config.chunk_bytes
+        self._total_audio_bytes_appended = 0
         image_sent = False
 
         for i in range(0, len(pcm_bytes), chunk):
             audio_chunk = pcm_bytes[i : i + chunk]
+            self._total_audio_bytes_appended += len(audio_chunk)
             self._send_event(
                 {
                     "type": "input_audio_buffer.append",
@@ -740,10 +878,23 @@ class QwenRealtimeClient:
                     }
                 )
                 image_sent = True
-                logger.debug("Image sent after first audio chunk")
+                logger.debug(
+                    "Image sent in supported audio-first order — size=%d chars",
+                    len(image_jpeg_b64),
+                )
+
+        if self._total_audio_bytes_appended == 0:
+            logger.warning("Skipping commit — empty audio buffer (0 bytes appended)")
+            self._state = SessionState.IDLE
+            self._turn_started_at = None
+            return
 
         self._send_event({"type": "input_audio_buffer.commit"})
         self._wait_for_event("input_audio_buffer.committed", timeout=10.0)
+        if self._last_commit_failed:
+            self._state = SessionState.IDLE
+            self._turn_started_at = None
+            return
         if auto_create_response:
             self._send_event({"type": "response.create"})
         logger.debug(
@@ -782,7 +933,9 @@ class QwenRealtimeClient:
             t = event.get("type", "")
 
             if t == "conversation.item.input_audio_transcription.completed":
-                result.user_transcript = event.get("transcript", "")
+                transcript = event.get("transcript", "")
+                if isinstance(transcript, str):
+                    result.user_transcript = detect_and_clean_transcript(transcript)[0]
 
             elif t == "response.created":
                 self._response_active = True
@@ -802,6 +955,7 @@ class QwenRealtimeClient:
                     if self._response_cancelled:
                         self._discarded_audio_chunks += 1
                         continue
+                    result.assistant_audio_bytes += len(delta_bytes)
                     if (
                         not first_audio_delta_logged
                         and self._turn_started_at is not None
@@ -813,8 +967,7 @@ class QwenRealtimeClient:
                         first_audio_delta_logged = True
                     if on_audio_chunk is not None:
                         on_audio_chunk(delta_bytes)
-                    else:
-                        audio_chunks.extend(delta_bytes)
+                    audio_chunks.extend(delta_bytes)
 
             elif t == "response.audio.done":
                 pass  # audio.delta already collected
@@ -885,7 +1038,7 @@ class QwenRealtimeClient:
         logger.info(
             "Turn complete: transcript=%d chars audio=%d bytes",
             len(result.assistant_transcript),
-            len(result.assistant_audio_pcm),
+            result.assistant_audio_bytes,
         )
 
 

@@ -46,15 +46,15 @@ DASHSCOPE_COMPAT_BASE: str = _get(
 # Model selection by profile
 QWEN_REALTIME_MODEL: str = _get(
     "QWEN_REALTIME_EXAM" if _is_exam else "QWEN_REALTIME_DEV",
-    "qwen3.5-omni-plus-realtime" if _is_exam else "qwen3.5-omni-flash-realtime",
+    "qwen3.5-omni-plus-realtime",
 )
-QWEN_OMNI_VOICE: str = _get("QWEN_OMNI_VOICE", "")
-QWEN_HEAVY_VISION_MODEL: str = _get("QWEN_HEAVY_VISION_MODEL", "qwen3.5-plus")
+QWEN_OMNI_VOICE: str = _get("QWEN_OMNI_VOICE", "Tina")
+QWEN_HEAVY_VISION_MODEL: str = _get("QWEN_HEAVY_VISION_MODEL", "qwen3.6-plus")
 QWEN_VISION_MODEL: str = _get(
     "QWEN_HEAVY_VISION_MODEL",
     _get(
         "QWEN_VISION_EXAM" if _is_exam else "QWEN_VISION_DEV",
-        "qwen3.5-plus",
+        "qwen3.6-plus",
     ),
 )
 QWEN_TRANSCRIPTION_MODEL: str = _get("QWEN_TRANSCRIPTION_MODEL", "gummy-realtime-v1")
@@ -64,7 +64,8 @@ QWEN_TURBO_MODEL: str = _get("QWEN_TURBO_MODEL", "qwen-turbo")
 EMBEDDING_MODEL: str = _get("EMBEDDING_MODEL", "text-embedding-v4")
 EMBEDDING_DIMENSIONS: int = int(_get("EMBEDDING_DIMENSIONS", "1024"))
 EMBEDDING_OUTPUT_TYPE: str = _get("EMBEDDING_OUTPUT_TYPE", "dense")
-MEMORY_DB_PATH: str = os.getenv("MEMORY_DB_PATH", "data/sqlite/memory.db")
+_DEFAULT_MEMORY_DB_PATH = pathlib.Path(__file__).resolve().parents[2] / "data" / "sqlite" / "memory.db"
+MEMORY_DB_PATH: str = os.getenv("MEMORY_DB_PATH", str(_DEFAULT_MEMORY_DB_PATH))
 
 # Ensure parent directory exists at settings load time
 pathlib.Path(MEMORY_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -97,6 +98,6 @@ def get_config() -> dict[str, object]:
 
 # Learning layer knobs (Plan 10)
 LEARNING_DECAY_FACTOR: float = 0.3
-LEARNING_FAILURE_THRESHOLD: float = 1.5
+LEARNING_FAILURE_THRESHOLD: float = 1.0
 LEARNING_PATCH_MONITOR_TURNS: int = 10
 LEARNING_PRIORITY_PROMOTION_MIN_RECALLS: int = 3

@@ -44,9 +44,17 @@ export function useCameraCapture() {
     // Use requestVideoFrameCallback if available for fresher frame
     // Feature detect — not all browsers support it
     ctx.drawImage(video, 0, 0);
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
-    // Strip the data URL prefix, return only base64
-    return dataUrl.replace('data:image/jpeg;base64,', '');
+    for (const quality of [0.85, 0.75, 0.65, 0.55, 0.45, 0.4]) {
+      const dataUrl = canvas.toDataURL('image/jpeg', quality);
+      const base64 = dataUrl.replace('data:image/jpeg;base64,', '');
+      const approxBytes = Math.ceil((base64.length * 3) / 4);
+      if (approxBytes <= 400 * 1024) {
+        return base64;
+      }
+    }
+
+    const fallback = canvas.toDataURL('image/jpeg', 0.4);
+    return fallback.replace('data:image/jpeg;base64,', '');
   }
 
   function disableCamera(): void {

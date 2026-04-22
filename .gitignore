@@ -1,5 +1,7 @@
 # Secrets
 .env
+.env.*
+!.env.example
 
 # Python
 .venv/
@@ -8,11 +10,15 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+.pytest_cache/
 *.egg-info/
 dist/
 build/
 
 # Data
+data/
+*.db
+*.sqlite
 data/sqlite/*.db
 data/captures/
 data/docsessions/
@@ -21,20 +27,33 @@ data/reflections/
 
 # Logs
 *.log
+logs/
 *.tmp
 
 # OpenCode
 .opencode/
+.playwright-mcp/
 
 # Node
 node_modules/
 .next/
 out/
+apps/frontend/node_modules/
+apps/frontend/.next/
+apps/frontend/out/
+
+# Local artifacts / reference repos
+live-audio/
+dashscope-sdk-java-ref/
+dashscope-sdk-python-ref/
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # IDE
 .vscode/
 .idea/
+
+.sisyphus/

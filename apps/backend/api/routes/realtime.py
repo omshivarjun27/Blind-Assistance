@@ -121,6 +121,8 @@ _CORRECTION_SIGNALS: frozenset[str] = frozenset(
     {
         "that's wrong",
         "thats wrong",
+        "that is wrong",
+        "you're wrong",
         "no that's not right",
         "no thats not right",
         "incorrect",
@@ -134,6 +136,8 @@ _CORRECTION_SIGNALS: frozenset[str] = frozenset(
         "ತಪ್ಪು",
         "ಇಲ್ಲ",
         "ಸರಿಯಿಲ್ಲ",
+        "ಅದು ತಪ್ಪು",
+        "ತಪ್ಪಾಗಿದೆ",
         "गलत है",
         "गलत",
         "नहीं",
@@ -154,6 +158,136 @@ _GREETING_PATTERNS: tuple[str, ...] = (
     "good afternoon",
 )
 
+_ACK_WORDS: frozenset[str] = frozenset(
+    {
+        "ok",
+        "okay",
+        "yes",
+        "no",
+        "yeah",
+        "sure",
+        "indeed",
+        "alright",
+        "right",
+        "fine",
+        "good",
+        "got it",
+        "i see",
+        "understood",
+        "thanks",
+        "thank you",
+        "cool",
+        "great",
+        "nice",
+        "हाँ",
+        "नहीं",
+        "ठीक है",
+        "अच्छा",
+        "हां",
+        "ओके",
+        "ಹೌದು",
+        "ಇಲ್ಲ",
+        "ಸರಿ",
+        "ಆಯ್ತು",
+        "ಒಕೆ",
+        "ಧನ್ಯವಾದ",
+    }
+)
+
+_VISION_TRIGGERS: tuple[str, ...] = (
+    "see",
+    "look",
+    "what",
+    "describe",
+    "show",
+    "read",
+    "tell me what",
+    "what is",
+    "what's",
+    "who is",
+    "who's",
+    "where is",
+    "which",
+    "color",
+    "text",
+    "sign",
+    "write",
+    "written",
+    "number",
+    "find",
+    "identify",
+    "any",
+    "help me see",
+    "can you see",
+    "देखो",
+    "क्या है",
+    "बताओ",
+    "दिखाओ",
+    "पढ़ो",
+    "कौन",
+    "कहाँ है",
+    "रंग",
+    "लिखा",
+    "नंबर",
+    "ನೋಡು",
+    "ಏನು",
+    "ಹೇಳು",
+    "ತೋರಿಸು",
+    "ಓದು",
+    "ಯಾರು",
+    "ಎಲ್ಲಿ",
+    "ಬಣ್ಣ",
+    "ಬರೆದಿದೆ",
+    "ಸಂಖ್ಯೆ",
+)
+
+_MEMORY_SAVE_TRIGGERS: tuple[str, ...] = (
+    "permanent memory",
+    "store permanently",
+    "remember forever",
+    "save permanently",
+    "long term",
+    "remember this always",
+    "ಶಾಶ್ವತ ಸ್ಮರಣೆ",
+    "हमेशा के लिए याद",
+)
+
+_SHORT_GENERAL_CHAT_PHRASES: frozenset[str] = frozenset(
+    {
+        "how are you",
+        "who are you",
+        "what can you do",
+        "can you help",
+        "help me",
+    }
+)
+
+_PERSONAL_MEMORY_KEYWORDS: tuple[str, ...] = (
+    "my name",
+    "i am",
+    "i'm",
+    "my city",
+    "i live",
+    "my doctor",
+    "my school",
+    "my job",
+    "my age",
+    "remember",
+    "store",
+    "save",
+    "note",
+    "ನನ್ನ ಹೆಸರು",
+    "ನಾನು",
+    "ನನ್ನ",
+    "ನನ್ನ ನಗರ",
+    "मेरा नाम",
+    "मैं",
+    "मेरा",
+    "मेरी",
+)
+
+_SEND_EXCEPTIONS = (WebSocketDisconnect, RuntimeError, ConnectionResetError)
+
 
 def _is_correction_signal(transcript: str) -> tuple[bool, str]:
     """Returns (is_correction, matched_signal). Never raises."""
@@ -169,6 +303,101 @@ def _is_greeting(text: str) -> bool:
     return any(pattern in cleaned for pattern in _GREETING_PATTERNS) and len(cleaned) < 80
 
 
+def _normalize_spoken_text(text: str) -> str:
+    return text.strip().lower().strip(".?!,;:。！？،")
+
+
+def _is_acknowledgement(text: str) -> bool:
+    cleaned = _normalize_spoken_text(text)
+    return cleaned in _ACK_WORDS
+
+
+def _contains_vision_trigger(text: str) -> bool:
+    cleaned = _normalize_spoken_text(text)
+    return any(trigger in cleaned for trigger in _VISION_TRIGGERS)
+
+
+def _should_force_scene_describe(transcript: str, image_present: bool) -> bool:
+    if not image_present:
+        return False
+    cleaned = _normalize_spoken_text(transcript)
+    if not cleaned:
+        return True
+    if cleaned in _ACK_WORDS:
+        return False
+    if cleaned in _SHORT_GENERAL_CHAT_PHRASES or _is_greeting(cleaned):
+        return False
+    return len(cleaned.split()) <= 3
+
+
+def _is_explicit_memory_save_request(transcript: str) -> bool:
+    cleaned = transcript.strip()
+    if not cleaned or _is_effective_silence(cleaned):
+        return False
+    if build_memory_fact(cleaned) != cleaned:
+        return True
+    lowered = cleaned.lower()
+    return any(token in lowered for token in _MEMORY_SAVE_TRIGGERS)
+
+
+def _should_auto_extract_memory(
+    transcript: str,
+    intent: IntentCategory | None,
+    route_target: RouteTarget,
+) -> bool:
+    cleaned = transcript.strip()
+    if not cleaned or _is_effective_silence(cleaned):
+        return False
+    if route_target == RouteTarget.MEMORY_WRITE or intent == IntentCategory.MEMORY_SAVE:
+        return True
+    if intent not in {IntentCategory.GENERAL_CHAT, IntentCategory.MEMORY_RECALL}:
+        return False
+    lowered = cleaned.lower()
+    return any(keyword in lowered for keyword in _PERSONAL_MEMORY_KEYWORDS)
+
+
+def _build_memory_write_confirmation(saved_fact: str) -> str:
+    return f"Done. I've saved that you told me: {saved_fact}."
+
+
+def _is_short_ambiguous_general_chat(
+    transcript: str,
+    intent: IntentCategory | None,
+) -> bool:
+    cleaned = transcript.strip()
+    if intent != IntentCategory.GENERAL_CHAT or not cleaned:
+        return False
+    if "?" in cleaned or _is_greeting(cleaned):
+        return False
+    return len(cleaned.split()) < 4
+
+
+def _build_short_input_clarification_prompt(transcript: str) -> str:
+    return (
+        f"The user said: '{transcript}'. This is very short. "
+        "Please ask one short clarifying question before answering."
+    )
+
+
+def _is_short_visual_fragment(transcript: str) -> bool:
+    cleaned = transcript.strip()
+    if not cleaned:
+        return True
+    return len(cleaned.split()) < 3
+
+
+def _detect_script(text: str) -> str:
+    for ch in text:
+        cp = ord(ch)
+        if 0x0C80 <= cp <= 0x0CFF:
+            return "kn"
+        if 0x0900 <= cp <= 0x097F:
+            return "hi"
+        if 0x4E00 <= cp <= 0x9FFF:
+            return "zh"
+    return "en"
+
+
 def _normalize_memory_fact(fact: str) -> str:
     cleaned = fact.strip()
     if cleaned.lower().startswith("object/text seen: "):
@@ -181,6 +410,20 @@ def _build_memory_recall_system_prompt(base_prompt: str, facts: list[str]) -> st
         return base_prompt
     context_block = "\n".join(f"- {fact}" for fact in facts)
     return f"{base_prompt}\n\nWhat I know about you:\n{context_block}"
+
+
+def _build_exact_memory_recall_note(query: str, facts: list[str]) -> str:
+    lowered_query = query.lower()
+    if not any(token in lowered_query for token in ("name", "ಹೆಸರು", "नाम")):
+        return ""
+    for fact in facts:
+        lowered_fact = fact.lower().strip().rstrip(".")
+        if lowered_fact.startswith("user's name is ") or lowered_fact.startswith("user name is "):
+            return (
+                "The user asked about their name. According to memory, their name is exactly: "
+                f"'{fact}'. Use this exact name in your response."
+            )
+    return ""
 
 
 async def _apply_memory_recall_instructions(
@@ -204,8 +447,44 @@ async def _apply_memory_recall_instructions(
     else:
         logger.info("Memory retrieval: no facts above threshold — using base prompt")
     system_prompt = _build_memory_recall_system_prompt(base_prompt, facts)
+    exact_note = _build_exact_memory_recall_note(query, facts)
+    if exact_note:
+        system_prompt = f"{system_prompt}\n\n{exact_note}"
     await client.async_update_instructions(system_prompt)
     return system_prompt
+
+
+async def _safe_send_json(ws: WebSocket, payload: dict[str, Any]) -> bool:
+    try:
+        await ws.send_text(json.dumps(payload))
+        return True
+    except _SEND_EXCEPTIONS as exc:
+        logger.warning("Frontend WebSocket closed before send: %s", exc)
+        return False
+
+
+async def _safe_send_bytes(ws: WebSocket, payload: bytes) -> bool:
+    try:
+        await ws.send_bytes(payload)
+        return True
+    except _SEND_EXCEPTIONS as exc:
+        logger.warning("Frontend WebSocket closed before send: %s", exc)
+        return False
+
+
+async def _safe_close_websocket(ws: WebSocket) -> None:
+    try:
+        await ws.close()
+    except _SEND_EXCEPTIONS:
+        return
+
+
+async def _send_heartbeat(ws: WebSocket, interval: float = 5.0) -> None:
+    while True:
+        await _asyncio.sleep(interval)
+        sent = await _safe_send_json(ws, {"type": "ping"})
+        if not sent:
+            return
 
 
 def _build_memory_reply(
@@ -354,17 +633,17 @@ async def _handle_control_message(
         return True, pending_image_b64, pending_instructions
 
     if msg_type == "ping":
-        await ws.send_text(json.dumps({"type": "pong"}))
-        return True, pending_image_b64, pending_instructions
+        sent = await _safe_send_json(ws, {"type": "pong"})
+        return sent, pending_image_b64, pending_instructions
 
     if msg_type == "interrupt":
         if not client.has_active_response():
-            logger.debug("Cancel request ignored — no active response")
-            return True, pending_image_b64, pending_instructions
+            logger.debug("Cancel: no active response — image slot flushed")
+            return True, None, pending_instructions
 
         client.cancel_response()
         logger.info("Barge-in detected — response cancelled")
-        return True, pending_image_b64, pending_instructions
+        return True, None, pending_instructions
 
     logger.warning("Unknown control message type: %r", msg_type)
     return False, pending_image_b64, pending_instructions
@@ -467,21 +746,20 @@ async def _send_upstream_error(
     message: str,
     config: QwenRealtimeConfig,
 ) -> None:
-    await ws.send_text(
-        json.dumps(
-            {
-                "type": "error",
-                "code": "upstream_realtime_unavailable",
-                "message": message,
-                "details": {
-                    "model": config.model,
-                    "voice": config.voice,
-                    "endpoint": config.endpoint,
-                },
-            }
-        )
+    await _safe_send_json(
+        ws,
+        {
+            "type": "error",
+            "code": "upstream_realtime_unavailable",
+            "message": message,
+            "details": {
+                "model": config.model,
+                "voice": config.voice,
+                "endpoint": config.endpoint,
+            },
+        },
     )
-    await ws.close()
+    await _safe_close_websocket(ws)
 
 
 @router.websocket("/ws/realtime")
@@ -538,16 +816,25 @@ async def realtime_endpoint(ws: WebSocket) -> None:
         memory_manager.session_memory = session_memory
     await bootstrap_learning_tables(settings.MEMORY_DB_PATH)
     try:
-        startup_ctx = await memory_manager.get_startup_memory_context("default")
+        startup_facts = await memory_manager.get_priority_facts("default", top_k=10)
     except Exception as exc:
         logger.warning("Startup priority memory load failed: %s", exc)
-        startup_ctx = None
-    if startup_ctx:
+        startup_facts = []
+    if startup_facts:
+        startup_ctx = "Known facts about this user from memory:\n" + "\n".join(
+            f"- {fact}" for fact in startup_facts
+        )
         default_instructions = build_system_prompt(
             base_instructions=route(IntentCategory.GENERAL_CHAT).system_instructions,
             memory_context=startup_ctx,
         )
         config.instructions = default_instructions
+        logger.info(
+            "Memory pre-loaded: %d facts injected into session",
+            len(startup_facts),
+        )
+    else:
+        logger.info("Memory pre-load: no facts found in DB")
     try:
         await client.async_connect()
     except Exception as exc:
@@ -562,6 +849,8 @@ async def realtime_endpoint(ws: WebSocket) -> None:
     _turn_index: int = 0
     _last_transcript: str = ""
     queued_data: dict[str, Any] | None = None
+    heartbeat_task = _asyncio.create_task(_send_heartbeat(ws, interval=5.0))
+    _last_vision_descriptions: list[str] = []
 
     try:
         while True:
@@ -601,13 +890,18 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 resolved_intent: IntentCategory | None = None
                 routing_decision = route(IntentCategory.GENERAL_CHAT)
                 route_image_b64 = pending_image_b64
+                pending_image_b64 = None
                 session_memory_recorded = False
-                scene_fallback_this_turn = False
+                turn_user_input_text: str | None = None
+                response_instructions: str | None = None
                 current_user_transcript: str | None = ""
+                user_transcript_sent = False
                 intent_task: _asyncio.Task[object] | None = None
                 intent_started_at: float | None = None
                 classification_deferred = False
                 instructions_already_updated = False
+                should_update_session_instructions = True
+                _turn_id = f"{session_id}:{uuid4().hex}"
 
                 turn_connect_started = time.monotonic()
                 if not client.is_connected():
@@ -637,20 +931,59 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 try:
                     current_user_transcript = await client.async_prepare_audio_turn(
                         audio_pcm=audio_pcm,
-                        image_jpeg_b64=route_image_b64,
+                        image_jpeg_b64=None,
                     )
                 except Exception as exc:
                     await _send_upstream_error(ws, str(exc), config)
                     break
 
+                commit_failure_message = client.consume_last_commit_failure()
+                if commit_failure_message is not None:
+                    sent = await _safe_send_json(
+                        ws,
+                        {
+                            "type": "status",
+                            "status": "turn_failed",
+                            "message": "Voice turn failed — please try again",
+                        },
+                    )
+                    if not sent:
+                        break
+                    logger.info("DashScope session recovered after InternalError")
+                    pending_instructions = None
+                    _last_transcript = ""
+                    last_user_transcript = ""
+                    continue
+
                 transcript_for_routing = current_user_transcript or ""
-                _cleaned = build_memory_fact(transcript_for_routing)
+                transcript_script = _detect_script(transcript_for_routing)
+                language_override_note: str | None = None
+                if transcript_script == "zh":
+                    logger.warning(
+                        "Transcript appears Chinese but user likely spoke Kannada/Hindi — possible transcription error"
+                    )
+                    language_override_note = (
+                        "The transcript may be mistranscribed. Do not respond in Chinese. Default to Kannada unless Hindi or English are clearly intended."
+                    )
+                if transcript_for_routing.strip():
+                    sent = await _safe_send_json(
+                        ws,
+                        {
+                            "type": "transcript",
+                            "role": "user",
+                            "text": transcript_for_routing,
+                            "turn_id": _turn_id,
+                        },
+                    )
+                    if not sent:
+                        break
+                    user_transcript_sent = True
+
+                if transcript_for_routing.strip():
+                    online_reflection.update_verbosity(session_id, transcript_for_routing)
+
                 _silence_like = _is_effective_silence(transcript_for_routing)
-                _is_memory_save = (
-                    bool(transcript_for_routing.strip())
-                    and not _silence_like
-                    and (_cleaned != transcript_for_routing.strip())
-                )
+                _is_memory_save = _is_explicit_memory_save_request(transcript_for_routing)
                 _is_memory_recall = bool(
                     transcript_for_routing.strip() and not _silence_like
                 ) and _is_memory_query(transcript_for_routing)
@@ -659,6 +992,18 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     predicted_intent = IntentCategory.MEMORY_SAVE
                 elif _is_memory_recall:
                     predicted_intent = IntentCategory.MEMORY_RECALL
+                elif route_image_b64 and _should_force_scene_describe(
+                    transcript_for_routing,
+                    True,
+                ):
+                    predicted_intent = IntentCategory.SCENE_DESCRIBE
+                    logger.debug(
+                        "Turn %d: short/empty non-ack transcript + image present → forcing SCENE_DESCRIBE (heavy vision)",
+                        current_turn_index,
+                    )
+                elif route_image_b64 and _is_acknowledgement(transcript_for_routing):
+                    predicted_intent = IntentCategory.GENERAL_CHAT
+                    effective_instructions = default_instructions
                 elif (
                     route_image_b64
                     and transcript_for_routing.strip()
@@ -666,6 +1011,11 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 ):
                     clf_result = await classifier.classify(transcript_for_routing)
                     predicted_intent = clf_result.intent
+                    if (
+                        _contains_vision_trigger(transcript_for_routing)
+                        and route(predicted_intent).target != RouteTarget.HEAVY_VISION
+                    ):
+                        predicted_intent = IntentCategory.SCENE_DESCRIBE
                 elif not prior_transcript or len(prior_transcript) < 3:
                     _last_transcript = ""
                     logger.info(
@@ -675,7 +1025,6 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     if route_image_b64 and not _scene_described_once:
                         predicted_intent = IntentCategory.SCENE_DESCRIBE
                         _scene_described_once = True
-                        scene_fallback_this_turn = True
                         logger.debug(
                             "No transcript yet, image present → SCENE_DESCRIBE"
                         )
@@ -697,8 +1046,9 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     routing_decision = decision
                     predicted_target = decision.target
                     prompt_verbosity = online_reflection.get_verbosity_mode(session_id)
-                    prompt_penalty = online_reflection.get_intent_penalty(
-                        str(predicted_intent)
+                    prompt_penalty = online_reflection.get_session_intent_penalty(
+                        session_id,
+                        str(predicted_intent),
                     )
                     logger.debug(
                         "Intent: %s → Route: %s (frame=%s)",
@@ -713,9 +1063,11 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                                 user_id="default",
                                 raw_utterance=current_user_transcript,
                             )
-                            effective_instructions = (
-                                f"Tell the user: I will remember that {confirmed_fact}."
+                            response_instructions = (
+                                "Respond exactly with this sentence and nothing else: "
+                                f"{_build_memory_write_confirmation(confirmed_fact)}"
                             )
+                            should_update_session_instructions = False
                         except Exception as exc:
                             logger.warning(
                                 "Classifier-routed memory save failed: %s",
@@ -776,11 +1128,21 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                                 "HEAVY_VISION: calling multimodal model=%s",
                                 mm_client._model,
                             )
+                            vision_prompt = (
+                                decision.system_instructions or "Describe what you see."
+                            )
+                            if _last_vision_descriptions:
+                                prior_context = "\n".join(
+                                    f"- {item[:100]}..."
+                                    for item in _last_vision_descriptions[-2:]
+                                )
+                                vision_prompt = (
+                                    f"{vision_prompt}\n\nPrevious descriptions of this scene (avoid repeating):\n{prior_context}"
+                                )
                             vision_result = await mm_client.analyze(
                                 VisionRequest(
                                     image_jpeg_b64=vision_image_b64,
-                                    prompt=decision.system_instructions
-                                    or "Describe what you see.",
+                                    prompt=vision_prompt,
                                 )
                             )
                             if vision_result.success:
@@ -788,10 +1150,15 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                                     "Vision model response received — %d chars",
                                     len(vision_result.text),
                                 )
-                                effective_instructions = (
-                                    "Say exactly this to the user: "
-                                    f"{vision_result.text}"
-                                )
+                                if (current_user_transcript or "").strip():
+                                    turn_user_input_text = (
+                                        f"The user asked: {current_user_transcript}\n"
+                                        f"[Camera sees]: {vision_result.text}"
+                                    )
+                                else:
+                                    turn_user_input_text = (
+                                        f"[Camera sees]: {vision_result.text}"
+                                    )
                                 session_memory.add_turn(
                                     user_transcript=current_user_transcript or "",
                                     assistant_response=vision_result.text,
@@ -804,6 +1171,9 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                                     "HEAVY_VISION result: %d chars",
                                     len(vision_result.text),
                                 )
+                                _last_vision_descriptions.append(vision_result.text[:200])
+                                if len(_last_vision_descriptions) > 3:
+                                    _last_vision_descriptions.pop(0)
                             else:
                                 effective_instructions = (
                                     "Tell the user the image could not be "
@@ -818,7 +1188,7 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                                 "Tell the user to press the capture button "
                                 "to take a photo first, then ask again."
                             )
-                    elif decision.requires_frame and not pending_image_b64:
+                    elif decision.requires_frame and not route_image_b64:
                         logger.debug(
                             "Frame required but not available — will ask user to capture"
                         )
@@ -833,16 +1203,17 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                             intent_penalty=prompt_penalty,
                         )
 
+                if language_override_note:
+                    effective_instructions = (
+                        f"{effective_instructions}\n\n{language_override_note}"
+                    )
+
                 if predicted_target != applied_target:
                     logger.debug(
                         "Predicted route %s but applying handler %s in Plan 05",
                         predicted_target.value,
                         applied_target.value,
                     )
-
-                should_update_session_instructions = (
-                    applied_target != RouteTarget.HEAVY_VISION
-                )
 
                 if should_update_session_instructions and (not instructions_already_updated) and (
                     effective_instructions != _last_instructions
@@ -857,9 +1228,32 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 loop = _asyncio.get_running_loop()
                 streamed_audio = False
                 heavy_vision_audio_logged = False
-                response_instructions: str | None = None
+
+                if _is_short_ambiguous_general_chat(
+                    current_user_transcript or "",
+                    predicted_intent,
+                ):
+                    turn_user_input_text = _build_short_input_clarification_prompt(
+                        current_user_transcript or ""
+                    )
 
                 if applied_target == RouteTarget.HEAVY_VISION:
+                    spoken_request = (current_user_transcript or "").strip()
+                    request_context = (
+                        spoken_request if spoken_request else "Describe what is visible."
+                    )
+                    effective_instructions = (
+                        "You are Ally, a warm and capable AI assistant for a visually impaired user. "
+                        f"The user's spoken request was: {request_context}. "
+                        "You have already received the camera result for this turn. "
+                        "Treat the camera result below as ground truth and answer from it directly. "
+                        "Never say you lack a camera feed, never say you cannot see, and never say you are audio-only. "
+                        "Answer in the same language the user spoke."
+                    )
+                    if turn_user_input_text:
+                        effective_instructions = (
+                            f"{effective_instructions}\n\n{turn_user_input_text}"
+                        )
                     response_instructions = effective_instructions
 
                 def _forward_audio_delta(delta_bytes: bytes) -> None:
@@ -878,13 +1272,13 @@ async def realtime_endpoint(ws: WebSocket) -> None:
 
                     if running_loop is loop:
                         _schedule_background_task(
-                            ws.send_bytes(delta_bytes),
+                            _safe_send_bytes(ws, delta_bytes),
                             "stream_audio_delta",
                         )
                         return
 
                     future = _asyncio.run_coroutine_threadsafe(
-                        ws.send_bytes(delta_bytes),
+                        _safe_send_bytes(ws, delta_bytes),
                         loop,
                     )
                     future.result()
@@ -896,9 +1290,17 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         "Audio streaming started — intent not yet resolved (correct behavior)"
                     )
 
+                if (turn_user_input_text is not None or response_instructions is not None) and client.has_buffered_response_events():
+                    logger.info(
+                        "Buffered upstream response detected — reconnecting before contextual response"
+                    )
+                    await client.async_reconnect()
+
                 create_response_kwargs: dict[str, Any] = {}
                 if response_instructions is not None:
                     create_response_kwargs["instructions"] = response_instructions
+                if turn_user_input_text is not None:
+                    create_response_kwargs["user_input_text"] = turn_user_input_text
 
                 turn_task = _asyncio.create_task(
                     client.async_create_response_for_prepared_turn_streaming(
@@ -962,86 +1364,36 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                             "Intent classification failed post-audio: %s",
                             exc,
                         )
-                if (
-                    resolved_intent == IntentCategory.MEMORY_SAVE
-                    and not _is_memory_save
-                    and current_user_transcript
-                ):
-                    try:
-                        await memory_manager.save(
-                            user_id="default",
-                            raw_utterance=current_user_transcript,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Post-turn MEMORY_SAVE failed: %s",
-                            exc,
-                        )
-                elif (
-                    resolved_intent == IntentCategory.MEMORY_RECALL
-                    and not _is_memory_recall
-                    and current_user_transcript
-                ):
-                    try:
-                        await memory_manager.recall(
-                            user_id="default",
-                            query=current_user_transcript,
-                            top_k=3,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Post-turn MEMORY_RECALL failed: %s",
-                            exc,
-                        )
                 assistant_text = (result.assistant_transcript or "").strip()
                 transcript_for_memory = current_user_transcript.strip()
-                use_user_transcript = len(transcript_for_memory) >= 3
-                memory_text = (
-                    transcript_for_memory if use_user_transcript else assistant_text
-                )
-                source = (
-                    "user_transcript" if use_user_transcript else "assistant_text_fallback"
-                )
-                if (
-                    source == "assistant_text_fallback"
-                    and _is_greeting(memory_text)
+                if _should_auto_extract_memory(
+                    transcript_for_memory,
+                    resolved_intent,
+                    applied_target,
                 ):
                     logger.info(
-                        "Memory extraction skipped — greeting detected, no facts (turn %d)",
+                        "Memory extraction task fired — turn %d (source: user_transcript)",
                         current_turn_index,
-                    )
-                elif len(memory_text) < 3:
-                    logger.info(
-                        "Memory extraction skipped — no usable text (turn %d)",
-                        current_turn_index,
-                    )
-                elif (
-                    source == "assistant_text_fallback"
-                    and len(memory_text.split()) < 8
-                ):
-                    logger.info(
-                        "Memory extraction skipped — text too sparse (turn %d)",
-                        current_turn_index,
-                    )
-                    logger.info(
-                        "Memory extraction: no facts found — nothing saved (turn %d)",
-                        current_turn_index,
-                    )
-                else:
-                    logger.info(
-                        "Memory extraction task fired — turn %d (source: %s)",
-                        current_turn_index,
-                        source,
                     )
                     _schedule_background_task(
                         _defer_auto_extract(
                             memory_manager,
                             "default",
-                            memory_text,
+                            transcript_for_memory,
                             result.assistant_transcript or "",
                             current_turn_index,
                         ),
                         "defer_auto_extract",
+                    )
+                elif len(transcript_for_memory) < 3:
+                    logger.info(
+                        "Memory extraction skipped — no usable text (turn %d)",
+                        current_turn_index,
+                    )
+                else:
+                    logger.info(
+                        "Memory extraction skipped — no qualifying personal fact signal (turn %d)",
+                        current_turn_index,
                     )
                 if not session_memory_recorded:
                     session_memory.add_turn(
@@ -1049,8 +1401,19 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                         result.assistant_transcript or "",
                     )
 
-                _turn_id = f"{session_id}:{uuid4().hex}"
                 _response_text = result.assistant_transcript or ""
+                _clean_user = (current_user_transcript or "").strip()
+                _clean_response = _response_text.strip()
+                _db_user_transcript = current_user_transcript or ""
+                _skip_turn_logging = False
+                if not _clean_user and not _clean_response:
+                    logger.debug(
+                        "Skipping transcript/reflection logs — both fields empty, silent turn"
+                    )
+                    _skip_turn_logging = True
+                elif not _clean_user and _clean_response:
+                    _db_user_transcript = "[no transcript — timeout]"
+
                 _current_intent = str(resolved_intent or predicted_intent)
                 _current_target = str(
                     route(
@@ -1060,20 +1423,25 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                     ).target
                 )
 
-                _schedule_background_task(
-                    correction_store.log_turn(
-                        session_id=session_id,
-                        turn_id=_turn_id,
-                        transcript=current_user_transcript,
-                        response=_response_text,
-                        intent=_current_intent,
-                        route_target=_current_target,
-                    ),
-                    "correction_store.log_turn",
-                )
+                if not _skip_turn_logging:
+                    _schedule_background_task(
+                        correction_store.log_turn(
+                            session_id=session_id,
+                            turn_id=_turn_id,
+                            transcript=_db_user_transcript,
+                            response=_response_text,
+                            intent=_current_intent,
+                            route_target=_current_target,
+                        ),
+                        "correction_store.log_turn",
+                    )
 
                 _is_corr, _corr_sig = _is_correction_signal(current_user_transcript)
                 if _is_corr:
+                    logger.info(
+                        "Correction signal detected: %r — inserting into correction_log",
+                        current_user_transcript,
+                    )
                     _schedule_background_task(
                         correction_store.log_correction(
                             session_id=session_id,
@@ -1089,26 +1457,25 @@ async def realtime_endpoint(ws: WebSocket) -> None:
                 else:
                     _turns_since_corr += 1
 
-                online_reflection.record_turn(
-                    session_id=session_id,
-                    turn_id=_turn_id,
-                    intent=_current_intent,
-                    was_corrected=_is_corr,
-                    turns_since_last_correction=_turns_since_corr,
-                )
-                online_reflection.update_verbosity(session_id, current_user_transcript)
-
-                turn_image_b64 = pending_image_b64
+                if not _skip_turn_logging:
+                    online_reflection.record_turn(
+                        session_id=session_id,
+                        turn_id=_turn_id,
+                        intent=_current_intent,
+                        was_corrected=_is_corr,
+                        turns_since_last_correction=_turns_since_corr,
+                    )
 
                 last_user_transcript = current_user_transcript
 
                 # Reset per-turn context
-                pending_image_b64 = None
                 pending_instructions = None
 
                 # Send spoken audio back
                 if result.assistant_audio_pcm and not streamed_audio:
-                    await ws.send_bytes(result.assistant_audio_pcm)
+                    sent = await _safe_send_bytes(ws, result.assistant_audio_pcm)
+                    if not sent:
+                        break
                     if (
                         applied_target == RouteTarget.HEAVY_VISION
                         and not heavy_vision_audio_logged
@@ -1118,27 +1485,31 @@ async def realtime_endpoint(ws: WebSocket) -> None:
 
                 # Send assistant transcript
                 if result.assistant_transcript:
-                    await ws.send_text(
-                        json.dumps(
-                            {
-                                "type": "transcript",
-                                "role": "assistant",
-                                "text": result.assistant_transcript,
-                            }
-                        )
+                    sent = await _safe_send_json(
+                        ws,
+                        {
+                            "type": "transcript",
+                            "role": "assistant",
+                            "text": result.assistant_transcript,
+                            "turn_id": _turn_id,
+                        },
                     )
+                    if not sent:
+                        break
 
                 # Send user transcript (reference only)
-                if result.user_transcript:
-                    await ws.send_text(
-                        json.dumps(
-                            {
-                                "type": "transcript",
-                                "role": "user",
-                                "text": result.user_transcript,
-                            }
-                        )
+                if result.user_transcript and not user_transcript_sent:
+                    sent = await _safe_send_json(
+                        ws,
+                        {
+                            "type": "transcript",
+                            "role": "user",
+                            "text": result.user_transcript,
+                            "turn_id": _turn_id,
+                        },
                     )
+                    if not sent:
+                        break
 
                 # Surface error if turn failed
                 if not result.success:
@@ -1173,6 +1544,8 @@ async def realtime_endpoint(ws: WebSocket) -> None:
         logger.error("Unhandled error in realtime route: %s", exc)
 
     finally:
+        heartbeat_task.cancel()
+        await _asyncio.gather(heartbeat_task, return_exceptions=True)
         session_memory.clear()
         try:
             await classifier.close()
@@ -1182,6 +1555,10 @@ async def realtime_endpoint(ws: WebSocket) -> None:
             await mm_client.close()
         except Exception as exc:
             logger.warning("Multimodal client close failed: %s", exc)
+        try:
+            await memory_manager.close()
+        except Exception as exc:
+            logger.warning("Memory manager close failed: %s", exc)
         await client.async_close()
         _schedule_background_task(
             offline_replay.run_replay(session_id),

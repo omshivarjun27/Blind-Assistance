@@ -1,297 +1,203 @@
----
+# Plan 06 — Heavy Vision Alignment and Consolidation
 
-# Plan 06 — Heavy Vision Path
+## 1. Purpose
 
-## Goal
-Implement the heavy vision path that sends camera frames
-to qwen3.6-plus for:
-- OCR / text reading ("read this")
-- Scene analysis with more detail than realtime path
-- Page capture for document sessions
+This is a **refine/alignment rewrite** of Plan 06, not a greenfield heavy-vision build plan. The backend already contains a live Heavy Vision path, including routing inside `apps/backend/api/routes/realtime.py`, a multimodal client, a pixel-based capture gate, high-level vision helpers, and unit tests. The purpose of this rewrite is to align stale planning language with current implementation truth, tighten the documented architecture, and define the remaining cleanup / verification work precisely.
 
-This is wired into the existing routing system from Plan 05.
-When PolicyRouter returns HEAVY_VISION, the route handler
-calls MultimodalClient instead of Qwen Omni Realtime.
+The rewrite also locks the strongest repo-aligned technical baseline: **Heavy Vision should be documented around the native DashScope multimodal HTTP endpoint, with current repo model reality `qwen3.6-plus`**. Compatible-mode image input remains valid documentation context in general, but it is not the authoritative baseline assumption for the current repo’s heavy-vision model.
 
-## Confirmed API Format
-- Compatible-mode vision endpoint is:
-  - `POST https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions`
-- Compatible-mode base URL is:
-  - `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`
-- Compatible-mode vision uses OpenAI-style `messages` with a `content` array.
-- Image input in compatible mode is passed with:
-  - `{ "type": "image_url", "image_url": { "url": "..." } }`
-- Text input in compatible mode is passed with:
-  - `{ "type": "text", "text": "..." }`
-- Base64 image format is supported as a Data URL:
-  - `data:image/jpeg;base64,...`
-- Broader DashScope vision docs confirm Base64 image input can be passed in this format and that the MIME type in the Data URL must match the actual image type.
-- Base64 input image strings are documented at **<= 10MB**.
-- Broader DashScope vision docs confirm the visual-understanding model name:
-  - `qwen3.6-plus`
-- Current repo settings use:
-  - dev vision model: `qwen3.6-plus`
-  - exam vision model: `qwen3.6-plus`
+## 2. What is true now
 
-UNCONFIRMED:
-- The dedicated compatible-mode vision page explicitly lists Qwen-VL family models, not `qwen3.6-plus` by name.
-- Broader vision docs show OpenAI-compatible image input examples with `qwen3.6-plus`, and native DashScope examples with `qwen3.6-plus`.
-- Therefore the exact pairing of `qwen3.6-plus` with the compatible-mode chat-completions endpoint should be treated as a runtime-verified assumption.
-- If the configured model rejects compatible-mode image input, Hephaestus must fail fast with a clear error and document the required override rather than silently falling back to another endpoint.
+- **CURRENT REPO REALITY** — Heavy Vision is already wired in `apps/backend/api/routes/realtime.py`.
+  - `realtime.py:283-329` contains the live `RouteTarget.HEAVY_VISION` branch.
+- **CURRENT REPO REALITY** — first-turn image fallback already exists.
+  - `realtime.py:225-227` sets `predicted_intent = IntentCategory.SCENE_DESCRIBE` when no transcript exists and `pending_image_b64` is present.
+- **CURRENT REPO REALITY** — `pending_image_b64` already has a complete lifecycle in the route.
+  - declared at `realtime.py:160`
+  - set from control message at `realtime.py:515-519`
+  - consumed in route logic at `realtime.py:187`, `285`
+  - reset at `realtime.py:458`
+- **CURRENT REPO REALITY** — `last_user_transcript` is already stored and reused.
+  - declared at `realtime.py:152`
+  - assigned from current turn result at `realtime.py:439`
+  - used for previous-turn memory logic at `realtime.py:241-243`, `259-267`, `440-449`
+- **CURRENT REPO REALITY** — `_is_memory_query` already exists.
+  - defined at `realtime.py:75-80`
+  - used at `realtime.py:451-455`
+- **CURRENT REPO REALITY** — `apps/backend/services/dashscope/multimodal_client.py` already exists.
+- **CURRENT REPO REALITY** — `core/orchestrator/capture_coach.py` already exists and is wired before expensive vision use.
+- **CURRENT REPO REALITY** — `core/vision/live_scene_reader.py` already exists.
+- **CURRENT REPO REALITY** — `core/vision/page_reader.py` already exists.
+- **CURRENT REPO REALITY** — `core/vision/framing_judge.py` already exists, but is not wired into the realtime route yet.
+- **CURRENT REPO REALITY** — `tests/unit/test_heavy_vision.py` already exists and is part of the current validation surface.
+- **CURRENT REPO REALITY** — the repo now has **9 intents**, not 8.
+  - `intent_classifier.py:47-56` defines: `SCENE_DESCRIBE`, `READ_TEXT`, `SCAN_PAGE`, `WEB_SEARCH`, `MEMORY_SAVE`, `MEMORY_RECALL`, `DOCUMENT_QA`, `TRANSLATE`, `GENERAL_CHAT`
+- **CURRENT REPO REALITY** — `TRANSLATE` exists in routing reality.
+  - `policy_router.py:83-91` routes `TRANSLATE` to `REALTIME_CHAT`
+- **CURRENT REPO REALITY** — `qwen3.6-plus` is the configured heavy-vision model for both dev and exam.
+  - `settings.py:51-54`
+- **CONFIRMED** — the strongest documented baseline for current repo reality is the **native DashScope multimodal endpoint**:
+  - `POST {DASHSCOPE_HTTP_BASE}/services/aigc/multimodal-generation/generation`
+- **WEAKER EVIDENCE** — compatible-mode image input is documented generally, but exact `qwen3.6-plus` image-input support on compatible mode is not strong enough to treat as the default implementation assumption.
 
-## Safe Deletions In This Plan
-None. This plan only adds new files.
+## 3. Historical assumptions to remove or rewrite
 
-## Files To Create
+- **HISTORICAL / SUPERSEDED** — “Heavy Vision is not implemented yet.”
+  - This is false in current repo reality.
+- **HISTORICAL / SUPERSEDED** — “Plan 06 builds Heavy Vision from scratch.”
+  - Current repo already has the route, client, capture gate, helpers, and tests.
+- **HISTORICAL / SUPERSEDED** — “There are 8 intents.”
+  - Current repo has 9 intents, including `TRANSLATE`.
+- **HISTORICAL / SUPERSEDED** — “Dev baseline is qwen3.5-flash while exam is qwen3.6-plus.”
+  - Current repo reality uses `qwen3.6-plus` for both dev and exam in `settings.py`.
+- **HISTORICAL / SUPERSEDED** — “Compatible-mode image input is the default heavy-vision assumption for qwen3.6-plus.”
+  - This is weaker evidence and should not be the baseline assumption in the rewritten plan.
+- **STALE CODE COMMENT** — `intent_classifier.py:4` still says “8 intent categories” even though the enum and label list now contain 9 values.
 
-### apps/backend/services/dashscope/multimodal_client.py
-Describe exactly what this file must contain:
+## 4. Current architecture
 
-DATACLASS: VisionRequest
-  image_jpeg_b64: str
-  prompt: str
-  model: str (from settings.QWEN_VISION_MODEL)
-  max_tokens: int = 1024
+This is the actual heavy-vision flow in the repo today, in sequence:
 
-DATACLASS: VisionResponse
-  text: str
-  error: str | None = None
-  property success: bool
+1. **Frontend sends audio and optional image/frame**
+   - The browser sends audio over `/ws/realtime` as a binary frame.
+   - It can also send `{"type":"image","data":"<base64 jpeg>"}` before the turn.
 
-CLASS: MultimodalClient
-  __init__(api_key: str, model: str, base_url: str)
-  async analyze(request: VisionRequest) -> VisionResponse
-    POST to DashScope compatible chat completions
-    Message format:
-      role: user
-      content: array with:
-        {type: "image_url", image_url: {url: "data:image/jpeg;base64,{b64}"}}
-        {type: "text", text: prompt}
-    Parse response["choices"][0]["message"]["content"]
-    Timeout: 30 seconds
-    On error: return VisionResponse(text="", error=str(exc))
+2. **`realtime.py` receives WebSocket messages**
+   - `apps/backend/api/routes/realtime.py` owns the main orchestration loop.
+   - It stores `pending_image_b64` and `pending_instructions` as per-turn state.
 
-  classmethod from_settings() -> MultimodalClient
+3. **Intent classifier predicts route from transcript context**
+   - Previous-turn classification happens through `IntentClassifier` task lookahead.
+   - If there is no transcript yet but an image exists, the route falls back to `SCENE_DESCRIBE`.
 
-Additional implementation requirements:
-- Use `httpx.AsyncClient`.
-- POST target must be `{base_url}/chat/completions`.
-- Use `Authorization: Bearer {api_key}` and `Content-Type: application/json`.
-- Use `settings.QWEN_VISION_MODEL` and `settings.DASHSCOPE_COMPAT_BASE`.
-- Do not silently fall back to `DASHSCOPE_HTTP_BASE` or the native DashScope endpoint.
-- Reject or fail clearly if `image_jpeg_b64` is empty.
-- Reject or fail clearly if the constructed Data URL exceeds the documented 10MB Base64 limit.
+4. **Policy router selects target**
+   - `policy_router.route()` returns a `RoutingDecision` with `target`, `requires_frame`, and `system_instructions`.
+   - `READ_TEXT` and `SCAN_PAGE` currently map to `HEAVY_VISION`.
 
-### core/vision/live_scene_reader.py
-Describe what this file must contain:
+5. **Capture coach validates frame quality before expensive vision use**
+   - `capture_coach.assess_frame_quality()` blocks obviously bad frames using cheap pixel heuristics.
+   - If the frame is bad, the route injects spoken guidance instead of calling the multimodal model.
 
-FUNCTION: read_scene(
-    image_jpeg_b64: str,
-    client: MultimodalClient,
-    detail_level: str = "standard",
-) -> str
-  Builds prompt based on detail_level:
-    "standard": "Describe what you see. Be specific about
-                  objects, their positions, and distances.
-                  Keep it brief for a blind user."
-    "detailed": "Describe everything visible in detail."
-  Calls client.analyze(VisionRequest(image_b64, prompt))
-  Returns text or error fallback string
+6. **Multimodal client sends image + prompt to the heavy-vision model**
+   - Current implementation detail: `multimodal_client.py` still uses compatible-mode request shape.
+   - Baseline plan assumption after this rewrite: Heavy Vision should be documented around native DashScope multimodal HTTP for `qwen3.6-plus`.
 
-### core/vision/page_reader.py
-Describe what this file must contain:
+7. **High-level helpers shape the prompts**
+   - `live_scene_reader.py` provides scene description prompts.
+   - `page_reader.py` provides OCR-style extraction and page-summary prompts.
 
-FUNCTION: read_text_from_image(
-    image_jpeg_b64: str,
-    client: MultimodalClient,
-) -> str
-  Prompt: "Read all text visible in this image.
-           Return the exact text, nothing else.
-           If no text is visible, say 'No text found'."
-  Calls client.analyze(VisionRequest(image_b64, prompt))
-  Returns text content
+8. **The result is returned through the existing orchestration path**
+   - `realtime.py` turns successful heavy-vision text into `effective_instructions`.
+   - The final spoken answer is still returned through the existing Omni audio response path.
 
-FUNCTION: summarize_page(
-    image_jpeg_b64: str,
-    client: MultimodalClient,
-    page_number: int = 1,
-) -> str
-  Prompt: "This is page {page_number} of a document.
-           Describe its content: main topic, key points,
-           any important numbers, dates, or names."
-  Returns page summary string
+## 5. Files and responsibilities
 
-### core/vision/framing_judge.py
-Describe what this file must contain:
+| File path | Current responsibility | Status |
+|---|---|---|
+| `apps/backend/api/routes/realtime.py` | Main `/ws/realtime` orchestration route; manages per-turn state, previous-turn classification, Heavy Vision branch, memory handling, interrupt control | **Implemented; reality source of truth** |
+| `apps/backend/services/dashscope/multimodal_client.py` | HTTP heavy-vision client for image + prompt analysis | **Implemented; baseline transport assumption needs alignment** |
+| `core/orchestrator/capture_coach.py` | Lightweight pixel-quality gate before expensive vision calls | **Implemented and wired** |
+| `core/vision/live_scene_reader.py` | Builds scene-description prompts and delegates to multimodal client | **Implemented** |
+| `core/vision/page_reader.py` | Builds OCR / page-summary prompts and delegates to multimodal client | **Implemented** |
+| `core/vision/framing_judge.py` | Model-based framing check for future use after cheap gate | **Implemented; not wired** |
+| `core/orchestrator/intent_classifier.py` | Classifies transcripts into current 9-intent set | **Implemented; docstring still stale** |
+| `core/orchestrator/policy_router.py` | Maps intent to route target and instructions, including `HEAVY_VISION` and `TRANSLATE` reality | **Implemented** |
+| `shared/config/settings.py` | Holds current `QWEN_VISION_MODEL`, `DASHSCOPE_COMPAT_BASE`, `DASHSCOPE_HTTP_BASE` values | **Implemented; current model reality is qwen3.6-plus for both profiles** |
+| `tests/unit/test_heavy_vision.py` | Validates multimodal client + vision helper behavior | **Implemented; still pins compatible-mode request shape** |
+| `tests/unit/test_realtime_route.py` | Validates route orchestration behavior around images, heavy vision, memory, interrupts | **Implemented** |
 
-FUNCTION: get_framing_guidance(
-    image_jpeg_b64: str,
-    client: MultimodalClient,
-) -> tuple[bool, str]
-  Sends image to multimodal model with prompt:
-    "Is this image clear and readable?
-     Reply with YES or NO followed by one sentence
-     of guidance if NO.
-     Example: NO - The image is too blurry."
-  Parse response:
-    Starts with YES → return (True, "")
-    Starts with NO → return (False, guidance_text)
-    Unexpected → return (True, "")
+## 6. Baseline technical decisions
 
-Note: This is model-based framing check.
-capture_coach.py does pixel-based pre-check.
-framing_judge.py does model-based post-check.
-Use capture_coach first (cheap), framing_judge
-only if capture_coach passes but quality uncertain.
+- **LOCKED BASELINE** — Native DashScope multimodal endpoint is the baseline Heavy Vision path.
+  - `POST {DASHSCOPE_HTTP_BASE}/services/aigc/multimodal-generation/generation`
+- **LOCKED BASELINE** — `qwen3.6-plus` is the current heavy-vision model in repo reality.
+- **LOCKED BASELINE** — Compatible-mode image input remains documented only as secondary/general context.
+- **LOCKED BASELINE** — The rewritten plan must not assume compatible-mode image support for `qwen3.6-plus` is the authoritative production path unless stronger repo-aligned evidence is gathered later.
+- **CURRENT IMPLEMENTATION DETAIL** — `multimodal_client.py` is still written against compatible mode today; this is a current implementation fact, not the baseline architectural assumption the rewritten plan should preserve.
 
-### apps/backend/api/routes/realtime.py (UPDATE)
-DO NOT replace the file.
-ADD heavy vision handling.
+## 7. Remaining work
 
-When routing decision is HEAVY_VISION:
-  Check capture_coach.assess_frame_quality(pending_image_b64)
-  If not usable: send guidance as Qwen spoken response
-  If usable:
-    Call multimodal_client.analyze(VisionRequest(...))
-    Convert text response to speech via Qwen Omni
-    (send text as instructions with short silent PCM)
-    Return audio to browser as normal
+This section is intentionally narrow because Heavy Vision already exists.
 
-Exact pattern:
-  if decision.target == RouteTarget.HEAVY_VISION:
-      from core.orchestrator.capture_coach import assess_frame_quality
-      is_usable, guidance = assess_frame_quality(pending_image_b64)
-      if not is_usable:
-          effective_instructions = (
-              f"Tell the user: {guidance}"
-          )
-          # Fall through to normal Qwen turn with guidance
-      else:
-          vision_result = await mm_client.analyze(
-              VisionRequest(
-                  image_jpeg_b64=pending_image_b64,
-                  prompt=decision.system_instructions,
-              )
-          )
-          if vision_result.success:
-              effective_instructions = (
-                  f"Say exactly this to the user: "
-                  f"{vision_result.text}"
-              )
-          else:
-              effective_instructions = (
-                  "Tell the user the image could not "
-                  "be analyzed. Ask them to try again."
-              )
+- **Alignment cleanup**
+  - Rewrite stale plan language so it matches implemented repo truth.
+  - Clean up stale “8 intents” language in code comments/docstrings where needed.
 
-Add multimodal_client creation per session
-alongside the existing classifier creation.
+- **Model / endpoint consistency verification**
+  - Align `multimodal_client.py` to the native DashScope multimodal baseline.
+  - Keep `qwen3.6-plus` as the current heavy-vision model unless a separate explicit config decision changes it.
 
-Critical routing details for this update:
-- `capture_coach.assess_frame_quality()` must gate the heavy-vision HTTP call; if it fails, `MultimodalClient.analyze()` must not run.
-- Spoken output still uses the existing Omni audio path.
-- Heavy vision does not itself produce speech; it returns text that is handed off to the existing Omni response path.
-- Do not analyze the same image twice in the core Plan 06 path.
-- `framing_judge.py` is not wired into `realtime.py` in Plan 06.
+- **Route verification**
+  - Preserve `pending_image_b64`, first-turn fallback, `last_user_transcript`, and memory/interrupt behavior while tightening Heavy Vision transport assumptions.
 
-### tests/unit/test_heavy_vision.py
-Tests to include (all mocked — no real API calls):
+- **Prompt / policy tightening**
+  - Keep `READ_TEXT` / `SCAN_PAGE` mapped to `HEAVY_VISION`.
+  - Preserve `TRANSLATE` as current routing reality, while being explicit that it is not itself the Heavy Vision target.
 
-  test_multimodal_client_analyze_success
-    Mock httpx POST returns text response
-    VisionResponse.text == expected text
-    VisionResponse.success == True
+- **Test additions / updates**
+  - Update Heavy Vision tests to match the locked baseline transport choice.
+  - Add route-level regression checks to ensure Heavy Vision changes do not break memory or interrupt behavior.
 
-  test_multimodal_client_analyze_on_error
-    Mock httpx raises exception
-    VisionResponse.error is not None
-    VisionResponse.success == False
+- **Optional future path**
+  - `framing_judge.py` remains a future enhancement path, not required core work for this rewrite.
 
-  test_multimodal_client_image_in_request
-    Mock captures request body
-    Assert "image_url" in content array
-    Assert "data:image/jpeg;base64," prefix in url
+## 8. Tests and validation
 
-  test_read_scene_returns_description
-    Mock client.analyze returns "A table with a laptop"
-    read_scene() returns that string
+### Automated tests to run
 
-  test_read_text_from_image_returns_text
-    Mock client.analyze returns "STOP"
-    read_text_from_image() returns "STOP"
+Use exact current repo test paths:
 
-  test_summarize_page_includes_page_number
-    Mock captures prompt sent to client
-    Assert "page 2" in prompt when page_number=2
+```powershell
+C:/ally-vision-v2/.venv/Scripts/pytest.exe tests/unit/test_heavy_vision.py -v --timeout=30 -x
+C:/ally-vision-v2/.venv/Scripts/pytest.exe tests/unit/test_realtime_route.py -v --timeout=30 -x
+C:/ally-vision-v2/.venv/Scripts/pytest.exe tests/unit/test_intent_classifier.py -v --timeout=30 -x
+C:/ally-vision-v2/.venv/Scripts/pytest.exe tests/unit/test_policy_router.py -v --timeout=30 -x
+```
 
-  test_framing_judge_yes_response
-    Mock returns "YES the image is clear"
-    get_framing_guidance() returns (True, "")
+If `apps/backend/services/dashscope/multimodal_client.py` changes:
+- extend `tests/unit/test_heavy_vision.py` to pin the native DashScope request/response shape.
 
-  test_framing_judge_no_response
-    Mock returns "NO - Image is too blurry"
-    get_framing_guidance() returns (False, guidance)
+If `apps/backend/api/routes/realtime.py` changes:
+- extend `tests/unit/test_realtime_route.py` to verify that Heavy Vision still preserves image state, first-turn visual fallback, memory behavior, and interrupt behavior.
 
-## Physical Gate Check
-GATE A — "Read this" with camera:
-  Start backend + frontend
-  Point camera at printed text (phone/paper/screen)
-  Press Capture button → then say "read this"
-  Must hear: the text read aloud by Cherry voice
-  Logs must show: HEAVY_VISION route taken
+### Manual gate checks
 
-GATE B — Blurry frame guidance:
-  Cover lens partially → press Capture → say "read this"
-  Must hear capture coach guidance
-  ("Move closer" or "Hold still" etc.)
-  Must NOT attempt to read unreadable frame
+1. **First-turn visual behavior when image is present**
+   - Capture an image before the first spoken turn.
+   - Ask a visual question as the first turn.
+   - PASS: app gives a visual answer, not a generic chat response.
+   - NOTE: current repo reality uses first-turn `SCENE_DESCRIBE` fallback here, not direct `HEAVY_VISION`.
 
-## Implementation Notes For Hephaestus
+2. **OCR / read-text query**
+   - Capture clear printed text.
+   - Ask: `read this`.
+   - PASS: text is read accurately and spoken back.
 
-1. Image format in DashScope compatible mode:
-   content: [
-     {
-       "type": "image_url",
-       "image_url": {
-         "url": f"data:image/jpeg;base64,{image_jpeg_b64}"
-       }
-     },
-     {
-       "type": "text",
-       "text": prompt
-     }
-   ]
+3. **Scene description query**
+   - Capture a general scene.
+   - Ask: `what is in front of me`.
+   - PASS: scene is described in a grounded way.
 
-2. MultimodalClient uses DASHSCOPE_COMPAT_BASE
-   (not DASHSCOPE_HTTP_BASE).
-   Compatible mode supports vision in this format.
+4. **Translation-adjacent visual query (current routing reality)**
+   - Capture visible non-English text.
+   - Ask: `translate this`.
+   - PASS: route behaves consistently with current `TRANSLATE → REALTIME_CHAT` reality and uses available image context if present.
 
-3. Heavy vision converts text → speech via existing
-   Qwen Omni turn with effective_instructions.
-   This reuses the existing audio pipeline.
-   No new TTS service needed.
+## 9. Non-goals
 
-4. multimodal_client instance per WebSocket session
-   in realtime.py — same pattern as classifier.
-   Do not create module-level shared clients.
+- Do **not** pretend Heavy Vision is not already built.
+- Do **not** reintroduce 8-intent language.
+- Do **not** make compatible-mode image input the default `qwen3.6-plus` baseline.
+- Do **not** invent unsupported new subsystems.
+- Do **not** broaden scope into unrelated route/memory refactors.
+- Do **not** wire `framing_judge.py` into the route as required work for this rewrite.
+- Do **not** silently change the heavy-vision model away from current repo reality.
 
-5. capture_coach.assess_frame_quality runs BEFORE
-   calling multimodal_client.
-   It is cheap (pixel check).
-   Do not call multimodal for clearly bad frames.
+## 10. Commit rule
 
-6. framing_judge is optional enhancement.
-   Not required in Plan 06 core path.
-   Include the file but do not wire into realtime.py yet.
+If this rewrite is committed, commit **only** the rewritten plan file.
+No code changes.
 
----
+## 11. Stop rule
 
-## Self-Check
-  □ MultimodalClient uses compatible mode base URL
-  □ Image format: data:image/jpeg;base64,... in content array
-  □ Heavy vision text → speech via Qwen instructions
-  □ capture_coach runs before multimodal call
-  □ realtime.py update described (not replace)
-  □ 8 unit tests listed
-  □ 2 physical gate checks require real camera
-  □ framing_judge described but not required in core path
+STOP. Say PLAN 06 REWRITE COMPLETE. Wait for instruction.

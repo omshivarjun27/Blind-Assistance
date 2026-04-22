@@ -9,12 +9,14 @@ import { useMicStream } from '@/hooks/useMicStream';
 export type SessionStatus =
   | 'idle'
   | 'connecting'
+  | 'reconnecting'
   | 'listening'
   | 'thinking'
   | 'speaking'
   | 'error';
 
 export interface TranscriptEntry {
+  id: string;
   role: 'user' | 'assistant';
   text: string;
 }
@@ -106,7 +108,12 @@ export function useRealtimeSession(captureFrame: () => string | null) {
   const mic = useMicStream();
 
   const appendTranscript = useCallback((entry: TranscriptEntry) => {
-    setTranscript((prev) => [...prev, entry]);
+    setTranscript((prev) => {
+      if (prev.some((item) => item.id === entry.id)) {
+        return prev;
+      }
+      return [...prev, entry];
+    });
   }, []);
 
   const flushTurn = useCallback(() => {
@@ -184,10 +191,6 @@ export function useRealtimeSession(captureFrame: () => string | null) {
           playbackEndTimerRef.current = setTimeout(() => {
             playbackEndTimerRef.current = null;
             _nextPlayTime = 0;
-            const newFrame = captureFrameRef.current?.();
-            if (newFrame) {
-              wsRef.current?.sendImage(newFrame);
-            }
             isPlayingRef.current = false;
             isSpeakingRef.current = false;
             isSendingRef.current = false;
@@ -278,17 +281,34 @@ export function useRealtimeSession(captureFrame: () => string | null) {
       wsRef.current = ws;
       responseCancelledRef.current = false;
 
+      ws.onConnected = () => {
+        setError(null);
+        setStatus('listening');
+      };
+
+      ws.onReconnecting = () => {
+        setStatus('reconnecting');
+      };
+
       ws.onAudio = (pcm) => {
         playPCMChunk(pcm);
       };
 
-      ws.onTranscript = (role, text) => {
-        appendTranscript({ role: role as 'user' | 'assistant', text });
+      ws.onTranscript = (role, text, turnId) => {
+        const id = turnId ? `${turnId}:${role}` : `${role}:${Date.now()}:${Math.random()}`;
+        appendTranscript({ id, role: role as 'user' | 'assistant', text });
       };
 
       ws.onError = (msg) => {
         setError(msg);
         setStatus('error');
+      };
+
+      ws.onTurnFailed = (msg) => {
+        setError(msg);
+        isSendingRef.current = false;
+        responseCancelledRef.current = false;
+        setStatus('listening');
       };
 
       ws.onDisconnected = () => {

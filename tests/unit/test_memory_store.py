@@ -92,6 +92,31 @@ async def test_get_priority_facts_returns_latest_first(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_get_priority_facts_includes_higher_priorities(tmp_path):
+    db_path = str(tmp_path / "memory.sqlite")
+    store = MemoryStore(db_path=db_path)
+    await store.initialize_all()
+    await _insert_long_term(
+        db_path=db_path,
+        user_id="default",
+        fact="Priority 1 fact",
+        created_at="2026-01-01T00:00:00",
+        priority=1,
+    )
+    await _insert_long_term(
+        db_path=db_path,
+        user_id="default",
+        fact="Priority 2 fact",
+        created_at="2026-01-02T00:00:00",
+        priority=2,
+    )
+
+    facts = await store.get_priority_facts("default", top_k=5)
+
+    assert facts == ["Priority 2 fact", "Priority 1 fact"]
+
+
+@pytest.mark.asyncio
 async def test_memory_manager_get_startup_memory_context_returns_formatted_lines():
     mock_embedder = AsyncMock()
     mock_store = AsyncMock()

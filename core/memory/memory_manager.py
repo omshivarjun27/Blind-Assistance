@@ -16,6 +16,54 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_RECALL_TOP_K = 5
 DEFAULT_RECALL_THRESHOLD = 0.72
+_FORCE_EXTRACT_TRIGGERS = (
+    "remember",
+    "ಯಾದ",
+    "याद",
+    "ನೆನಪಿಡು",
+    "ನನ್ನ ಹೆಸರು",
+    "मेरा नाम",
+    "my name is",
+    "my city is",
+    "i live in",
+    "my doctor is",
+    "update that",
+    "save this",
+    "note that",
+    "don't forget",
+)
+
+
+def _should_force_extract(transcript: str) -> bool:
+    lowered = transcript.lower()
+    return any(token in lowered for token in _FORCE_EXTRACT_TRIGGERS)
+
+
+def _normalize_category(category: str) -> str:
+    cleaned = category.strip().upper() or "GENERAL"
+    return cleaned if cleaned in {
+        "NAME",
+        "LOCATION",
+        "MEDICAL",
+        "PREFERENCE",
+        "RELATIONSHIP",
+        "GENERAL",
+    } else "GENERAL"
+
+
+def _infer_category_from_fact(fact: str) -> str:
+    lowered = fact.lower()
+    if "name is" in lowered:
+        return "NAME"
+    if "city" in lowered or "live" in lowered or "from" in lowered:
+        return "LOCATION"
+    if "doctor" in lowered or "medicine" in lowered or "medical" in lowered:
+        return "MEDICAL"
+    if "like" in lowered or "prefer" in lowered or "favorite" in lowered:
+        return "PREFERENCE"
+    if "mother" in lowered or "father" in lowered or "wife" in lowered or "husband" in lowered:
+        return "RELATIONSHIP"
+    return "GENERAL"
 
 
 class MemoryManager:
@@ -49,7 +97,13 @@ class MemoryManager:
         if self.extractor is None:
             return
         try:
+            logger.debug(
+                "Memory extraction input: %r + %r",
+                user_transcript,
+                assistant_transcript,
+            )
             facts = await self.extractor.extract(user_transcript, assistant_transcript)
+            logger.debug("Memory extraction facts: %r", facts)
             if not facts:
                 if turn_index is not None:
                     logger.info(
@@ -60,7 +114,7 @@ class MemoryManager:
             saved_count = 0
             for fact_data in facts:
                 fact_text = fact_data.get("fact", "").strip()
-                category = fact_data.get("category", "GENERAL").upper()
+                category = _normalize_category(fact_data.get("category", "GENERAL"))
                 tier = fact_data.get("tier", "long")
                 if not fact_text:
                     continue
@@ -72,6 +126,8 @@ class MemoryManager:
                         embedding,
                         tier=tier,
                         category=category,
+                        priority=1,
+                        dedupe_by_category=category != "GENERAL",
                     )
                     saved_count += 1
                 except Exception as exc:
@@ -115,8 +171,26 @@ class MemoryManager:
         Returns the cleaned fact string for confirmation response.
         """
         cleaned_fact = build_memory_fact(raw_utterance)
+        category = _infer_category_from_fact(cleaned_fact)
+
+        if self.extractor is not None:
+            extracted = await self.extractor.extract(cleaned_fact, "")
+            if extracted:
+                first = extracted[0]
+                fact_candidate = str(first.get("fact", "")).strip()
+                if fact_candidate:
+                    cleaned_fact = fact_candidate
+                    category = _normalize_category(first.get("category", category))
+
         embedding = await self.embedder.embed(cleaned_fact)
-        await self.store.save_fact(user_id, cleaned_fact, embedding)
+        await self.store.save_fact(
+            user_id,
+            cleaned_fact,
+            embedding,
+            category=category,
+            priority=2,
+            dedupe_by_category=category != "GENERAL",
+        )
         logger.info("Memory saved for user %s: %s", user_id, cleaned_fact)
         return cleaned_fact
 
@@ -177,9 +251,7 @@ class MemoryManager:
         Never raises.
         """
         try:
-            priority_facts = await self.store.get_priority_facts(
-                user_id=user_id, top_k=top_k
-            )
+            priority_facts = await self.get_priority_facts(user_id=user_id, top_k=top_k)
             if not priority_facts:
                 return None
             lines = [f"- {fact}" for fact in priority_facts]
@@ -187,3 +259,18 @@ class MemoryManager:
         except Exception as exc:
             logger.warning("get_startup_memory_context failed: %s", exc)
             return None
+
+    async def get_priority_facts(
+        self,
+        user_id: str,
+        top_k: int = 10,
+    ) -> list[str]:
+        try:
+            return await self.store.get_priority_facts(user_id=user_id, top_k=top_k)
+        except Exception as exc:
+            logger.warning("get_priority_facts failed: %s", exc)
+            return []
+
+    async def close(self) -> None:
+        if self.extractor is not None:
+            await self.extractor.close()

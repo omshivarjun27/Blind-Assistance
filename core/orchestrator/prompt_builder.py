@@ -15,7 +15,7 @@ _SEARCH_PREFIXES = re.compile(
 )
 
 _MEMORY_PREFIXES = re.compile(
-    r"^((please\s+)?memorize\s+(that\s+)?|remember\s+(that\s+)?|save\s+(this\s+)?|note\s+(that\s+)?)",
+    r"^((please\s+)?memorize\s+(that\s+)?|remember\s+(that\s+)?|save\s+(this\s+)?|save\s+permanently\s+(that\s+)?|store\s+(this\s+)?|store\s+permanently\s+(that\s+)?|store\s+in\s+(my\s+)?permanent\s+memory\s+(that\s+)?|note\s+(that\s+)?|keep\s+in\s+mind\s+(that\s+)?|don't\s+forget\s+(that\s+)?|do\s+not\s+forget\s+(that\s+)?|remember\s+this\s+always\s*(that\s+)?|remember\s+forever\s*(that\s+)?)",
     re.IGNORECASE,
 )
 
@@ -39,7 +39,7 @@ def build_system_prompt(
     if intent_penalty:
         parts.insert(
             0,
-            "The user has corrected this type of answer before. Be especially careful and clear.",
+            "Let me be careful here… The user has corrected this type of answer before.",
         )
     if verbosity_mode == "COMPACT":
         parts.append("Keep your answer under 2 sentences.")

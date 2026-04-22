@@ -3,11 +3,21 @@ Ally Vision v2 — FastAPI entry point.
 """
 
 from __future__ import annotations
+
 import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from shared.config.settings import get_config, APP_HOST, APP_PORT, DEBUG
+
 from apps.backend.api.routes import realtime as realtime_route
+from apps.backend.services.shared_http import (
+    close_shared_http_clients,
+    configure_shared_http_clients,
+)
+from shared.config.settings import APP_HOST, APP_PORT, DEBUG, MEMORY_DB_PATH, get_config
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -15,10 +25,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ally-vision")
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    vision_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(60.0),
+        limits=httpx.Limits(max_keepalive_connections=3, max_connections=6),
+    )
+    compat_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0),
+        limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+    )
+    configure_shared_http_clients(
+        vision_client=vision_client,
+        compat_client=compat_client,
+    )
+    logger.info("Memory DB absolute path: %s", Path(MEMORY_DB_PATH).resolve())
+    try:
+        yield
+    finally:
+        await close_shared_http_clients()
+
+
 app = FastAPI(
     title="Ally Vision v2",
     description="Blind-first voice+vision assistant",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(

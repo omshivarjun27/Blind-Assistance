@@ -10,7 +10,7 @@ interface ControlBarProps {
 }
 
 export function ControlBar({ onStart, onStop, onCapture, status }: ControlBarProps) {
-  const isActive = ['listening', 'thinking', 'speaking'].includes(status);
+  const isActive = ['listening', 'thinking', 'speaking', 'reconnecting'].includes(status);
   const isDisabled = ['connecting', 'thinking'].includes(status);
 
   return (

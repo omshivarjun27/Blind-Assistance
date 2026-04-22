@@ -87,6 +87,8 @@ def _mock_client(turn: Any):
     client.session_needs_reconnect = MagicMock(return_value=False)
     client.needs_reconnect = MagicMock(return_value=False)
     client.was_response_cancelled = MagicMock(return_value=False)
+    client.has_buffered_response_events = MagicMock(return_value=False)
+    client.consume_last_commit_failure = MagicMock(return_value=None)
     client._last_session_updated_elapsed_ms = 0
     client.close = MagicMock()
     return client
@@ -154,7 +156,7 @@ def test_first_audio_ms_not_null():
         with TestClient(app) as client:
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(b"\x00" * 3200)
-                response = ws.receive_bytes()
+                response = _receive_until_bytes(ws)
 
     assert response == turn.assistant_audio_pcm
     assert len(response) > 0
@@ -177,7 +179,7 @@ def test_audio_starts_before_intent_resolves(caplog):
     audio_started = {"value": False}
     stream_index = {"value": 0}
 
-    async def streaming_side_effect(on_audio_chunk):
+    async def streaming_side_effect(on_audio_chunk, **_kwargs):
         next_turn = turns[stream_index["value"]]
         stream_index["value"] += 1
         audio_started["value"] = True
@@ -244,7 +246,7 @@ def test_intent_timeout_defaults_to_general_chat(caplog):
     mock_client = _mock_client(turns)
     stream_index = {"value": 0}
 
-    async def streaming_side_effect(on_audio_chunk):
+    async def streaming_side_effect(on_audio_chunk, **_kwargs):
         next_turn = turns[stream_index["value"]]
         stream_index["value"] += 1
         on_audio_chunk(next_turn.assistant_audio_pcm)
@@ -319,9 +321,7 @@ def test_turn1_skips_classifier(caplog):
         with TestClient(app) as client:
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(b"\x00" * 3200)
-                response = ws.receive_bytes()
-                _ = ws.receive_text()
-                _ = ws.receive_text()
+                response = _receive_until_bytes(ws)
 
     assert response == turn.assistant_audio_pcm
     mock_classifier.classify.assert_not_awaited()
@@ -378,8 +378,6 @@ def test_turn2_classifies_normally(caplog):
 
                 ws.send_bytes(b"\x00" * 3200)
                 _ = _receive_until_bytes(ws)
-                _ = ws.receive_text()
-                _ = ws.receive_text()
 
     mock_classifier.classify.assert_awaited_once()
     assert (
@@ -434,14 +432,8 @@ def test_memory_extraction_fires_on_turn_1_skip(caplog):
 
     mock_classifier.classify.assert_not_awaited()
     assert "Intent classification skipped — no transcript (turn 0 cold start)" in caplog.text
-    assert (
-        "Memory extraction task fired — turn 0 (source: assistant_text_fallback)"
-        in caplog.text
-    )
-    assert (
-        "defer_auto_extract",
-        "My name is Om. I need help reading documents.",
-    ) in scheduled_calls
+    assert "Memory extraction skipped — no usable text (turn 0)" in caplog.text
+    assert ("defer_auto_extract", "My name is Om. I need help reading documents.") not in scheduled_calls
 
 
 def test_memory_extraction_fires_on_turn_2_normal(caplog):
@@ -499,11 +491,8 @@ def test_memory_extraction_fires_on_turn_2_normal(caplog):
                 time.sleep(0.1)
 
     assert mock_classifier.classify.await_count == 1
-    assert (
-        "Memory extraction task fired — turn 1 (source: user_transcript)"
-        in caplog.text
-    )
-    assert ("defer_auto_extract", 1) in scheduled_turns
+    assert "Memory extraction skipped — no qualifying personal fact signal (turn 1)" in caplog.text
+    assert ("defer_auto_extract", 1) not in scheduled_turns
 
 
 def test_memory_extraction_skipped_on_empty_transcript(caplog):
@@ -575,7 +564,7 @@ def test_greeting_skips_extraction(caplog):
                 _ = _receive_until_bytes(ws)
                 time.sleep(0.1)
 
-    assert "Memory extraction skipped — greeting detected, no facts (turn 0)" in caplog.text
+    assert "Memory extraction skipped — no usable text (turn 0)" in caplog.text
     assert "defer_auto_extract" not in scheduled_labels
 
 
@@ -608,7 +597,7 @@ def test_sparse_text_skips_extraction(caplog):
                 _ = _receive_until_bytes(ws)
                 time.sleep(0.1)
 
-    assert "Memory extraction skipped — text too sparse (turn 0)" in caplog.text
+    assert "Memory extraction skipped — no usable text (turn 0)" in caplog.text
     assert "defer_auto_extract" not in scheduled_labels
 
 
@@ -765,7 +754,7 @@ def test_websocket_audio_returns_binary_response():
         with TestClient(app) as client:
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(b"\x00" * 3200)
-                response = ws.receive_bytes()
+                response = _receive_until_bytes(ws)
                 assert response == turn.assistant_audio_pcm
                 assert len(response) > 0
 
@@ -796,9 +785,7 @@ def test_client_created_once_per_user_session():
             with client.websocket_connect("/ws/realtime") as ws:
                 for _ in range(3):
                     ws.send_bytes(b"\x00" * 3200)
-                    _ = ws.receive_bytes()
-                    _ = ws.receive_text()
-                    _ = ws.receive_text()
+                    _ = _receive_until_bytes(ws)
 
     assert mock_ctor.call_count == 1
     mock_client.async_connect.assert_awaited_once()
@@ -818,7 +805,7 @@ def test_reconnect_fires_before_turn_on_expiry(caplog):
     async def reconnect_side_effect():
         order.append("reconnect")
 
-    async def streaming_side_effect(on_audio_chunk):
+    async def streaming_side_effect(on_audio_chunk, **_kwargs):
         order.append("audio")
         on_audio_chunk(turn.assistant_audio_pcm)
         return _clone_mock_turn(turn, audio=b"")
@@ -852,7 +839,7 @@ def test_reconnect_fires_before_turn_on_expiry(caplog):
 
 
 def test_websocket_returns_assistant_transcript_json():
-    """Audio turn must return assistant transcript as JSON text frame."""
+    """User transcript should be emitted before assistant transcript."""
     turn = _make_mock_turn(assistant_text="I see a table")
     mock_client = _mock_client(turn)
 
@@ -869,14 +856,17 @@ def test_websocket_returns_assistant_transcript_json():
         with TestClient(app) as client:
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(b"\x00" * 3200)
-                # First receive: audio bytes
-                ws.receive_bytes()
-                # Second receive: assistant transcript
-                text_frame = ws.receive_text()
-                msg = json.loads(text_frame)
-                assert msg["type"] == "transcript"
-                assert msg["role"] == "assistant"
-                assert msg["text"] == "I see a table"
+                first_msg = json.loads(ws.receive_text())
+                assert first_msg["type"] == "transcript"
+                assert first_msg["role"] == "user"
+                assert first_msg["text"] == "hi"
+                assert "turn_id" in first_msg
+                _receive_until_bytes(ws)
+                second_msg = json.loads(ws.receive_text())
+                assert second_msg["type"] == "transcript"
+                assert second_msg["role"] == "assistant"
+                assert second_msg["text"] == "I see a table"
+                assert second_msg["turn_id"] == first_msg["turn_id"]
 
 
 def test_websocket_prepare_audio_turn_called_with_audio_pcm():
@@ -898,7 +888,7 @@ def test_websocket_prepare_audio_turn_called_with_audio_pcm():
         with TestClient(app) as client:
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(audio_data)
-                _ = ws.receive_bytes()  # consume response
+                _ = _receive_until_bytes(ws)  # consume response
 
     mock_client.async_prepare_audio_turn.assert_called_once()
     call_kwargs = mock_client.async_prepare_audio_turn.call_args
@@ -911,7 +901,7 @@ def test_websocket_prepare_audio_turn_called_with_audio_pcm():
 
 
 def test_websocket_image_message_queued_for_next_turn():
-    """Image control message must be passed to next audio turn."""
+    """Image control message should be queued for routing, not sent into realtime audio commit."""
     turn = _make_mock_turn()
     mock_client = _mock_client(turn)
 
@@ -938,14 +928,14 @@ def test_websocket_image_message_queued_for_next_turn():
                 )
                 # Then send audio turn
                 ws.send_bytes(b"\x01" * 3200)
-                _ = ws.receive_bytes()  # consume response
+                _ = _receive_until_bytes(ws)  # consume response
 
-    # prepare_audio_turn must have received the image
+    # prepare_audio_turn should stay audio-only; image is consumed later by route logic
     call_kwargs = mock_client.async_prepare_audio_turn.call_args
     kwargs = call_kwargs[1] if call_kwargs[1] else {}
     args = call_kwargs[0] if call_kwargs[0] else ()
     image_used = kwargs.get("image_jpeg_b64") or (args[1] if len(args) > 1 else None)
-    assert image_used == "base64imgdata"
+    assert image_used is None
 
 
 def test_websocket_image_first_turn_defaults_to_scene_describe():
@@ -989,7 +979,7 @@ def test_websocket_image_first_turn_defaults_to_scene_describe():
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_text(json.dumps({"type": "image", "data": "frame123"}))
                 ws.send_bytes(b"\x00" * 3200)
-                _ = ws.receive_bytes()
+                _ = _receive_until_bytes(ws)
 
     mock_mm_client.analyze.assert_awaited_once()
 
@@ -1024,14 +1014,14 @@ def test_websocket_upstream_failure_returns_structured_error():
     turn = _make_mock_turn(audio=b"", assistant_text="", user_text="hello")
     turn.success = False
     turn.error = (
-        "DashScope session.update failed for model=qwen3-omni-flash-realtime "
-        "voice=Cherry endpoint=wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime "
+        "DashScope session.update failed for model=qwen3.5-omni-plus-realtime "
+        "voice=Tina endpoint=wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime "
         "session_id=sess_123: Access denied."
     )
     mock_client = _mock_client(turn)
     mock_config = MagicMock(
-        model="qwen3-omni-flash-realtime",
-        voice="Cherry",
+        model="qwen3.5-omni-plus-realtime",
+        voice="Tina",
         endpoint="wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime",
     )
 
@@ -1067,8 +1057,8 @@ def test_websocket_upstream_exception_returns_structured_error():
     mock_client = MagicMock()
     mock_client.async_prepare_audio_turn = AsyncMock(
         side_effect=RuntimeError(
-            "DashScope session.update failed for model=qwen3-omni-flash-realtime "
-            "voice=Cherry endpoint=wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime "
+            "DashScope session.update failed for model=qwen3.5-omni-plus-realtime "
+            "voice=Tina endpoint=wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime "
             "session_id=sess_123: Access denied."
         )
     )
@@ -1082,8 +1072,8 @@ def test_websocket_upstream_exception_returns_structured_error():
     mock_client.async_create_response_for_prepared_turn = AsyncMock()
     mock_client.close = MagicMock()
     mock_config = MagicMock(
-        model="qwen3-omni-flash-realtime",
-        voice="Cherry",
+        model="qwen3.5-omni-plus-realtime",
+        voice="Tina",
         endpoint="wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime",
     )
 
@@ -1152,14 +1142,10 @@ def test_websocket_current_turn_classifier_called_for_each_spoken_turn():
         with TestClient(app) as client:
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(b"\x00" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-                _ = ws.receive_text()
+                _ = _receive_until_bytes(ws)
 
                 ws.send_bytes(b"\x01" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-                _ = ws.receive_text()
+                _ = _receive_until_bytes(ws)
 
     assert mock_classifier.classify.await_count == 1
     mock_client.async_prepare_audio_turn.assert_awaited()
@@ -1177,7 +1163,7 @@ def test_websocket_empty_user_transcript_skips_response_after_first_scene():
 
 
 def test_websocket_current_turn_read_text_routes_to_heavy_vision():
-    """Current-turn READ_TEXT intent must use the same turn's queued image."""
+    """Short OCR-style turns with an image should go straight to heavy vision using the queued frame."""
     from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
 
     first_turn = _make_mock_turn(assistant_text="first", user_text="read this")
@@ -1223,14 +1209,106 @@ def test_websocket_current_turn_read_text_routes_to_heavy_vision():
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_text(json.dumps({"type": "image", "data": "image-one"}))
                 ws.send_bytes(b"\x01" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-                _ = ws.receive_text()
+                _ = _receive_until_bytes(ws)
 
     mock_mm_client.analyze.assert_awaited_once()
     vision_request = mock_mm_client.analyze.await_args.args[0]
     assert vision_request.image_jpeg_b64 == "image-one"
-    assert mock_classifier.classify.await_count == 1
+    assert mock_classifier.classify.await_count == 0
+
+
+def test_short_fragment_with_image_forces_scene_describe_without_classifier():
+    from apps.backend.services.dashscope.multimodal_client import VisionResponse
+
+    turn = _make_mock_turn(assistant_text="I see a desk", user_text="What.")
+    mock_client = _mock_client(turn)
+    mock_client.async_prepare_audio_turn = AsyncMock(return_value="What.")
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock()
+    mock_classifier.close = AsyncMock(return_value=None)
+    mock_mm_client = MagicMock()
+    mock_mm_client.close = AsyncMock(return_value=None)
+    mock_mm_client.analyze = AsyncMock(
+        return_value=VisionResponse(text="A desk and a chair")
+    )
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MultimodalClient.from_settings",
+            return_value=mock_mm_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.assess_frame_quality",
+            return_value=(True, ""),
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_text(json.dumps({"type": "image", "data": "image-fragment"}))
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+
+    assert mock_classifier.classify.await_count == 0
+    mock_mm_client.analyze.assert_awaited_once()
+
+
+def test_chinese_like_transcript_with_image_forces_scene_describe_without_classifier():
+    from apps.backend.services.dashscope.multimodal_client import VisionResponse
+
+    turn = _make_mock_turn(assistant_text="I see a desk", user_text="嗯。")
+    mock_client = _mock_client(turn)
+    mock_client.async_prepare_audio_turn = AsyncMock(return_value="嗯。")
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock()
+    mock_classifier.close = AsyncMock(return_value=None)
+    mock_mm_client = MagicMock()
+    mock_mm_client.close = AsyncMock(return_value=None)
+    mock_mm_client.analyze = AsyncMock(
+        return_value=VisionResponse(text="A desk and a chair")
+    )
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MultimodalClient.from_settings",
+            return_value=mock_mm_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.assess_frame_quality",
+            return_value=(True, ""),
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_text(json.dumps({"type": "image", "data": "image-fragment"}))
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+
+    assert mock_classifier.classify.await_count == 0
+    mock_mm_client.analyze.assert_awaited_once()
 
 
 def test_heavy_vision_dispatch_on_scene_intent(caplog):
@@ -1277,8 +1355,6 @@ def test_heavy_vision_dispatch_on_scene_intent(caplog):
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(b"\x00" * 3200)
                 _ = _receive_until_bytes(ws)
-                _ = ws.receive_text()
-                _ = ws.receive_text()
                 mock_client.async_update_instructions.reset_mock()
                 mock_client.async_create_response_for_prepared_turn_streaming.reset_mock()
 
@@ -1295,10 +1371,50 @@ def test_heavy_vision_dispatch_on_scene_intent(caplog):
     mock_client.async_update_instructions.assert_not_awaited()
     assert (
         mock_client.async_create_response_for_prepared_turn_streaming.await_args.kwargs[
-            "instructions"
+            "user_input_text"
         ]
-        == "Say exactly this to the user: A table and a chair"
+        == "The user asked: what do you see\n[Camera sees]: A table and a chair"
     )
+
+
+def test_heavy_vision_reconnects_before_contextual_response_when_upstream_started(caplog):
+    from core.orchestrator.intent_classifier import ClassificationResult, IntentCategory
+    from apps.backend.services.dashscope.multimodal_client import VisionResponse
+
+    caplog.set_level("INFO", logger="ally-vision-realtime-route")
+    turns = [
+        _make_mock_turn(audio=b"\x01\x02" * 40, assistant_text="scene", user_text="what do you see"),
+    ]
+    mock_client = _mock_client(turns)
+    mock_client.has_buffered_response_events = MagicMock(return_value=True)
+    mock_classifier = MagicMock()
+    mock_classifier.classify = AsyncMock(
+        return_value=ClassificationResult(
+            intent=IntentCategory.SCENE_DESCRIBE,
+            confidence="high",
+            raw_label="SCENE_DESCRIBE",
+        )
+    )
+    mock_classifier.close = AsyncMock(return_value=None)
+    mock_mm_client = MagicMock()
+    mock_mm_client.close = AsyncMock(return_value=None)
+    mock_mm_client.analyze = AsyncMock(return_value=VisionResponse(text="A table and a chair"))
+
+    with (
+        patch("apps.backend.api.routes.realtime.QwenRealtimeClient", return_value=mock_client),
+        patch("apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings", return_value=MagicMock()),
+        patch("apps.backend.api.routes.realtime.IntentClassifier.from_settings", return_value=mock_classifier),
+        patch("apps.backend.api.routes.realtime.MultimodalClient.from_settings", return_value=mock_mm_client),
+        patch("apps.backend.api.routes.realtime.assess_frame_quality", return_value=(True, "")),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_text(json.dumps({"type": "image", "data": "image-two"}))
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+
+    mock_client.async_reconnect.assert_awaited_once()
+    assert "Buffered upstream response detected — reconnecting before contextual response" in caplog.text
 
 
 def test_capture_coach_rejection_blocks_vision_model(caplog):
@@ -1334,8 +1450,6 @@ def test_capture_coach_rejection_blocks_vision_model(caplog):
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(b"\x00" * 3200)
                 _ = _receive_until_bytes(ws)
-                _ = ws.receive_text()
-                _ = ws.receive_text()
 
                 ws.send_text(json.dumps({"type": "image", "data": "image-two"}))
                 ws.send_bytes(b"\x00" * 3200)
@@ -1378,8 +1492,6 @@ def test_heavy_vision_not_called_on_general_chat():
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(b"\x00" * 3200)
                 _ = _receive_until_bytes(ws)
-                _ = ws.receive_text()
-                _ = ws.receive_text()
 
                 ws.send_text(json.dumps({"type": "image", "data": "image-two"}))
                 ws.send_bytes(b"\x00" * 3200)
@@ -1433,8 +1545,6 @@ def test_heavy_vision_dispatch_on_scene_intent_gate_path(caplog):
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(b"\x00" * 3200)
                 _ = _receive_until_bytes(ws)
-                _ = ws.receive_text()
-                _ = ws.receive_text()
 
                 ws.send_text(json.dumps({"type": "image", "data": "image-two"}))
                 ws.send_bytes(b"\x00" * 3200)
@@ -1481,8 +1591,6 @@ def test_capture_coach_rejection_blocks_vision_model_gate_path(caplog):
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(b"\x00" * 3200)
                 _ = _receive_until_bytes(ws)
-                _ = ws.receive_text()
-                _ = ws.receive_text()
 
                 ws.send_text(json.dumps({"type": "image", "data": "image-two"}))
                 ws.send_bytes(b"\x00" * 3200)
@@ -1525,8 +1633,6 @@ def test_heavy_vision_not_called_on_general_chat_gate_path():
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(b"\x00" * 3200)
                 _ = _receive_until_bytes(ws)
-                _ = ws.receive_text()
-                _ = ws.receive_text()
 
                 ws.send_text(json.dumps({"type": "image", "data": "image-two"}))
                 ws.send_bytes(b"\x00" * 3200)
@@ -1534,6 +1640,239 @@ def test_heavy_vision_not_called_on_general_chat_gate_path():
 
     assert response == turns[1].assistant_audio_pcm
     mock_mm_client.analyze.assert_not_awaited()
+
+
+def test_short_general_chat_turn_injects_clarification_prompt():
+    turn = _make_mock_turn(
+        audio=b"\x07\x08" * 20,
+        assistant_text="Could you clarify what you'd like to know about art learning?",
+        user_text="Art learning.",
+    )
+    mock_client = _mock_client(turn)
+    mock_memory_manager = MagicMock()
+    mock_memory_manager.store.initialize = AsyncMock()
+    mock_classifier = MagicMock()
+    mock_classifier.close = AsyncMock(return_value=None)
+    mock_mm_client = MagicMock()
+    mock_mm_client.close = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MemoryManager.from_settings",
+            return_value=mock_memory_manager,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MultimodalClient.from_settings",
+            return_value=mock_mm_client,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+
+    assert (
+        mock_client.async_create_response_for_prepared_turn_streaming.await_args.kwargs[
+            "user_input_text"
+        ]
+        == "The user said: 'Art learning.'. This is very short. Please ask one short clarifying question before answering."
+    )
+
+
+def test_greeting_turn_does_not_inject_clarification_prompt():
+    turn = _make_mock_turn(
+        audio=b"\x09\x0A" * 20,
+        assistant_text="Hello! How can I help you today?",
+        user_text="Hello",
+    )
+    mock_client = _mock_client(turn)
+    mock_memory_manager = MagicMock()
+    mock_memory_manager.store.initialize = AsyncMock()
+    mock_classifier = MagicMock()
+    mock_classifier.close = AsyncMock(return_value=None)
+    mock_mm_client = MagicMock()
+    mock_mm_client.close = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MemoryManager.from_settings",
+            return_value=mock_memory_manager,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.IntentClassifier.from_settings",
+            return_value=mock_classifier,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MultimodalClient.from_settings",
+            return_value=mock_mm_client,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                _ = ws.receive_text()
+
+    assert (
+        mock_client.async_create_response_for_prepared_turn_streaming.await_args.kwargs.get(
+            "user_input_text"
+        )
+        is None
+    )
+
+
+def test_commit_failure_sends_status_and_keeps_socket_open():
+    turn = _make_mock_turn(audio=b"", assistant_text="", user_text="")
+    mock_client = _mock_client(turn)
+    mock_client.async_prepare_audio_turn = AsyncMock(return_value=None)
+    mock_client.consume_last_commit_failure = MagicMock(
+        return_value="Internal service error: null"
+    )
+    mock_memory_manager = MagicMock()
+    mock_memory_manager.store.initialize = AsyncMock()
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MemoryManager.from_settings",
+            return_value=mock_memory_manager,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                status_msg = json.loads(ws.receive_text())
+                assert status_msg == {
+                    "type": "status",
+                    "status": "turn_failed",
+                    "message": "Voice turn failed — please try again",
+                }
+                ws.send_text(json.dumps({"type": "ping"}))
+                assert json.loads(ws.receive_text())["type"] == "pong"
+
+
+def test_timeout_placeholder_used_for_transcript_log():
+    turn = _make_mock_turn(
+        audio=b"\x0b\x0c" * 20,
+        assistant_text="I can see a face.",
+        user_text="",
+    )
+    mock_client = _mock_client(turn)
+    mock_memory_manager = MagicMock()
+    mock_memory_manager.store.initialize = AsyncMock()
+    mock_correction_store = MagicMock()
+    mock_correction_store.log_turn = AsyncMock(return_value=None)
+    mock_correction_store.log_correction = AsyncMock(return_value=None)
+    mock_reflection = MagicMock()
+    mock_reflection.get_verbosity_mode = MagicMock(return_value="normal")
+    mock_reflection.get_intent_penalty = MagicMock(return_value=False)
+    mock_reflection.record_turn = MagicMock()
+    mock_reflection.update_verbosity = MagicMock()
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MemoryManager.from_settings",
+            return_value=mock_memory_manager,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.CorrectionStore.from_settings",
+            return_value=mock_correction_store,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.OnlineReflection.from_settings",
+            return_value=mock_reflection,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                _ = _receive_until_bytes(ws)
+                _ = ws.receive_text()
+
+    assert (
+        mock_correction_store.log_turn.await_args.kwargs["transcript"]
+        == "[no transcript — timeout]"
+    )
+
+
+def test_empty_turn_skips_transcript_and_reflection_logs():
+    turn = _make_mock_turn(audio=b"", assistant_text="", user_text="")
+    mock_client = _mock_client(turn)
+    mock_memory_manager = MagicMock()
+    mock_memory_manager.store.initialize = AsyncMock()
+    mock_correction_store = MagicMock()
+    mock_correction_store.log_turn = AsyncMock(return_value=None)
+    mock_correction_store.log_correction = AsyncMock(return_value=None)
+    mock_reflection = MagicMock()
+    mock_reflection.get_verbosity_mode = MagicMock(return_value="normal")
+    mock_reflection.get_intent_penalty = MagicMock(return_value=False)
+    mock_reflection.record_turn = MagicMock()
+    mock_reflection.update_verbosity = MagicMock()
+
+    with (
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.QwenRealtimeConfig.from_settings",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.MemoryManager.from_settings",
+            return_value=mock_memory_manager,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.CorrectionStore.from_settings",
+            return_value=mock_correction_store,
+        ),
+        patch(
+            "apps.backend.api.routes.realtime.OnlineReflection.from_settings",
+            return_value=mock_reflection,
+        ),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_bytes(b"\x00" * 3200)
+                time.sleep(0.1)
+
+    mock_correction_store.log_turn.assert_not_awaited()
+    mock_reflection.record_turn.assert_not_called()
 
 
 # ── disconnect ────────────────────────────────────────────────────
@@ -1631,7 +1970,7 @@ def test_mid_turn_disconnect_cancels_stream(caplog):
     mock_mm_client = MagicMock()
     mock_mm_client.close = AsyncMock(return_value=None)
 
-    async def midstream_disconnect(on_audio_chunk):
+    async def midstream_disconnect(on_audio_chunk, **_kwargs):
         raise WebSocketDisconnect()
 
     mock_client.async_create_response_for_prepared_turn_streaming = AsyncMock(
@@ -1821,14 +2160,10 @@ def test_classifier_memory_write_route_calls_memory_manager():
         with TestClient(app) as client:
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(b"\x00" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-                _ = ws.receive_text()
+                _ = _receive_until_bytes(ws)
 
                 ws.send_bytes(b"\x00" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-                _ = ws.receive_text()
+                _ = _receive_until_bytes(ws)
 
     mock_memory_manager.save.assert_called_once_with(
         user_id="default",
@@ -1885,14 +2220,10 @@ def test_classifier_memory_recall_route_calls_memory_manager():
         with TestClient(app) as client:
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_bytes(b"\x00" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-                _ = ws.receive_text()
+                _ = _receive_until_bytes(ws)
 
                 ws.send_bytes(b"\x00" * 3200)
-                _ = ws.receive_bytes()
-                _ = ws.receive_text()
-                _ = ws.receive_text()
+                _ = _receive_until_bytes(ws)
 
     mock_memory_manager.retrieve_relevant_facts.assert_called_once_with(
         user_id="default",
@@ -1931,7 +2262,7 @@ def test_interrupt_control_message_calls_cancel_response():
             with client.websocket_connect("/ws/realtime") as ws:
                 ws.send_text(json.dumps({"type": "interrupt"}))
                 ws.send_bytes(b"\x00" * 3200)
-                ws.receive_bytes()
+                _receive_until_bytes(ws)
 
     mock_client.cancel_response.assert_called_once()
 
@@ -1967,7 +2298,7 @@ def test_interrupt_ignored_when_no_active_response(caplog):
                 assert json.loads(ws.receive_text())["type"] == "pong"
 
     mock_client.cancel_response.assert_not_called()
-    assert "Cancel request ignored — no active response" in caplog.text
+    assert "Cancel: no active response — image slot flushed" in caplog.text
     assert "response.cancel sent (inf" not in caplog.text
 
 
@@ -2041,7 +2372,7 @@ def test_cancelled_turn_reconnects_before_processing_queued_audio():
     )
     mock_client.was_response_cancelled = MagicMock(side_effect=lambda: cancelled.is_set())
 
-    async def fake_stream(_forward_audio_delta, instructions=None):
+    async def fake_stream(_forward_audio_delta, instructions=None, **_kwargs):
         if not cancelled.is_set():
             mock_client._response_active = True
             await cancelled.wait()

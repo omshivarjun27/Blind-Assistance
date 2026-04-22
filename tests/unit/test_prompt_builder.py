@@ -78,3 +78,17 @@ def test_build_memory_fact_strips_please_memorize_that():
 
     result = build_memory_fact("please memorize that my name is Om")
     assert result == "my name is Om"
+
+
+def test_build_memory_fact_strips_keep_in_mind_that():
+    from core.orchestrator.prompt_builder import build_memory_fact
+
+    result = build_memory_fact("keep in mind that my city is Bengaluru")
+    assert result == "my city is Bengaluru"
+
+
+def test_build_system_prompt_uses_cautious_prefix_when_penalized():
+    from core.orchestrator.prompt_builder import build_system_prompt
+
+    result = build_system_prompt("Answer clearly.", intent_penalty=True)
+    assert result.startswith("Let me be careful here…")

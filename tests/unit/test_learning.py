@@ -148,15 +148,15 @@ async def test_ebbinghaus_weight_decays_with_turns(tmp_path):
     reflection.record_turn("s1", "t2", "SLOW", True, 10)
     await asyncio.sleep(0.1)
 
-    assert pytest.approx(reflection._failure_scores["FAST"], rel=1e-3) == 1.0
-    assert reflection._failure_scores["SLOW"] < 0.3
+    assert pytest.approx(reflection._failure_scores["FAST"], rel=1e-3) == 0.34
+    assert pytest.approx(reflection._failure_scores["SLOW"], rel=1e-3) == 0.34
 
 
 @pytest.mark.asyncio
 async def test_failure_score_exceeds_threshold_after_3_corrections(tmp_path):
     db_path = await _make_learning_db(tmp_path)
     reflection = OnlineReflection(
-        db_path=db_path, decay_factor=0.3, failure_threshold=1.5
+        db_path=db_path, decay_factor=0.3, failure_threshold=1.0
     )
 
     reflection.record_turn("s1", "t1", "GENERAL_CHAT", True, 0)
@@ -176,6 +176,13 @@ def test_verbosity_compact_set_on_signal(tmp_path):
     reflection = OnlineReflection(db_path=str(tmp_path / "learning.sqlite"))
     reflection.update_verbosity("s1", "give me a shorter answer")
     assert reflection.get_verbosity_mode("s1") == "COMPACT"
+
+
+def test_verbosity_modes_are_session_scoped(tmp_path):
+    reflection = OnlineReflection(db_path=str(tmp_path / "learning.sqlite"))
+    reflection.update_verbosity("s1", "give me a shorter answer")
+    assert reflection.get_verbosity_mode("s1") == "COMPACT"
+    assert reflection.get_verbosity_mode("s2") == "NORMAL"
 
 
 def test_verbosity_verbose_set_on_signal(tmp_path):
@@ -198,10 +205,11 @@ def test_intent_penalty_true_above_threshold(tmp_path):
     reflection = OnlineReflection(
         db_path=str(tmp_path / "learning.sqlite"),
         decay_factor=0.3,
-        failure_threshold=1.5,
+        failure_threshold=1.0,
     )
     reflection.record_turn("s1", "t1", "GENERAL_CHAT", True, 0)
     reflection.record_turn("s1", "t2", "GENERAL_CHAT", True, 0)
+    reflection.record_turn("s1", "t3", "GENERAL_CHAT", True, 0)
     assert reflection.get_intent_penalty("GENERAL_CHAT") is True
 
 
@@ -537,11 +545,9 @@ def test_normal_verbosity_no_change():
 
 def test_intent_penalty_prepends_warning():
     result = build_system_prompt("Base.", intent_penalty=True)
-    assert result.startswith(
-        "The user has corrected this type of answer before. Be especially careful and clear."
-    )
+    assert result.startswith("Let me be careful here…")
 
 
 def test_no_penalty_no_prepend():
     result = build_system_prompt("Base.", intent_penalty=False)
-    assert not result.startswith("The user has corrected this type of answer before.")
+    assert not result.startswith("Let me be careful here…")

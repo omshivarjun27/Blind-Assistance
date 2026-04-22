@@ -8,6 +8,16 @@ import { StatusPill } from '@/components/status-pill';
 import { useCameraCapture } from '@/hooks/useCameraCapture';
 import { useRealtimeSession } from '@/hooks/useRealtimeSession';
 
+function isKannadaScript(text: string): boolean {
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp >= 0x0C80 && cp <= 0x0CFF) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export default function Home() {
   const camera = useCameraCapture();
   const session = useRealtimeSession(camera.captureFrame);
@@ -74,6 +84,8 @@ export default function Home() {
               className={`text-xs px-2 py-0.5 rounded-full border ${
                 session.status === 'listening'
                   ? 'border-green-500 text-green-400 bg-green-500/10'
+                  : session.status === 'reconnecting'
+                    ? 'border-amber-500 text-amber-400 bg-amber-500/10'
                   : session.status === 'thinking'
                     ? 'border-yellow-500 text-yellow-400 bg-yellow-500/10'
                     : session.status === 'speaking'
@@ -83,6 +95,8 @@ export default function Home() {
             >
               {session.status === 'listening'
                 ? 'Listening'
+                : session.status === 'reconnecting'
+                  ? 'Reconnecting...'
                 : session.status === 'thinking'
                   ? 'Thinking'
                   : session.status === 'speaking'
@@ -112,9 +126,9 @@ export default function Home() {
               </div>
             ) : (
               <>
-                {session.transcript.map((entry, i) => (
+                {session.transcript.map((entry) => (
                   entry.role === 'user' ? (
-                    <div key={i} className="flex justify-end">
+                    <div key={entry.id} className="flex justify-end">
                       <div
                         data-transcript
                         className="ml-auto max-w-[85%] rounded-2xl rounded-tr-sm bg-blue-600 px-4 py-2 text-sm text-white"
@@ -128,7 +142,7 @@ export default function Home() {
                       </div>
                     </div>
                   ) : (
-                    <div key={i} className="flex justify-start gap-2">
+                    <div key={entry.id} className="flex justify-start gap-2">
                       <div className="w-6 h-6 rounded-full bg-white/10 flex items-center justify-center shrink-0 mt-0.5">
                         <span className="text-[10px] text-zinc-400">A</span>
                       </div>
@@ -138,7 +152,12 @@ export default function Home() {
                       >
                         <p
                           className="break-words whitespace-pre-wrap"
-                          style={{ lineHeight: '1.8' }}
+                          style={{
+                            lineHeight: '1.8',
+                            fontFamily: isKannadaScript(entry.text)
+                              ? "'Noto Sans Kannada', 'Noto Sans', sans-serif"
+                              : undefined,
+                          }}
                         >
                           {entry.text}
                         </p>
@@ -154,6 +173,8 @@ export default function Home() {
           <div className="shrink-0 px-4 py-2 border-t border-white/10 bg-zinc-950">
             {session.status === 'thinking' ? (
               <div className="text-xs text-yellow-400">Ally is thinking...</div>
+            ) : session.status === 'reconnecting' ? (
+              <div className="text-xs text-amber-400">Reconnecting...</div>
             ) : session.status === 'speaking' ? (
               <div className="text-xs text-blue-400">Ally is speaking...</div>
             ) : session.status === 'listening' ? (
@@ -199,9 +220,9 @@ export default function Home() {
               </div>
             ) : (
               <>
-                {session.transcript.map((entry, i) => (
+                {session.transcript.map((entry) => (
                   entry.role === 'user' ? (
-                    <div key={i} className="flex justify-end">
+                    <div key={entry.id} className="flex justify-end">
                       <div
                         data-transcript
                         className="ml-auto max-w-[85%] rounded-2xl rounded-tr-sm bg-blue-600 px-4 py-2 text-sm text-white"
@@ -215,7 +236,7 @@ export default function Home() {
                       </div>
                     </div>
                   ) : (
-                    <div key={i} className="flex justify-start gap-2">
+                    <div key={entry.id} className="flex justify-start gap-2">
                       <div className="w-6 h-6 rounded-full bg-white/10 flex items-center justify-center shrink-0 mt-0.5">
                         <span className="text-[10px] text-zinc-400">A</span>
                       </div>
@@ -225,7 +246,12 @@ export default function Home() {
                       >
                         <p
                           className="break-words whitespace-pre-wrap"
-                          style={{ lineHeight: '1.8' }}
+                          style={{
+                            lineHeight: '1.8',
+                            fontFamily: isKannadaScript(entry.text)
+                              ? "'Noto Sans Kannada', 'Noto Sans', sans-serif"
+                              : undefined,
+                          }}
                         >
                           {entry.text}
                         </p>
