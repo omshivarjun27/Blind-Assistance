@@ -1,0 +1,11 @@
+Task 03 notebook matrix audit
+rows=
+21
+source_notebooks=
+10
+winner_rows=
+10
+bad_status_rows=
+0
+categories=
+realtime; heavy vision; intent classification; embeddings; memory architecture; ASR; TTS; transport; capture coach; self-correction

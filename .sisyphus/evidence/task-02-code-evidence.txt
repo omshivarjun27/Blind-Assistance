@@ -1,0 +1,16 @@
+Task 02 code evidence audit
+rows=
+71
+test_verified=
+26
+limitation_rows=
+8
+forbidden_source_kind_rows=
+0
+forbidden_source_path_rows=
+0
+pytest=test_realtime_route PASSED
+pytest=test_realtime_client PASSED
+pytest=test_memory_store PASSED
+pytest=test_learning PASSED
+pytest=test_settings PASSED

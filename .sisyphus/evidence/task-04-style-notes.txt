@@ -1,0 +1,10 @@
+Task 04 style-note audit
+## Survey Sample=True
+## Journal Samples=True
+## Legacy Main.tex Constraints=True
+## Survey Thesis=True
+## Journal Thesis=True
+## Non-Overlap Rules=True
+STYLE EXEMPLAR ONLY=True
+LEGACY / NOT SOURCE OF TRUTH=True
+JP2.pdf and JP3.pdf require duplicate/mislabeled-copy caution=True

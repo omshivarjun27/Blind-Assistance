@@ -1,0 +1,14 @@
+Task 02 unsupported-claim guard audit
+limitation_row_count=
+8
+forbidden_rows=
+0
+limitation_rows:
+E039|core/orchestrator/policy_router.py|DOCUMENT_QA is not implemented and falls back to REALTIME_CHAT
+E040|apps/backend/services/dashscope/realtime_client.py|Reconnect creates a fresh session and does not resume prior realtime state
+E041|core/orchestrator/prompt_builder.py|Search query extraction exists only as a helper and is not a routed runtime capability by itself
+E042|apps/frontend/hooks/useRealtimeSession.ts|Vision capture is on-demand at turn flush or explicit capture and is not an always-on sensing loop
+E043|requirements.txt|Runtime dependency list uses DashScope HTTP and SQLite packages and does not declare FAISS Chroma Pinecone Weaviate Torch Transformers or Ollama
+E044|.sisyphus/evidence/task-02-read-inventory.txt|Tracked repo inventory contains no checked-in infrastructure directory or infrastructure implementation layer
+E045|apps/frontend/package.json|Frontend package scripts support dev build start and lint only and no checked-in JS test runner is configured
+E061|tests/unit/test_realtime_route.py|Unit test confirms web search logic is absent from the current realtime route source

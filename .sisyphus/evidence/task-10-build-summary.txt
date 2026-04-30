@@ -1,0 +1,19 @@
+Task 10 build summary
+main_pages=8
+main_figures=
+12
+main_tables=
+1
+main_equations=
+3
+main_bibliography_count=
+50
+journal_pages=7
+journal_figures=
+12
+journal_tables=
+3
+journal_equations=
+2
+journal_bibliography_count=
+40

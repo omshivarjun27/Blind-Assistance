@@ -1,0 +1,34 @@
+Task 01 bootstrap happy-path evidence
+
+Resolved MiKTeX binaries:
+- `C:\Users\HP\AppData\Local\Programs\MiKTeX\miktex\bin\x64\pdflatex.exe`
+- `C:\Users\HP\AppData\Local\Programs\MiKTeX\miktex\bin\x64\bibtex.exe`
+- `C:\Users\HP\AppData\Local\Programs\MiKTeX\miktex\bin\x64\initexmf.exe`
+
+Auto-install configuration:
+- `initexmf --show-config-value=[MPM]AutoInstall` -> `t`
+
+Version checks:
+- `pdflatex.exe --version` -> `MiKTeX-pdfTeX 4.23 (MiKTeX 25.12)`
+- `bibtex.exe --version` -> `MiKTeX-BibTeX 4.2 (MiKTeX 25.12)`
+
+Support artifacts present:
+- `docs/Survey paper/evidence_ledger.csv`
+- `docs/Survey paper/comparison_matrix.csv`
+- `docs/Survey paper/literature_corpus.csv`
+- `docs/Survey paper/references.bib`
+- `docs/Survey paper/sample_style_notes.md`
+
+Header / skeleton verification:
+- `evidence_ledger.csv` header matches plan
+- `comparison_matrix.csv` header matches plan
+- `literature_corpus.csv` header matches plan
+- `references.bib` exists as UTF-8 text scaffold
+- `sample_style_notes.md` contains:
+  - `# Sample Style Notes`
+  - `## Survey Sample`
+  - `## Journal Samples`
+  - `## Legacy Main.tex Constraints`
+
+Conclusion:
+- Task 1 bootstrap succeeded using the resolved per-user MiKTeX install path.

@@ -1,0 +1,17 @@
+Task 01 bootstrap failure-path evidence
+
+Initial shell checks:
+- `pdflatex --version` -> CommandNotFoundException in the tool shell
+- `bibtex --version` -> CommandNotFoundException in the tool shell
+- Standard system-wide probe `C:\Program Files\MiKTeX\miktex\bin\x64\{pdflatex,bibtex}.exe` -> missing
+
+Follow-up discovery:
+- `winget --version` -> v1.28.240
+- `winget install --id MiKTeX.MiKTeX -e --source winget --accept-package-agreements --accept-source-agreements`
+  reported MiKTeX 25.12 already installed with no newer package available
+- Located active MiKTeX user install at:
+  `C:\Users\HP\AppData\Local\Programs\MiKTeX\miktex\bin\x64`
+
+Branching result:
+- Bootstrap did NOT proceed as if TeX were unavailable system-wide.
+- It branched into discovery of the existing per-user MiKTeX install, exactly matching the plan's fallback for PATH issues.

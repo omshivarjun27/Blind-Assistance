@@ -1,0 +1,15 @@
+Task 07 survey audit
+abstract_words=
+243
+abstract_sentences=
+4
+figure_count=
+12
+figure_ids_match=
+True
+equation_count=
+3
+table_count=
+1
+missing_citation_keys=
+

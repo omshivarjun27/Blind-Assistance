@@ -1,0 +1,15 @@
+Task 09 journal audit
+figure_count=
+12
+figure_ids_match=
+True
+demo_figures_present=
+2
+unique_citations=
+41
+related_work_subsections=
+5
+equation_count=
+2
+table_count=
+3

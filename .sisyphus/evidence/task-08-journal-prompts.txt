@@ -1,0 +1,9 @@
+Task 08 journal prompt audit
+figure_count=
+12
+unique_count=
+12
+blank_markers=
+2
+wordcount_violations=
+0

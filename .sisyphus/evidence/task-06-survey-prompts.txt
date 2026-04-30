@@ -1,0 +1,9 @@
+Task 06 survey prompt audit
+figure_count=
+12
+unique_count=
+12
+placement_count=
+12
+wordcount_violations=
+0
